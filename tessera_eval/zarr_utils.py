@@ -142,10 +142,9 @@ def read_region_chunked(gtz, bounds, year):
     total_chunks = len(chunk_lons) * len(chunk_lats)
     logger.info("Reading %d zarr chunks (%d x %d)", total_chunks, len(chunk_lons), len(chunk_lats))
 
-    # Collect chunks — merge manually using coordinate offsets
-    first_transform = None
+    # Collect chunks — merge manually using coordinate offsets.
     first_crs = None
-    chunks = []
+    chunks = []  # list of (emb, tfm, crs)
 
     for lat_start, lat_end in chunk_lats:
         for lon_start, lon_end in chunk_lons:
@@ -164,34 +163,54 @@ def read_region_chunked(gtz, bounds, year):
                 continue
             if emb is None or emb.size == 0:
                 continue
-            if first_transform is None:
-                first_transform = tfm
+            if first_crs is None:
                 first_crs = crs
-            chunks.append((emb, tfm))
+            if str(crs) != str(first_crs):
+                # A different UTM zone can't share one metre grid; a correct merge
+                # would reproject each chunk to a common CRS first. Skip (and warn)
+                # rather than silently mis-place it on the wrong grid.
+                logger.warning(
+                    "Zarr chunk (%.3f,%.3f)-(%.3f,%.3f) CRS %s != %s; skipping",
+                    lon_start,
+                    lat_start,
+                    lon_end,
+                    lat_end,
+                    crs,
+                    first_crs,
+                )
+                continue
+            chunks.append((emb, tfm, crs))
 
     if not chunks:
         return None, None, None
 
-    # Merge: compute the full mosaic size from the first and last transforms
-    px = first_transform.a  # pixel size in CRS units
-    all_rows = []
-    all_cols = []
-    for emb, tfm in chunks:
-        col_off = round((tfm.c - first_transform.c) / px)
-        row_off = round((first_transform.f - tfm.f) / px)
-        all_rows.append(row_off + emb.shape[0])
-        all_cols.append(col_off + emb.shape[1])
+    # Place each chunk against a TOP-LEFT (north-west) origin: row 0 = the
+    # northern-most top edge (max .f), col 0 = the western-most left edge (min .c).
+    # NOTE: anchoring at the first (south-west) chunk gave every northern chunk a
+    # NEGATIVE row_off — a chunk one tile north landed at mosaic[-h:0] (an empty
+    # slice) and crashed the broadcast, and total_h came out one chunk too short.
+    # Anchoring at the NW corner keeps offsets >= 0.
+    base = chunks[0][1]
+    px = base.a  # pixel size in CRS units (common grid across same-CRS chunks)
+    origin_c = min(tfm.c for _, tfm, _ in chunks)
+    origin_f = max(tfm.f for _, tfm, _ in chunks)
 
-    total_h = max(all_rows)
-    total_w = max(all_cols)
+    def _row_col(tfm):
+        return round((origin_f - tfm.f) / px), round((tfm.c - origin_c) / px)
+
+    total_h = max(_row_col(tfm)[0] + emb.shape[0] for emb, tfm, _ in chunks)
+    total_w = max(_row_col(tfm)[1] + emb.shape[1] for emb, tfm, _ in chunks)
     n_bands = chunks[0][0].shape[2]
     mosaic = np.full((total_h, total_w, n_bands), np.nan, dtype=np.float32)
 
-    for emb, tfm in chunks:
-        col_off = round((tfm.c - first_transform.c) / px)
-        row_off = round((first_transform.f - tfm.f) / px)
+    for emb, tfm, _ in chunks:
+        row_off, col_off = _row_col(tfm)
         h, w = emb.shape[:2]
         mosaic[row_off : row_off + h, col_off : col_off + w] = emb
 
-    # Merge happens in native CRS; reproject the assembled mosaic to 4326.
-    return _reproject_to_4326(mosaic, first_transform, first_crs)
+    # The mosaic transform shares the chunk pixel grid, anchored at the NW origin.
+    # Merge is in native CRS; reproject the assembled mosaic to EPSG:4326.
+    from affine import Affine
+
+    mosaic_transform = Affine(base.a, base.b, origin_c, base.d, base.e, origin_f)
+    return _reproject_to_4326(mosaic, mosaic_transform, first_crs)

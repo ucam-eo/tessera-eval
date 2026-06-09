@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1]
+
+### Fixed
+- `zarr_utils.read_region_chunked`: correct the multi-chunk merge. Chunks are now
+  anchored at a north-west origin (`max .f` / `min .c`) instead of the first
+  (south-west) chunk — the old anchor gave northern chunks a negative row offset,
+  which landed them on an empty slice (crash) and under-sized the mosaic height.
+  Also skip (with a warning) chunks whose CRS differs from the first chunk's,
+  rather than mis-placing them on an incompatible metre grid.
+
 ## [1.0.0]
 
 First public release.
