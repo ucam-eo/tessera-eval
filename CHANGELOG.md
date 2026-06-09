@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.3]
+
+### Fixed
+- `__version__` is now read from the installed package metadata via
+  `importlib.metadata` instead of a hardcoded literal (which had been left at
+  `1.0.0` through 1.0.1/1.0.2). No functional change.
+
 ## [1.0.2]
 
 ### Fixed

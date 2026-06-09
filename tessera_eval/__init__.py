@@ -8,7 +8,15 @@ for _var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
     if _var not in _os.environ:
         _os.environ[_var] = "1"
 
-__version__ = "1.0.0"
+# Single source of truth: the installed package metadata (pyproject version),
+# so __version__ can't drift from the release tag.
+from importlib.metadata import PackageNotFoundError as _PkgNotFound
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("tessera-eval")
+except _PkgNotFound:  # running from a source tree that isn't installed
+    __version__ = "0+unknown"
 
 from tessera_eval.classify import (
     available_classifiers,
