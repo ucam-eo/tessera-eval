@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2]
+
+### Fixed
+- `zarr_utils.read_region_chunked`: correctly handle bboxes spanning **more than
+  one UTM zone**. Each 0.1° chunk is now read in its own native zone and
+  **reprojected into a single shared EPSG:4326 grid** (one resolution for the whole
+  bbox, nearest-neighbour, NaN-preserving seam merge). This supersedes the v1.0.1
+  NW-origin metre-offset merge (which could only place same-zone chunks) and also
+  fixes geotessera's silent centre-zone clipping of small cross-zone bboxes. The
+  small-region fast path now also routes through the merge when the bbox crosses a
+  zone boundary.
+
 ## [1.0.1]
 
 ### Fixed

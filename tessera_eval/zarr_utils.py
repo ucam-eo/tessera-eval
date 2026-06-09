@@ -104,6 +104,54 @@ def _reproject_to_4326(mosaic, transform, src_crs):
     return np.transpose(dst, (1, 2, 0)), dst_transform, dst_crs
 
 
+def _utm_zone(lon):
+    """UTM zone number for a longitude (geotessera routes each chunk by its centre)."""
+    return int((lon + 180.0) // 6.0) + 1
+
+
+def _reproject_chunk_into(mosaic, dst_transform, emb, src_transform, src_crs, chunk_bounds):
+    """Reproject one native-CRS chunk into the shared EPSG:4326 ``mosaic`` in place.
+
+    Only the chunk's geographic sub-window is written, and existing non-NaN values
+    are kept where the reprojected chunk is NaN — so overlapping seams don't punch
+    holes. Nearest-neighbour only (never blend 128-d embeddings). Temp memory is
+    bounded to one chunk window.
+    """
+    from affine import Affine
+    from rasterio.warp import Resampling, reproject
+
+    h_full, w_full, bands = mosaic.shape
+    px_lon, px_lat = dst_transform.a, -dst_transform.e
+    west0, north0 = dst_transform.c, dst_transform.f
+    lon0, lat0, lon1, lat1 = chunk_bounds
+
+    # Pixel window of this chunk in the dst grid (+1 px pad to avoid seam gaps).
+    c0 = max(0, int(np.floor((lon0 - west0) / px_lon)) - 1)
+    c1 = min(w_full, int(np.ceil((lon1 - west0) / px_lon)) + 1)
+    r0 = max(0, int(np.floor((north0 - lat1) / px_lat)) - 1)
+    r1 = min(h_full, int(np.ceil((north0 - lat0) / px_lat)) + 1)
+    if c1 <= c0 or r1 <= r0:
+        return
+
+    win_transform = Affine(px_lon, 0.0, west0 + c0 * px_lon, 0.0, -px_lat, north0 - r0 * px_lat)
+    src = np.ascontiguousarray(np.transpose(emb, (2, 0, 1)))  # (B, h, w)
+    tmp = np.full((bands, r1 - r0, c1 - c0), np.nan, dtype=np.float32)
+    reproject(
+        source=src,
+        destination=tmp,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=win_transform,
+        dst_crs="EPSG:4326",
+        src_nodata=np.nan,
+        dst_nodata=np.nan,
+        resampling=Resampling.nearest,
+    )
+    tmp = np.transpose(tmp, (1, 2, 0))  # (rows, cols, B)
+    covered = ~np.isnan(tmp).all(axis=2)
+    mosaic[r0:r1, c0:c1][covered] = tmp[covered]
+
+
 def read_region_chunked(gtz, bounds, year):
     """Read a region via zarr, chunking if larger than CHUNK_THRESHOLD.
 
@@ -121,96 +169,76 @@ def read_region_chunked(gtz, bounds, year):
     west, south, east, north = bounds
     lon_span = east - west
     lat_span = north - south
+    single_zone = _utm_zone(west) == _utm_zone(east)
 
-    # Small region — single read
-    if lon_span <= CHUNK_THRESHOLD and lat_span <= CHUNK_THRESHOLD:
+    # Small, single-zone region — one native read + reproject (fast path).
+    if lon_span <= CHUNK_THRESHOLD and lat_span <= CHUNK_THRESHOLD and single_zone:
         mosaic, transform, crs = gtz.read_region(bounds, year)
         return _reproject_to_4326(mosaic, transform, crs)
 
-    # Large region — split into chunks and merge
-    chunk_lons = []
-    lon = west
+    # Otherwise — large, and/or spanning >1 UTM zone. geotessera's read_region
+    # routes a whole bbox to a single centre-zone grid and clips the rest, and a
+    # naive metre-offset merge cannot place chunks from different zones. So read
+    # 0.1deg chunks (each in its own native zone) and reproject each into ONE
+    # shared EPSG:4326 grid defined up front.
+    from affine import Affine
+    from rasterio.warp import calculate_default_transform
+
+    chunk_lons, lon = [], west
     while lon < east:
         chunk_lons.append((lon, min(lon + CHUNK_SIZE, east)))
         lon += CHUNK_SIZE
-    chunk_lats = []
-    lat = south
+    chunk_lats, lat = [], south
     while lat < north:
         chunk_lats.append((lat, min(lat + CHUNK_SIZE, north)))
         lat += CHUNK_SIZE
+    logger.info(
+        "Reading %d zarr chunks (%d x %d) -> shared EPSG:4326 grid",
+        len(chunk_lons) * len(chunk_lats),
+        len(chunk_lons),
+        len(chunk_lats),
+    )
 
-    total_chunks = len(chunk_lons) * len(chunk_lats)
-    logger.info("Reading %d zarr chunks (%d x %d)", total_chunks, len(chunk_lons), len(chunk_lats))
-
-    # Collect chunks — merge manually using coordinate offsets.
-    first_crs = None
-    chunks = []  # list of (emb, tfm, crs)
-
-    for lat_start, lat_end in chunk_lats:
-        for lon_start, lon_end in chunk_lons:
-            chunk_bbox = (lon_start, lat_start, lon_end, lat_end)
+    # Read every chunk (each in its native zone); keep its requested 4326 bounds.
+    read = []  # (emb, tfm, crs, (lon0, lat0, lon1, lat1))
+    for lat0, lat1 in chunk_lats:
+        for lon0, lon1 in chunk_lons:
+            cb = (lon0, lat0, lon1, lat1)
             try:
-                emb, tfm, crs = gtz.read_region(chunk_bbox, year)
+                emb, tfm, crs = gtz.read_region(cb, year)
             except Exception as e:
-                logger.warning(
-                    "Zarr chunk (%.3f,%.3f)-(%.3f,%.3f) failed: %s",
-                    lon_start,
-                    lat_start,
-                    lon_end,
-                    lat_end,
-                    e,
-                )
+                logger.warning("Zarr chunk %s failed: %s", cb, e)
                 continue
             if emb is None or emb.size == 0:
                 continue
-            if first_crs is None:
-                first_crs = crs
-            if str(crs) != str(first_crs):
-                # A different UTM zone can't share one metre grid; a correct merge
-                # would reproject each chunk to a common CRS first. Skip (and warn)
-                # rather than silently mis-place it on the wrong grid.
-                logger.warning(
-                    "Zarr chunk (%.3f,%.3f)-(%.3f,%.3f) CRS %s != %s; skipping",
-                    lon_start,
-                    lat_start,
-                    lon_end,
-                    lat_end,
-                    crs,
-                    first_crs,
-                )
-                continue
-            chunks.append((emb, tfm, crs))
+            read.append((emb, tfm, crs, cb))
 
-    if not chunks:
+    if not read:
         return None, None, None
 
-    # Place each chunk against a TOP-LEFT (north-west) origin: row 0 = the
-    # northern-most top edge (max .f), col 0 = the western-most left edge (min .c).
-    # NOTE: anchoring at the first (south-west) chunk gave every northern chunk a
-    # NEGATIVE row_off — a chunk one tile north landed at mosaic[-h:0] (an empty
-    # slice) and crashed the broadcast, and total_h came out one chunk too short.
-    # Anchoring at the NW corner keeps offsets >= 0.
-    base = chunks[0][1]
-    px = base.a  # pixel size in CRS units (common grid across same-CRS chunks)
-    origin_c = min(tfm.c for _, tfm, _ in chunks)
-    origin_f = max(tfm.f for _, tfm, _ in chunks)
+    # One resolution for the whole target grid (don't let each chunk choose its
+    # own — that would create sub-pixel seams). Derive it from the first chunk's
+    # native -> 4326 reprojection.
+    emb0, tfm0, crs0, _ = read[0]
+    h0, w0, bands = emb0.shape
+    dt0, _, _ = calculate_default_transform(
+        crs0,
+        "EPSG:4326",
+        w0,
+        h0,
+        left=tfm0.c,
+        bottom=tfm0.f + tfm0.e * h0,
+        right=tfm0.c + tfm0.a * w0,
+        top=tfm0.f,
+    )
+    px_lon, px_lat = dt0.a, -dt0.e
 
-    def _row_col(tfm):
-        return round((origin_f - tfm.f) / px), round((tfm.c - origin_c) / px)
+    width = max(1, int(np.ceil(lon_span / px_lon)))
+    height = max(1, int(np.ceil(lat_span / px_lat)))
+    dst_transform = Affine(px_lon, 0.0, west, 0.0, -px_lat, north)
+    mosaic = np.full((height, width, bands), np.nan, dtype=np.float32)
 
-    total_h = max(_row_col(tfm)[0] + emb.shape[0] for emb, tfm, _ in chunks)
-    total_w = max(_row_col(tfm)[1] + emb.shape[1] for emb, tfm, _ in chunks)
-    n_bands = chunks[0][0].shape[2]
-    mosaic = np.full((total_h, total_w, n_bands), np.nan, dtype=np.float32)
+    for emb, tfm, crs, cb in read:
+        _reproject_chunk_into(mosaic, dst_transform, emb, tfm, crs, cb)
 
-    for emb, tfm, _ in chunks:
-        row_off, col_off = _row_col(tfm)
-        h, w = emb.shape[:2]
-        mosaic[row_off : row_off + h, col_off : col_off + w] = emb
-
-    # The mosaic transform shares the chunk pixel grid, anchored at the NW origin.
-    # Merge is in native CRS; reproject the assembled mosaic to EPSG:4326.
-    from affine import Affine
-
-    mosaic_transform = Affine(base.a, base.b, origin_c, base.d, base.e, origin_f)
-    return _reproject_to_4326(mosaic, mosaic_transform, first_crs)
+    return mosaic, dst_transform, "EPSG:4326"
