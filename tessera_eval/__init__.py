@@ -30,6 +30,7 @@ from tessera_eval.data import (
     dequantize_int8,
     dequantize_uint8,
     load_embeddings_for_shapefile,
+    load_embeddings_for_shapefile_vq,
     load_tee_vectors,
 )
 from tessera_eval.evaluate import (

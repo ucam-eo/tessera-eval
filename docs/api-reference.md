@@ -31,6 +31,17 @@ column. Returns `vectors: float32 (N, 128)`, `labels: int (N,)` (0-indexed),
 `total_pixels`, `n_classes`). `callback(current, total)` reports tile progress.
 Raises `ValueError` if no labelled pixels are found.
 
+#### `load_embeddings_for_shapefile_vq(gdf, field, year, client, *, max_km=10.0, target_crs="EPSG:4326", callback=None) -> (vectors, labels, class_names, stats)`
+The **VQ data path**: same output contract, but pulls *reconstructed* embeddings
+from `client.fetch_mosaic_for_region(bbox, year, target_crs) -> (mosaic, transform, crs)`
+instead of raw GeoTessera tiles. `client` is duck-typed — pass a
+`tessera_vq.VQTessera` (the VQ bolt-on) for the VQ path, or a `geotessera.GeoTessera`
+for raw region reads (not imported here, so no tessera-vq dependency). The shapefile
+bbox is split into `<= max_km` chunks (the bolt-on caps bbox size); chunks no polygon
+touches are skipped without a fetch, and chunks with no coverage are skipped with a
+warning. `stats` has `chunk_count`, `chunks_with_data`, `total_pixels`, `n_classes`.
+Use it to measure downstream accuracy on VQ-reconstructed vs. raw embeddings.
+
 ---
 
 ## `tessera_eval.rasterize`

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0]
+
+### Added
+- `data.load_embeddings_for_shapefile_vq`: load labelled embeddings from a
+  **VQ bolt-on** (or any client exposing `fetch_mosaic_for_region`), pulling
+  *reconstructed* embeddings region-by-region. Splits the shapefile bbox into
+  `<= max_km` chunks (the bolt-on caps bbox size), skips chunks no polygon
+  touches and chunks with no VQ coverage, and returns the same
+  `(vectors, labels, class_names, stats)` contract as
+  `load_embeddings_for_shapefile`. Lets you evaluate downstream accuracy on
+  VQ-reconstructed embeddings vs. the raw-tile reference. The VQ client
+  (e.g. `tessera_vq.VQTessera`) is duck-typed and passed in — no tessera-vq
+  dependency is added.
+
 ## [1.0.3]
 
 ### Fixed

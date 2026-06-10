@@ -3,11 +3,17 @@
 import gzip
 import io
 import json
+import logging
+import math
 from pathlib import Path
 
 import numpy as np
 from rasterio.transform import array_bounds as _array_bounds
 from shapely.geometry import box as _box
+
+logger = logging.getLogger(__name__)
+
+_M_PER_DEG_LAT = 111_320.0  # metres per degree of latitude (WGS84, approx)
 
 
 def dequantize_uint8(quantized, dim_min, dim_max):
@@ -203,3 +209,137 @@ def load_embeddings_for_shapefile(gdf, field, year, gt_instance, callback=None):
     }
 
     return vectors, labels, class_names, stats
+
+
+def load_embeddings_for_shapefile_vq(
+    gdf,
+    field,
+    year,
+    client,
+    *,
+    max_km=10.0,
+    target_crs="EPSG:4326",
+    callback=None,
+):
+    """Load labelled embeddings via a VQ bolt-on (or any mosaic-fetching client).
+
+    Like :func:`load_embeddings_for_shapefile`, but instead of iterating raw
+    GeoTessera tiles it pulls **reconstructed** embeddings region-by-region from
+    ``client.fetch_mosaic_for_region(bbox, year, target_crs)``. Use it to evaluate
+    downstream accuracy on VQ-reconstructed embeddings (the cost of compression),
+    versus the raw-tile loader (the reference).
+
+    The shapefile's bounding box is split into ``<= max_km`` chunks because the VQ
+    bolt-on caps the bbox per request; chunks the polygons don't touch are skipped
+    without a fetch, and chunks the bolt-on has no coverage for are skipped with a
+    warning. Class IDs are consistent across chunks (one shared ``LabelEncoder``).
+
+    Args:
+        gdf: GeoDataFrame with geometry + the ``field`` column (any CRS).
+        field: attribute column used as labels.
+        year: embedding year.
+        client: any object exposing
+            ``fetch_mosaic_for_region(bbox, year, target_crs) -> (mosaic, transform, crs)``
+            where ``mosaic`` is ``(H, W, 128)`` float32 in ``target_crs``. Both
+            ``tessera_vq.VQTessera`` (the VQ bolt-on) and ``geotessera.GeoTessera``
+            satisfy this; pass a ``VQTessera`` for the VQ path. (Not imported here —
+            construct it yourself, so tessera-eval keeps no tessera-vq dependency.)
+        max_km: max chunk side in km (default 10, matching the bolt-on's default cap;
+            a 10% safety margin is applied).
+        target_crs: CRS for the fetched mosaics (default EPSG:4326).
+        callback: optional ``function(current_chunk, total_chunks)`` for progress.
+
+    Returns:
+        ``(vectors, labels, class_names, stats)`` — same contract as
+        :func:`load_embeddings_for_shapefile`. ``stats`` has ``chunk_count``,
+        ``chunks_with_data``, ``total_pixels``, ``n_classes``.
+
+    Raises:
+        ValueError: if no labelled pixels are recovered from any chunk.
+    """
+    from sklearn.preprocessing import LabelEncoder
+
+    from tessera_eval.rasterize import rasterize_shapefile
+
+    gdf4326 = gdf if _is_4326(gdf.crs) else gdf.to_crs(target_crs)
+    west, south, east, north = (float(v) for v in gdf4326.total_bounds)
+
+    # Chunk side in degrees, kept under max_km on both axes (lon shrinks with lat).
+    midlat = (south + north) / 2.0
+    span_m = max_km * 1000.0 * 0.9  # 10% margin under the server cap
+    dlat = span_m / _M_PER_DEG_LAT
+    dlon = span_m / (_M_PER_DEG_LAT * max(math.cos(math.radians(midlat)), 1e-6))
+
+    chunks = []
+    lat = south
+    while lat < north:
+        lon = west
+        while lon < east:
+            chunks.append((lon, lat, min(lon + dlon, east), min(lat + dlat, north)))
+            lon += dlon
+        lat += dlat
+
+    le = LabelEncoder()
+    le.fit(gdf4326[field].dropna().unique())
+    class_names = le.classes_.tolist()
+    sindex = gdf4326.sindex
+
+    all_vectors, all_labels = [], []
+    chunks_with_data = 0
+    for i, cb in enumerate(chunks):
+        if callback:
+            callback(i + 1, len(chunks))
+        # Skip chunks no polygon touches — avoids a wasted bolt-on round-trip.
+        candidates = list(sindex.intersection(cb))
+        if not candidates:
+            continue
+        sub = gdf4326.iloc[candidates]
+        sub = sub[sub.intersects(_box(*cb))]
+        if sub.empty:
+            continue
+        try:
+            mosaic, transform, _crs = client.fetch_mosaic_for_region(
+                cb, year=year, target_crs=target_crs
+            )
+        except Exception as exc:  # no VQ coverage / server error for this chunk
+            logger.warning("VQ chunk %s skipped: %s", cb, exc)
+            continue
+        if mosaic is None or mosaic.size == 0:
+            continue
+
+        h, w = mosaic.shape[:2]
+        class_raster = rasterize_shapefile(sub, field, transform, w, h, label_encoder=le)
+        labelled = class_raster > 0
+        if not labelled.any():
+            continue
+        labels = class_raster[labelled] - 1  # 1-based -> 0-based
+        vectors = mosaic[labelled]
+        finite = np.isfinite(vectors).all(axis=1)  # drop nodata pixels
+        if not finite.any():
+            continue
+        all_vectors.append(vectors[finite].astype(np.float32))
+        all_labels.append(labels[finite].astype(np.int32))
+        chunks_with_data += 1
+
+    if not all_vectors:
+        raise ValueError("No labelled VQ-reconstructed pixels found across any chunk")
+
+    vectors = np.concatenate(all_vectors, axis=0)
+    labels = np.concatenate(all_labels, axis=0)
+    stats = {
+        "chunk_count": len(chunks),
+        "chunks_with_data": chunks_with_data,
+        "total_pixels": len(labels),
+        "n_classes": len(class_names),
+    }
+    return vectors, labels, class_names, stats
+
+
+def _is_4326(crs):
+    """True if a GeoDataFrame CRS is (effectively) EPSG:4326 / WGS84."""
+    if crs is None:
+        return True  # assume already lon/lat
+    try:
+        return int(crs.to_epsg() or 0) == 4326
+    except Exception:
+        return "4326" in str(crs)
