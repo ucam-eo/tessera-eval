@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0]
+
+### Changed
+- `zarr_utils` moved to its own package,
+  [`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils), so it can
+  be used without the eval/ML stack. `server.py` imports it from there; it's a
+  `[server]`-extra dependency. No API change for tessera-eval users.
+- Require `geotessera>=0.9.0`.
+
+### Removed
+- `tessera_eval/zarr_utils.py` (now provided by `tessera-zarr-utils`).
+
 ## [1.1.0]
 
 ### Added

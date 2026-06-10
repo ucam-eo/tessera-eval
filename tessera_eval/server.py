@@ -103,7 +103,7 @@ def _load_cached_result(field, year, gdf, sampling="equal"):
     return None
 
 
-from tessera_eval.zarr_utils import get_zarr, probe_zarr_coverage
+from tessera_zarr_utils import get_zarr, probe_zarr_coverage
 
 
 def _extract_tile_patches(
