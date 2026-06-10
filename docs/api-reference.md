@@ -134,18 +134,13 @@ the training/predict functions raise `RuntimeError`.
 
 ---
 
-## `tessera_eval.zarr_utils` (requires `geotessera`)
+## GeoTessera zarr access — moved out
 
-#### `get_zarr() -> GeoTesseraZarr | None`
-Cached zarr handle (import attempted once; failure cached).
-
-#### `probe_zarr_coverage(gtz, bounds, year) -> bool`
-True if the zarr store has non-NaN data at the centre of `bounds`.
-
-#### `read_region_chunked(gtz, bounds, year) -> (mosaic, transform, crs)`
-Read a region (`bounds = (west, south, east, north)`, EPSG:4326), chunking large
-areas. Returns a `(H, W, 128) float32` mosaic **reprojected to EPSG:4326**
-(GeoTessera returns native UTM), or `(None, None, None)` if no data.
+The cached zarr handle and region reads (`get_zarr`, `probe_zarr_coverage`,
+`read_region_chunked`) now live in the standalone
+[`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils) package
+(`pip install "tessera-zarr-utils[geotessera]"`), so they can be used without the
+eval/ML stack. The `tee-compute` server depends on it; see that package's README.
 
 ---
 

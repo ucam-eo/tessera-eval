@@ -22,9 +22,11 @@ It handles the unglamorous-but-fiddly parts end to end:
 - An optional **local compute server** (`tee-compute`) so you can run the ML on
   your own machine while pulling tiles/UI from a hosted service.
 
-> Status: first public release (`1.0.0`). The library core (`data`, `rasterize`,
-> `classify`, `evaluate`, `zarr_utils`) is pure NumPy / scikit-learn / rasterio and
-> has no web-framework or hosting dependency.
+> The library core (`data`, `rasterize`, `classify`, `evaluate`) is pure NumPy /
+> scikit-learn / rasterio and has no web-framework or hosting dependency. GeoTessera
+> zarr access lives in the separate
+> [`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils) package
+> (used by the compute server).
 
 ## Install
 
@@ -92,13 +94,16 @@ curve → confusion matrix → interpretation).
 
 | Module | Purpose |
 |---|---|
-| `tessera_eval.data` | Load + dequantize embeddings (`load_tee_vectors`, `dequantize_int8`, `dequantize_uint8`, `load_embeddings_for_shapefile`). |
+| `tessera_eval.data` | Load + dequantize embeddings (`load_tee_vectors`, `dequantize_int8`, `dequantize_uint8`, `load_embeddings_for_shapefile`, `load_embeddings_for_shapefile_vq`). |
 | `tessera_eval.rasterize` | Burn shapefile polygons onto a pixel grid with stable, 1-based class IDs. |
 | `tessera_eval.classify` | Classifier/regressor factory + spatial neighbourhood features. |
 | `tessera_eval.evaluate` | Learning curves, k-fold CV, spatial split, metrics, field-type detection. |
 | `tessera_eval.unet` | Optional PyTorch U-Net for sparse-label tile segmentation. |
-| `tessera_eval.zarr_utils` | Cached GeoTessera zarr access with chunked reads + EPSG:4326 reprojection. |
 | `tessera_eval.server` | `tee-compute`: local Flask compute server, proxies data/UI to a hosted TEE. |
+
+GeoTessera zarr access (`get_zarr`, `probe_zarr_coverage`, `read_region_chunked`) now
+lives in [`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils); the
+compute server depends on it.
 
 Available models: `nn`, `rf`, `mlp`, `spatial_mlp`, `spatial_mlp_5x5`, `xgboost`
 (if installed), `unet` (if torch installed); regressors `nn_reg`, `rf_reg`,
