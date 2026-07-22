@@ -30,3 +30,4 @@ htmlcov/
 *.tif
 *.tiff
 *.zip
+*.npz

@@ -79,6 +79,46 @@ vectors, coords, metadata = load_tee_vectors("/path/to/vectors/aoi/2024")
 See the [tutorial](docs/tutorial.md) for the full workflow (labels → learning
 curve → confusion matrix → interpretation).
 
+## Command-line interface
+
+The workflow covered in the [tutorial](docs/tutorial.md) can also be run through the command line.
+
+First, install the `geotessera` package needed for the `load` step below:
+
+```
+pip install -e ".[geotessera]"
+```
+
+Download the Tessera embeddings for the area covered by your labelled polygons, and save the result to a file (vectors.npz). The argument `--field` is the column in your data holding the class or target values (e.g. `habitat`).
+
+```bash
+tessera-eval load --data /path/to/habitats.geojson --field habitat --year 2024
+```
+
+`kfold` and `learning-curve` reuse this cached `vectors.npz` automatically - no need to repeat `--data`. Pass `--vectors <path>` to use a different cached file instead.
+
+Run k-fold cross-validation and print accuracy per model.
+
+```bash
+tessera-eval kfold --models rf,nn,mlp # for classification task
+tessera-eval kfold --models rf_reg,nn_reg # for regression task
+```
+
+Investigate how accuracy changes using different fractions of training labels (currently only for classification task).
+```bash
+tessera-eval learning-curve --models rf
+```
+
+Since neighbouring pixels are usually very similar, a random split can overstate how accurate the model really is (see [tutorial](docs/tutorial.md)). For a more honest estimate, train on one geographic half of your area and test on the other:
+
+
+```bash
+tessera-eval learning-curve --models rf --spatial-holdout
+```
+
+
+
+
 ## Documentation
 
 - **[Data formats](docs/data-formats.md)** — the Tessera embedding formats this
@@ -100,6 +140,7 @@ curve → confusion matrix → interpretation).
 | `tessera_eval.evaluate` | Learning curves, k-fold CV, spatial split, metrics, field-type detection. |
 | `tessera_eval.unet` | Optional PyTorch U-Net for sparse-label tile segmentation. |
 | `tessera_eval.server` | `tee-compute`: local Flask compute server, proxies data/UI to a hosted TEE. |
+| `tessera_eval.cli` | `tessera-eval` command-line interface: `load`, `kfold`, `learning-curve`. |
 
 GeoTessera zarr access (`get_zarr`, `probe_zarr_coverage`, `read_region_chunked`) now
 lives in [`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils); the
