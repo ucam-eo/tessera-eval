@@ -773,7 +773,28 @@ def run_large_area():
             if _geotessera_instance is None:
                 tile_cache_dir = _get_cache_dir() / "tiles"
                 tile_cache_dir.mkdir(parents=True, exist_ok=True)
-                _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                try:
+                    _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                except Exception as e:
+                    # Unguarded before this fix: a network failure here (e.g. no route to
+                    # the Tessera embeddings store) raised out of the generator and killed
+                    # the SSE stream mid-response, surfacing to the browser as an opaque
+                    # "failed to fetch" instead of a readable error.
+                    logger.warning("GeoTessera initialization failed: %s", e)
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "message": (
+                                    "Could not initialize GeoTessera -- check that this "
+                                    f"machine has network access to the Tessera embeddings "
+                                    f"store: {e}"
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
+                    return
             gt = _geotessera_instance
 
             try:
@@ -1664,7 +1685,24 @@ def create_map():
         if _geotessera_instance is None:
             tile_cache_dir = _get_cache_dir() / "tiles"
             tile_cache_dir.mkdir(parents=True, exist_ok=True)
-            _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+            try:
+                _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+            except Exception as e:
+                logger.warning("GeoTessera initialization failed: %s", e)
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": (
+                                "Could not initialize GeoTessera -- check that this "
+                                f"machine has network access to the Tessera embeddings "
+                                f"store: {e}"
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+                return
         gt = _geotessera_instance
 
         year = cache["key"][1] if cache.get("key") else 2024
