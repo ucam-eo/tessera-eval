@@ -44,3 +44,53 @@ def rasterize_shapefile(gdf, field, transform, width, height, label_encoder=None
     )
 
     return class_raster
+
+
+def align_raster_to_grid(
+    raster_path, transform, crs, width, height, band=1, resampling="nearest", nodata_values=None
+):
+    """Reproject one band of a raster onto a target pixel grid.
+
+    The raster-to-raster counterpart to rasterize_shapefile: instead of
+    burning polygons onto a grid, this resamples an existing raster (e.g.
+    a forest-inventory GeoTIFF) onto the exact grid described by transform,
+    crs, width, and height.
+
+    Args:
+        raster_path: path to a GeoTIFF (or any rasterio-readable raster)
+        transform: Affine transform of the destination grid
+        crs: CRS of the destination grid
+        width: destination grid width in pixels
+        height: destination grid height in pixels
+        band: 1-based band index to read (default 1)
+        resampling: 'nearest' (for categorical data) or 'bilinear' (for
+            continuous data)
+        nodata_values: optional list of extra sentinel values to treat as
+            missing, beyond the raster's own declared nodata
+
+    Returns:
+        float64 array, shape (height, width) — NaN where missing.
+    """
+    import rasterio
+    from rasterio.warp import Resampling, reproject
+
+    resampling_enum = Resampling.nearest if resampling == "nearest" else Resampling.bilinear
+    nodata_values = nodata_values or []
+
+    aligned = np.full((height, width), np.nan, dtype=np.float64)
+    with rasterio.open(raster_path) as src:
+        reproject(
+            source=rasterio.band(src, band),
+            destination=aligned,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=transform,
+            dst_crs=crs,
+            dst_nodata=np.nan,
+            resampling=resampling_enum,
+        )
+    for v in nodata_values:
+        aligned[aligned == v] = np.nan
+
+    return aligned

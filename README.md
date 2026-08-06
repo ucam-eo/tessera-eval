@@ -83,39 +83,84 @@ curve → confusion matrix → interpretation).
 
 The workflow covered in the [tutorial](docs/tutorial.md) can also be run through the command line.
 
-First, install the `geotessera` package needed for the `load` step below:
+First, install the `geotessera` package needed for the `load`/`load-raster` steps below:
 
 ```
 pip install -e ".[geotessera]"
 ```
 
-Download the Tessera embeddings for the area covered by your labelled polygons, and save the result to a file (vectors.npz). The argument `--field` is the column in your data holding the class or target values (e.g. `habitat`).
+Optional installation for using xgboost:
+
+```
+pip install -e ".[xgboost]"
+```
+
+Download the Tessera embeddings for the area covered by your labelled polygons (shapefile/GeoJSON), and save the result to a file (vectors.npz by default, change the name with argument `--output`). The argument `--field` is the column in your data holding the class or target values (e.g. `habitat`).
 
 ```bash
 tessera-eval load --data /path/to/habitats.geojson --field habitat --year 2024
 ```
 
-`kfold` and `learning-curve` reuse this cached `vectors.npz` automatically - no need to repeat `--data`. Pass `--vectors <path>` to use a different cached file instead.
+If your labels are already a raster (e.g. a national forest inventory map) instead of hand-labelled polygons, use `load-raster` instead. A bounding box is required, in EPSG:4326 (longitude,latitude in degrees), and `--nodata` marks any missing-value codes:
+
+```bash
+tessera-eval load-raster --raster site_type.tif --bbox 27.1,67.75,27.2,67.85 --year 2024 --nodata 32766,32767
+```
+
+`kfold` and `learning-curve` reuse the cached `vectors.npz` automatically. Pass `--vectors <path>` to use a different cached file instead.
 
 Run k-fold cross-validation and print accuracy per model.
 
 ```bash
-tessera-eval kfold --models rf,nn,mlp # for classification task
-tessera-eval kfold --models rf_reg,nn_reg # for regression task
+tessera-eval kfold --models rf,nn,mlp      # for classification
+tessera-eval kfold --models rf_reg,nn_reg  # for regression
+```
+
+Optional arguments:
+
+```bash
+# --k: number of cross-validation folds (default: 5)
+# --seed: random seed for reproducible fold splits (default: 42)
+# --confusion / --no-confusion: show or hide the confusion summary (for classification only)
+# --vectors: path to a different cached .npz (default: vectors.npz from `load`)
+# --max-samples: cap the training set size per fold (random, not stratified by class) —
+#   usually needed for raster-derived data, which labels every pixel, not a hand-picked subset
+tessera-eval kfold --models rf --k 10 --seed 1 --no-confusion --max-samples 50000
 ```
 
 Investigate how accuracy changes using different fractions of training labels (currently only for classification task).
 ```bash
-tessera-eval learning-curve --models rf
+tessera-eval learning-curve --models rf --training-pcts 1,5,10,30,50,80 --repeats 5  # --training-pcts: % of labels per step (default: 1,5,10,30,50,80); --repeats: random repeats per step (default: 5)
 ```
 
-Since neighbouring pixels are usually very similar, a random split can overstate how accurate the model really is (see [tutorial](docs/tutorial.md)). For a more honest estimate, train on one geographic half of your area and test on the other:
 
+
+Since neighbouring pixels are usually very similar, a random split can overstate how accurate the model really is (see [tutorial](docs/tutorial.md)). For a more reliable estimate, train on one geographic half of your area and test on the other:
 
 ```bash
 tessera-eval learning-curve --models rf --spatial-holdout
 ```
 
+You can also choose exactly which region to hold out, by passing a bounding box (for `--data`, in the same CRS as your data; for `--raster`, always EPSG:4326):
+
+
+```bash
+tessera-eval learning-curve --models rf --spatial-holdout --test-bbox 27.16,67.77,27.23,67.82
+```
+
+For `--raster`, `--bbox` sets the training region (required, since a raster has no natural extent like polygons do); omitting `--test-bbox` splits it in half instead of requiring both:
+
+```bash
+tessera-eval learning-curve --raster site_type.tif --spatial-holdout --bbox 27.0,67.65,27.3,67.95 --test-bbox 27.16,67.77,27.23,67.82 --models rf
+```
+
+For shapefiles/GeoJSON, you can also use a completely separate shapefile/GeoJSON as the test set:
+
+```bash
+tessera-eval learning-curve --models rf --test-data /path/to/other_region.geojson
+```
+
+Run any command with `--help` for a list of all possible arguments. 
 
 
 
@@ -134,8 +179,8 @@ tessera-eval learning-curve --models rf --spatial-holdout
 
 | Module | Purpose |
 |---|---|
-| `tessera_eval.data` | Load + dequantize embeddings (`load_tee_vectors`, `dequantize_int8`, `dequantize_uint8`, `load_embeddings_for_shapefile`, `load_embeddings_for_shapefile_vq`). |
-| `tessera_eval.rasterize` | Burn shapefile polygons onto a pixel grid with stable, 1-based class IDs. |
+| `tessera_eval.data` | Load + dequantize embeddings (`load_tee_vectors`, `dequantize_int8`, `dequantize_uint8`, `load_embeddings_for_shapefile`, `load_embeddings_for_shapefile_vq`, `load_embeddings_for_raster`). |
+| `tessera_eval.rasterize` | Burn shapefile polygons onto a pixel grid with stable, 1-based class IDs|
 | `tessera_eval.classify` | Classifier/regressor factory + spatial neighbourhood features. |
 | `tessera_eval.evaluate` | Learning curves, k-fold CV, spatial split, metrics, field-type detection. |
 | `tessera_eval.unet` | Optional PyTorch U-Net for sparse-label tile segmentation. |
