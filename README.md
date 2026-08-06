@@ -101,7 +101,7 @@ Download the Tessera embeddings for the area covered by your labelled polygons (
 tessera-eval load --data /path/to/habitats.geojson --field habitat --year 2024
 ```
 
-If your labels are already a raster (e.g. a national forest inventory map) instead of hand-labelled polygons, use `load-raster` instead. A bounding box is required, in EPSG:4326 (longitude,latitude in degrees), and `--nodata` marks any missing-value codes:
+If your labels are already a raster instead of hand-labelled polygons, use `load-raster` instead. A bounding box is required, in EPSG:4326 (longitude,latitude in degrees), and `--nodata` marks any missing-value codes:
 
 ```bash
 tessera-eval load-raster --raster site_type.tif --bbox 27.1,67.75,27.2,67.85 --year 2024 --nodata 32766,32767
