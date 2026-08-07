@@ -321,10 +321,26 @@ def _extract_tile_patches(
             if (label_patch > 0).sum() < 10:
                 continue
 
+            # Basic slicing above returns a *view* into tile_emb -- copy() is not
+            # optional here, even though nothing after this point looks like it
+            # mutates emb_patch on the no-NaN path. unet_patches (below) is kept
+            # for the rest of the evaluation run; without this copy, every patch
+            # keeps its *entire* source tile (H*W*128*4 bytes -- several hundred
+            # MB, not the ~patch_size*patch_size*128*4 bytes ~32MB the patch
+            # itself needs) alive in memory for as long as unet_patches lives.
+            # With patches drawn from many different tiles across a large
+            # shapefile, that's the difference between tens of MB and tens of
+            # GB retained -- confirmed as the proximate cause of an OOM kill on
+            # a real evaluation run (dmesg: "Out of memory: Killed process
+            # ... (tee-compute) ... anon-rss:2407060kB"). The NaN branch below
+            # already copied (needed there to avoid mutating the shared
+            # buffer), which accidentally made the leak conditional on which
+            # patches happened to contain NaN pixels -- easy to miss in review.
+            emb_patch = emb_patch.copy()
+
             # Replace NaN with 0
             nan_mask = np.isnan(emb_patch)
             if nan_mask.any():
-                emb_patch = emb_patch.copy()
                 emb_patch[nan_mask] = 0.0
 
             unet_patches.append((emb_patch, label_patch.astype(np.int32)))
