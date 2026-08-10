@@ -295,11 +295,11 @@ def kfold(
             recall = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
             print(f"\nConfusion summary [{name}]:")
             for i, cname in enumerate(class_names):
-                worst = np.argsort(recall[i])[::-1]
-                second = worst[1] if len(worst) > 1 else worst[0]
+                off_diag = [(j, recall[i, j]) for j in range(len(class_names)) if j != i]
+                most_confused_idx, most_confused_val = max(off_diag, key=lambda x: x[1])
                 print(
                     f"  {cname:>20}: recall {recall[i, i]:.2f} "
-                    f"(most confused with {class_names[second]})"
+                    f"(most confused with {class_names[most_confused_idx]})"
                 )
 
 

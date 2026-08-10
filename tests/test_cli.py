@@ -119,8 +119,20 @@ class TestKfoldClassification:
         assert result.exit_code == 0
         assert "Confusion summary" not in result.stdout
 
+    def test_confusion_never_reports_self_confusion(self, classification_npz):
+        result = runner.invoke(
+            app, ["kfold", "--vectors", str(classification_npz), "--models", "nn"]
+        )
+        assert result.exit_code == 0
+        # For each class line, the "most confused with" name must differ from
+        # the class itself.
+        for line in result.output.splitlines():
+            if "most confused with" in line:
+                class_name = line.split(":")[0].strip()
+                confused_with = line.split("with ")[1].rstrip(")")
+                assert confused_with != class_name, f"Self-confusion reported: {line}"
 
-# ── TestKfoldRegression ──
+    # ── TestKfoldRegression ──
 
 
 class TestKfoldRegression:
