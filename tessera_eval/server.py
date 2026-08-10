@@ -20,6 +20,7 @@ from pathlib import Path
 import geopandas as gpd
 import joblib
 import numpy as np
+import requests
 from flask import Flask, Response, jsonify, request, send_file
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,12 @@ _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
 _geotessera_instance = None  # cached to avoid 10-30s registry init per run
 _cancel_flag = None  # threading.Event, set when user cancels
+# Shared across every proxy() call so the TCP+TLS connection to _hosted_url is
+# kept alive and reused (requests' connection-pooling adapter), instead of a
+# fresh handshake per proxied request -- see proxy()'s docstring for why this
+# matters. Sharing one Session across threads is standard/safe for this: no
+# concurrent mutation of cookies/state beyond urllib3's own thread-safe pools.
+_proxy_session = requests.Session()
 
 FLUSH_PAD = 18 * 1024  # pad NDJSON lines to force Waitress flush
 
@@ -2039,9 +2046,19 @@ def health():
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy(path):
-    """Forward all non-eval requests to the hosted server."""
-    import requests as _requests
+    """Forward all non-eval requests to the hosted server.
 
+    Uses the shared _proxy_session (module-level requests.Session), not the
+    top-level requests.request() -- that helper opens a fresh Session, and
+    therefore a fresh TCP+TLS handshake, for every single call. A page load
+    against a --hosted server is never just one request (HTML, several JS
+    modules, CSS, auth/config/viewport-list API calls, ...), so paying a full
+    handshake per request compounds badly: reported live as TEE's UI taking
+    "several minutes" to even load through a gpu-box deploy (see
+    deploy-compute.sh) sitting on the same network as the hosted server --
+    geography wasn't the explanation, repeated handshakes were. Reusing one
+    Session keeps the connection alive via requests' pooled HTTPAdapter.
+    """
     if not _hosted_url:
         return jsonify({"error": "No --hosted URL configured"}), 502
 
@@ -2054,7 +2071,7 @@ def proxy(path):
     headers = {k: v for k, v in request.headers if k.lower() not in skip}
 
     try:
-        resp = _requests.request(
+        resp = _proxy_session.request(
             method=request.method,
             url=target,
             headers=headers,
@@ -2063,9 +2080,9 @@ def proxy(path):
             stream=True,
             timeout=300,
         )
-    except _requests.ConnectionError:
+    except requests.ConnectionError:
         return jsonify({"error": f"Cannot reach hosted server at {_hosted_url}"}), 502
-    except _requests.Timeout:
+    except requests.Timeout:
         return jsonify({"error": "Hosted server timed out"}), 504
 
     # Stream response back
