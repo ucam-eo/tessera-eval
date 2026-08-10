@@ -419,6 +419,40 @@ def _save_cached_result(field, year, gdf, vectors, labels, class_names, stats, s
         logger.debug("Failed to save result cache: %s", e)
 
 
+def _cached_tiles_need_reload(
+    cached_spatial_3x3,
+    cached_spatial_5x5,
+    cached_sample_points,
+    *,
+    needs_spatial_3x3,
+    needs_spatial_5x5,
+    has_spatial_bboxes,
+):
+    """Does an in-memory _tile_cache hit (same key, vectors present) still
+    need a fresh reload, because this specific request needs data the cached
+    entry doesn't have?
+
+    True when the cache was populated by an earlier request that didn't need
+    spatial_mlp/spatial_mlp_5x5 features, or didn't need a spatial train/test
+    split (so never cached sample-point coordinates), and *this* request
+    does. Whoever calls this with True must also invalidate the cache's own
+    key (not just its own local `vectors` variable) -- confirmed live as a
+    real bug otherwise: run_large_area's cache-hit branch used to set
+    `vectors = None` here without touching `_tile_cache["key"]`, so the
+    later "reload from GeoTessera" block (guarded by
+    `_tile_cache["key"] != cache_key`) never triggered either, since the key
+    still matched. vectors stayed None all the way through and crashed
+    downstream at `len(vectors)` (TypeError: object of type 'NoneType' has
+    no len()) on a spatial_mlp request that hit a cache entry from a prior
+    non-spatial run.
+    """
+    if (needs_spatial_3x3 and cached_spatial_3x3 is None) or (
+        needs_spatial_5x5 and cached_spatial_5x5 is None
+    ):
+        return True
+    return bool(has_spatial_bboxes and cached_sample_points is None)
+
+
 def _padded(gen):
     """Pad each NDJSON line to exceed Waitress send_bytes buffer."""
     for chunk in gen:
@@ -722,17 +756,27 @@ def run_large_area():
             all_valid_mask = _tile_cache.get("valid_mask")
             logger.info("In-memory cache hit for %s/%s (%d pixels)", field_name, year, len(labels))
 
-            # If spatial features needed but not cached, must reload
-            if (needs_spatial_3x3 and spatial_3x3 is None) or (
-                needs_spatial_5x5 and spatial_5x5 is None
+            # See _cached_tiles_need_reload's docstring: setting vectors =
+            # None alone (without also invalidating _tile_cache["key"]) used
+            # to leave vectors None all the way through and crash downstream
+            # at `len(vectors)` -- confirmed live on a spatial_mlp request
+            # that hit a cache entry from a prior non-spatial run.
+            if _cached_tiles_need_reload(
+                spatial_3x3,
+                spatial_5x5,
+                all_sample_points,
+                needs_spatial_3x3=needs_spatial_3x3,
+                needs_spatial_5x5=needs_spatial_5x5,
+                has_spatial_bboxes=has_spatial_bboxes,
             ):
-                logger.info("Spatial features needed but not cached — reloading tiles")
+                if (needs_spatial_3x3 and spatial_3x3 is None) or (
+                    needs_spatial_5x5 and spatial_5x5 is None
+                ):
+                    logger.info("Spatial features needed but not cached — reloading tiles")
+                else:
+                    logger.info("Spatial split needs point coordinates — reloading tiles")
                 vectors = None  # force reload
-
-            # If spatial bboxes but no sample point coordinates cached, must reload
-            if has_spatial_bboxes and all_sample_points is None:
-                logger.info("Spatial split needs point coordinates — reloading tiles")
-                vectors = None  # force reload
+                _tile_cache["key"] = None
 
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
