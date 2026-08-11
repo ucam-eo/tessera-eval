@@ -20,6 +20,7 @@ from pathlib import Path
 import geopandas as gpd
 import joblib
 import numpy as np
+import requests
 from flask import Flask, Response, jsonify, request, send_file
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,12 @@ _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
 _geotessera_instance = None  # cached to avoid 10-30s registry init per run
 _cancel_flag = None  # threading.Event, set when user cancels
+# Shared across every proxy() call so the TCP+TLS connection to _hosted_url is
+# kept alive and reused (requests' connection-pooling adapter), instead of a
+# fresh handshake per proxied request -- see proxy()'s docstring for why this
+# matters. Sharing one Session across threads is standard/safe for this: no
+# concurrent mutation of cookies/state beyond urllib3's own thread-safe pools.
+_proxy_session = requests.Session()
 
 FLUSH_PAD = 18 * 1024  # pad NDJSON lines to force Waitress flush
 
@@ -321,10 +328,26 @@ def _extract_tile_patches(
             if (label_patch > 0).sum() < 10:
                 continue
 
+            # Basic slicing above returns a *view* into tile_emb -- copy() is not
+            # optional here, even though nothing after this point looks like it
+            # mutates emb_patch on the no-NaN path. unet_patches (below) is kept
+            # for the rest of the evaluation run; without this copy, every patch
+            # keeps its *entire* source tile (H*W*128*4 bytes -- several hundred
+            # MB, not the ~patch_size*patch_size*128*4 bytes ~32MB the patch
+            # itself needs) alive in memory for as long as unet_patches lives.
+            # With patches drawn from many different tiles across a large
+            # shapefile, that's the difference between tens of MB and tens of
+            # GB retained -- confirmed as the proximate cause of an OOM kill on
+            # a real evaluation run (dmesg: "Out of memory: Killed process
+            # ... (tee-compute) ... anon-rss:2407060kB"). The NaN branch below
+            # already copied (needed there to avoid mutating the shared
+            # buffer), which accidentally made the leak conditional on which
+            # patches happened to contain NaN pixels -- easy to miss in review.
+            emb_patch = emb_patch.copy()
+
             # Replace NaN with 0
             nan_mask = np.isnan(emb_patch)
             if nan_mask.any():
-                emb_patch = emb_patch.copy()
                 emb_patch[nan_mask] = 0.0
 
             unet_patches.append((emb_patch, label_patch.astype(np.int32)))
@@ -394,6 +417,40 @@ def _save_cached_result(field, year, gdf, vectors, labels, class_names, stats, s
         )
     except Exception as e:
         logger.debug("Failed to save result cache: %s", e)
+
+
+def _cached_tiles_need_reload(
+    cached_spatial_3x3,
+    cached_spatial_5x5,
+    cached_sample_points,
+    *,
+    needs_spatial_3x3,
+    needs_spatial_5x5,
+    has_spatial_bboxes,
+):
+    """Does an in-memory _tile_cache hit (same key, vectors present) still
+    need a fresh reload, because this specific request needs data the cached
+    entry doesn't have?
+
+    True when the cache was populated by an earlier request that didn't need
+    spatial_mlp/spatial_mlp_5x5 features, or didn't need a spatial train/test
+    split (so never cached sample-point coordinates), and *this* request
+    does. Whoever calls this with True must also invalidate the cache's own
+    key (not just its own local `vectors` variable) -- confirmed live as a
+    real bug otherwise: run_large_area's cache-hit branch used to set
+    `vectors = None` here without touching `_tile_cache["key"]`, so the
+    later "reload from GeoTessera" block (guarded by
+    `_tile_cache["key"] != cache_key`) never triggered either, since the key
+    still matched. vectors stayed None all the way through and crashed
+    downstream at `len(vectors)` (TypeError: object of type 'NoneType' has
+    no len()) on a spatial_mlp request that hit a cache entry from a prior
+    non-spatial run.
+    """
+    if (needs_spatial_3x3 and cached_spatial_3x3 is None) or (
+        needs_spatial_5x5 and cached_spatial_5x5 is None
+    ):
+        return True
+    return bool(has_spatial_bboxes and cached_sample_points is None)
 
 
 def _padded(gen):
@@ -699,17 +756,27 @@ def run_large_area():
             all_valid_mask = _tile_cache.get("valid_mask")
             logger.info("In-memory cache hit for %s/%s (%d pixels)", field_name, year, len(labels))
 
-            # If spatial features needed but not cached, must reload
-            if (needs_spatial_3x3 and spatial_3x3 is None) or (
-                needs_spatial_5x5 and spatial_5x5 is None
+            # See _cached_tiles_need_reload's docstring: setting vectors =
+            # None alone (without also invalidating _tile_cache["key"]) used
+            # to leave vectors None all the way through and crash downstream
+            # at `len(vectors)` -- confirmed live on a spatial_mlp request
+            # that hit a cache entry from a prior non-spatial run.
+            if _cached_tiles_need_reload(
+                spatial_3x3,
+                spatial_5x5,
+                all_sample_points,
+                needs_spatial_3x3=needs_spatial_3x3,
+                needs_spatial_5x5=needs_spatial_5x5,
+                has_spatial_bboxes=has_spatial_bboxes,
             ):
-                logger.info("Spatial features needed but not cached — reloading tiles")
+                if (needs_spatial_3x3 and spatial_3x3 is None) or (
+                    needs_spatial_5x5 and spatial_5x5 is None
+                ):
+                    logger.info("Spatial features needed but not cached — reloading tiles")
+                else:
+                    logger.info("Spatial split needs point coordinates — reloading tiles")
                 vectors = None  # force reload
-
-            # If spatial bboxes but no sample point coordinates cached, must reload
-            if has_spatial_bboxes and all_sample_points is None:
-                logger.info("Spatial split needs point coordinates — reloading tiles")
-                vectors = None  # force reload
+                _tile_cache["key"] = None
 
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
@@ -2023,9 +2090,19 @@ def health():
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy(path):
-    """Forward all non-eval requests to the hosted server."""
-    import requests as _requests
+    """Forward all non-eval requests to the hosted server.
 
+    Uses the shared _proxy_session (module-level requests.Session), not the
+    top-level requests.request() -- that helper opens a fresh Session, and
+    therefore a fresh TCP+TLS handshake, for every single call. A page load
+    against a --hosted server is never just one request (HTML, several JS
+    modules, CSS, auth/config/viewport-list API calls, ...), so paying a full
+    handshake per request compounds badly: reported live as TEE's UI taking
+    "several minutes" to even load through a gpu-box deploy (see
+    deploy-compute.sh) sitting on the same network as the hosted server --
+    geography wasn't the explanation, repeated handshakes were. Reusing one
+    Session keeps the connection alive via requests' pooled HTTPAdapter.
+    """
     if not _hosted_url:
         return jsonify({"error": "No --hosted URL configured"}), 502
 
@@ -2038,7 +2115,7 @@ def proxy(path):
     headers = {k: v for k, v in request.headers if k.lower() not in skip}
 
     try:
-        resp = _requests.request(
+        resp = _proxy_session.request(
             method=request.method,
             url=target,
             headers=headers,
@@ -2047,9 +2124,9 @@ def proxy(path):
             stream=True,
             timeout=300,
         )
-    except _requests.ConnectionError:
+    except requests.ConnectionError:
         return jsonify({"error": f"Cannot reach hosted server at {_hosted_url}"}), 502
-    except _requests.Timeout:
+    except requests.Timeout:
         return jsonify({"error": "Hosted server timed out"}), 504
 
     # Stream response back
