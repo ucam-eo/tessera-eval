@@ -20,6 +20,13 @@ from tessera_eval import (
 # same convention GeoTessera itself uses for its own tile mirror.
 DEFAULT_VECTORS_PATH = Path("vectors.npz")
 
+
+def _bboxes_overlap(a, b):
+    a_minx, a_miny, a_maxx, a_maxy = a
+    b_minx, b_miny, b_maxx, b_maxy = b
+    return a_minx < b_maxx and b_minx < a_maxx and a_miny < b_maxy and b_miny < a_maxy
+
+
 app = typer.Typer()
 
 
@@ -485,6 +492,13 @@ def learning_curve(
                 ) from exc
             train_region = (minx, miny, maxx, maxy)
             test_region = (test_minx, test_miny, test_maxx, test_maxy)
+
+            if _bboxes_overlap(train_region, test_region):
+                raise typer.BadParameter(
+                    f"--bbox {bbox} and --test-bbox {test_bbox} overlap — they must be "
+                    "disjoint, since --bbox defines the training region and shared "
+                    "pixels would leak between train and test."
+                )
         else:
             # No --test-bbox given: auto-split --bbox in half by longitude,
             # matching the shapefile east/west default.

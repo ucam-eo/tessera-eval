@@ -367,8 +367,8 @@ def load_embeddings_for_raster(
         band: 1-based band index to read (default 1)
         task: "classification" or "regression", or None to auto-detect
             from a memory-bounded, reduced-resolution scan of the raster
-            (>20 distinct values -> regression, same threshold as
-            detect_field_type). Determined before alignment, since it
+            within bbox (>20 distinct values -> regression, same threshold
+            as detect_field_type). Determined before alignment, since it
             decides the resampling method (nearest vs bilinear).
         nodata_values: optional list of extra sentinel values to treat as
             missing, beyond the raster's own declared nodata (e.g. MS-NFI's
@@ -390,29 +390,29 @@ def load_embeddings_for_raster(
             valid pixels are found across any tile
     """
     import rasterio
+    import rasterio.features
+    from rasterio.warp import transform_bounds, transform_geom
+    from rasterio.windows import from_bounds as _window_from_bounds
     from sklearn.preprocessing import LabelEncoder
 
     from tessera_eval.rasterize import align_raster_to_grid
 
     nodata_values = nodata_values or []
+    bbox_geom_4326 = _box(*bbox)
 
     if task is None:
+        # Memory-bounded pre-scan: read at reduced resolution (capped
+        # regardless of the source raster's size) just to guess the task,
+        # so the correct resampling method is used in the tile loop below.
         with rasterio.open(raster_path) as src:
-            # Restrict the pre-scan to the bbox area only — reading the whole
-            # raster here defeats the purpose of bbox-bounding in the first place.
-            from rasterio.warp import transform_bounds
-            from rasterio.windows import from_bounds as _window_from_bounds
-
             west, south, east, north = bbox
             raster_bounds = transform_bounds("EPSG:4326", src.crs, west, south, east, north)
             window = _window_from_bounds(*raster_bounds, transform=src.transform)
-
             scale = min(1.0, 2000 / max(window.width, window.height, 1))
             out_shape = (max(1, int(window.height * scale)), max(1, int(window.width * scale)))
             sample = src.read(band, window=window, out_shape=out_shape, masked=True).astype(
                 np.float64
             )
-
         for v in nodata_values:
             sample = np.ma.masked_equal(sample, v)
         sample_values = sample.compressed()
@@ -450,7 +450,19 @@ def load_embeddings_for_raster(
             nodata_values=nodata_values,
         )
 
-        valid_mask = ~np.isnan(aligned)
+        # Clip to the actual requested bbox, not just to non-nodata pixels —
+        # a tile can extend well beyond bbox, and (for spatial hold-out)
+        # two nearby bboxes can share a tile.
+        bbox_geom_tile_crs = transform_geom("EPSG:4326", tile_crs, bbox_geom_4326.__geo_interface__)
+        bbox_mask = rasterio.features.rasterize(
+            [(bbox_geom_tile_crs, 1)],
+            out_shape=(h, w),
+            transform=tile_transform,
+            fill=0,
+            dtype=np.uint8,
+        ).astype(bool)
+
+        valid_mask = ~np.isnan(aligned) & bbox_mask
         if not valid_mask.any():
             continue
         tiles_with_data += 1

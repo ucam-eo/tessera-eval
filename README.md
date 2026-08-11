@@ -151,7 +151,7 @@ tessera-eval learning-curve --models rf --spatial-holdout --test-bbox 27.16,67.7
 For `--raster`, `--bbox` sets the training region (required, since a raster has no natural extent like polygons do); omitting `--test-bbox` splits it in half instead of requiring both:
 
 ```bash
-tessera-eval learning-curve --raster site_type.tif --spatial-holdout --bbox 27.0,67.65,27.3,67.95 --test-bbox 27.16,67.77,27.23,67.82 --models rf
+tessera-eval learning-curve --raster site_type.tif --spatial-holdout --bbox 27.1,67.75,27.2,67.85 --test-bbox 27.3,67.77,27.4,67.82 --models rf
 ```
 
 For shapefiles/GeoJSON, you can also use a completely separate shapefile/GeoJSON as the test set:
