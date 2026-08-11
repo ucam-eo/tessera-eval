@@ -123,13 +123,13 @@ cm = None
 for event in run_kfold_cv(vectors, labels, ["rf"], k=5):
     if event["type"] == "confusion_matrices":
         cm = np.array(event["confusion_matrices"]["rf"])
-
 # Row-normalize to per-class recall
 recall = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
 for i, name in enumerate(class_names):
-    worst = np.argsort(recall[i])[::-1]
+    off_diag = [(j, recall[i, j]) for j in range(len(class_names)) if j != i]
+    worst_idx, worst_val = max(off_diag, key=lambda x: x[1])
     print(f"{name:>20}: recall {recall[i, i]:.2f} "
-          f"(most confused with {class_names[worst[1]]})")
+          f"(most confused with {class_names[worst_idx]})")
 ```
 
 ## 7. Spatial features (optional)
