@@ -1,6 +1,7 @@
 """Learning curve and k-fold cross-validation evaluation with streaming results."""
 
 import logging
+import threading
 import warnings
 
 import numpy as np
@@ -21,6 +22,54 @@ from tessera_eval.classify import (
     make_classifier,
     make_regressor,
 )
+
+_HEARTBEAT_INTERVAL_S = 5  # matches server.py's tile-fetch heartbeat cadence
+
+
+def _fit_with_heartbeat(fit_fn, *, interval=_HEARTBEAT_INTERVAL_S):
+    """Run a blocking ``fit_fn()`` (e.g. ``lambda: clf.fit(X, y)``) in a
+    background thread; yield a ``{"type": "heartbeat"}`` event every
+    ``interval`` seconds while it's still running. Use as
+    ``result = yield from _fit_with_heartbeat(fit_fn)`` -- the generator's
+    return value is whatever ``fit_fn()`` returned (e.g. a trained U-Net
+    model); for a plain ``clf.fit()`` call (mutates in place, return value
+    unused by callers here) just discard it.
+
+    A single classifier .fit() call used to block this generator -- and
+    therefore the whole SSE response -- with zero output for as long as
+    training took. That's invisible to the caller in the ordinary case
+    (a few seconds), but for spatial_mlp specifically (9x the input
+    dimensionality of plain mlp, 4x more training samples from
+    augment_spatial, a wider network, and CPU-only scikit-learn -- no GPU
+    regardless of the host) a single fit can run well past 20 minutes.
+    Confirmed live: a fit that long left the SSE stream completely silent
+    for its whole duration, and whatever was carrying the connection (SSH
+    tunnel for a gpu-box deploy, in the reported case) dropped it as idle
+    partway through, surfacing to the user as a "network error" moments
+    before the fit would otherwise have finished successfully. Mirrors the
+    existing tile-fetch heartbeat pattern in server.py (background thread +
+    a queue polled with a timeout) rather than inventing a new one.
+
+    Re-raises whatever ``fit_fn`` raised, if anything, once it finishes.
+    """
+    result_holder = []
+    error_holder = []
+
+    def _run():
+        try:
+            result_holder.append(fit_fn())
+        except Exception as exc:  # re-raised on the generator's own thread below
+            error_holder.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(timeout=interval)
+        if thread.is_alive():
+            yield {"type": "heartbeat"}
+    if error_holder:
+        raise error_holder[0]
+    return result_holder[0]
 
 
 def run_learning_curve(
@@ -269,7 +318,9 @@ def run_learning_curve(
 
                 clf = make_classifier(name, (classifier_params or {}).get(name, {}))
                 try:
-                    clf.fit(X_tr, y_tr_aug)
+                    yield from _fit_with_heartbeat(
+                        lambda: clf.fit(X_tr, y_tr_aug), interval=_HEARTBEAT_INTERVAL_S
+                    )
                     y_pred = clf.predict(X_te)
                     f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
                     f1w = f1_score(y_test, y_pred, average="weighted", zero_division=0)
@@ -313,7 +364,12 @@ def run_learning_curve(
                                 # Use fewer epochs for learning curve (full epochs only for final model)
                                 unet_params = dict((classifier_params or {}).get(unet_name, {}))
                                 unet_params.setdefault("epochs", 15)
-                                model = train_unet_on_patches(train_patches, n_classes, unet_params)
+                                model = yield from _fit_with_heartbeat(
+                                    lambda: train_unet_on_patches(
+                                        train_patches, n_classes, unet_params
+                                    ),
+                                    interval=_HEARTBEAT_INTERVAL_S,
+                                )
 
                                 # Evaluate on test patches
                                 all_true, all_pred = [], []

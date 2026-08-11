@@ -1469,6 +1469,14 @@ def run_large_area():
                     )
                     + "\n"
                 )
+            elif event["type"] == "heartbeat":
+                # From _fit_with_heartbeat, during a single slow classifier fit
+                # (spatial_mlp, U-Net) -- same wire event the tile-fetch phase
+                # above already sends and the frontend already ignores-by-design
+                # (keep-alive only). Bonus: since this loop's _cancelled() check
+                # runs on every yielded event, a long fit is now also actually
+                # cancellable every ~5s instead of only between whole classifiers.
+                yield json.dumps({"event": "heartbeat"}) + "\n"
 
         # Store active_models for deferred training
         _tile_cache["_active_models"] = active_models
