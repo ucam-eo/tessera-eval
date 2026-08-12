@@ -15,6 +15,7 @@ from sklearn.metrics import (
     r2_score,
 )
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
 
 from tessera_eval.classify import (
     _strip_variant_suffix,
@@ -70,6 +71,42 @@ def _fit_with_heartbeat(fit_fn, *, interval=_HEARTBEAT_INTERVAL_S):
     if error_holder:
         raise error_holder[0]
     return result_holder[0]
+
+
+def _fit_predict_relabeled(clf, X_tr, y_tr, X_te, *, interval=_HEARTBEAT_INTERVAL_S):
+    """Fit ``clf`` on ``(X_tr, y_tr)`` and predict ``X_te``, remapping
+    ``y_tr`` to a contiguous ``0..(k-1)`` range for the duration (``k`` =
+    classes actually present in ``y_tr``) and mapping predictions back to
+    the original label space before returning them.
+
+    xgboost's sklearn wrapper requires the labels passed to .fit() to
+    already be an exact contiguous 0..(k-1) range and raises ("Invalid
+    classes inferred from unique values of y") if not -- but the *global*
+    label space (used for n_classes, confusion matrices, etc.) can easily
+    contain classes that are simply absent from a given y_train, leaving
+    gaps. Confirmed live (Louis Driver), spatial-split mode specifically:
+    "Invalid classes inferred from unique values of y. Expected: [0..13],
+    got: [0,1,...,8,10,...,13,15]" -- per-class sampling here always takes
+    at least one sample of every class *present in the training region*,
+    so classes 9 and 14 weren't merely undersampled at that percentage,
+    they most likely have zero pixels in the train-side bboxes at all
+    (geographically confined to the test-side region instead) -- a class
+    this can never see regardless of percentage, not just a small-sample
+    unlucky draw. (A small non-spatial-split subsample missing a rare
+    class by chance is the same failure mode either way.) The other
+    classifiers here (kNN, RandomForest, MLPClassifier) don't have this
+    contiguous-label requirement, so it went unnoticed until xgboost was
+    actually exercised on data with a class like this.
+
+    Applied unconditionally rather than special-cased to xgboost: it's a
+    no-op in substance for classifiers that don't care, so this is one
+    fewer special case rather than two code paths to keep in sync.
+    """
+    encoder = LabelEncoder()
+    y_tr_encoded = encoder.fit_transform(y_tr)
+    yield from _fit_with_heartbeat(lambda: clf.fit(X_tr, y_tr_encoded), interval=interval)
+    y_pred_encoded = clf.predict(X_te)
+    return encoder.inverse_transform(y_pred_encoded)
 
 
 def run_learning_curve(
@@ -318,10 +355,9 @@ def run_learning_curve(
 
                 clf = make_classifier(name, (classifier_params or {}).get(name, {}))
                 try:
-                    yield from _fit_with_heartbeat(
-                        lambda: clf.fit(X_tr, y_tr_aug), interval=_HEARTBEAT_INTERVAL_S
+                    y_pred = yield from _fit_predict_relabeled(
+                        clf, X_tr, y_tr_aug, X_te, interval=_HEARTBEAT_INTERVAL_S
                     )
-                    y_pred = clf.predict(X_te)
                     f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
                     f1w = f1_score(y_test, y_pred, average="weighted", zero_division=0)
                     f1_scores[name].append(f1)
@@ -639,8 +675,18 @@ def run_kfold_cv(
                 else:
                     model = make_regressor(name, (model_params or {}).get(name, {}))
 
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
+                if is_classification:
+                    # Same xgboost contiguous-label requirement as
+                    # run_learning_curve -- see _fit_predict_relabeled's
+                    # docstring. StratifiedKFold makes this less likely
+                    # than a small learning-curve subsample (it tries to
+                    # preserve class proportions per fold), but a class
+                    # with very few total samples can still end up absent
+                    # from a training fold.
+                    y_pred = yield from _fit_predict_relabeled(model, X_train, y_train, X_test)
+                else:
+                    model.fit(X_train, y_train)
+                    y_pred = model.predict(X_test)
 
                 if is_classification:
                     metrics = {
