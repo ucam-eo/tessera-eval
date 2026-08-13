@@ -29,6 +29,7 @@ from tessera_eval.classify import (
 from tessera_eval.data import (
     dequantize_int8,
     dequantize_uint8,
+    load_embeddings_for_raster,
     load_embeddings_for_shapefile,
     load_embeddings_for_shapefile_vq,
     load_tee_vectors,
@@ -40,4 +41,4 @@ from tessera_eval.evaluate import (
     run_kfold_cv,
     run_learning_curve,
 )
-from tessera_eval.rasterize import rasterize_shapefile
+from tessera_eval.rasterize import align_raster_to_grid, rasterize_shapefile

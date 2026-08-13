@@ -343,3 +343,150 @@ def _is_4326(crs):
         return int(crs.to_epsg() or 0) == 4326
     except Exception:
         return "4326" in str(crs)
+
+
+def load_embeddings_for_raster(
+    raster_path, bbox, year, gt_instance, band=1, task=None, nodata_values=None, callback=None
+):
+    """Load embeddings tile-by-tile for all pixels covered by an already-
+    rasterized reference layer, within a bounded area of interest.
+
+    Like load_embeddings_for_shapefile, but the labels come from a raster
+    (e.g. a forest-inventory GeoTIFF) instead of polygons — no polygon
+    rasterization step is needed, only alignment onto each GeoTessera
+    tile's grid. Unlike a shapefile (whose polygons naturally bound the
+    area of interest), a raster gives no such boundary — a bbox is
+    required to avoid processing e.g. a whole country's worth of tiles.
+
+    Args:
+        raster_path: path to a GeoTIFF (or any rasterio-readable raster)
+        bbox: (west, south, east, north) tuple, EPSG:4326 degrees —
+            required, since GeoTessera's tile registry is indexed this way
+        year: Year of embeddings to load
+        gt_instance: GeoTessera instance (with registry and embeddings_dir)
+        band: 1-based band index to read (default 1)
+        task: "classification" or "regression", or None to auto-detect
+            from a memory-bounded, reduced-resolution scan of the raster
+            within bbox (>20 distinct values -> regression, same threshold
+            as detect_field_type). Determined before alignment, since it
+            decides the resampling method (nearest vs bilinear).
+        nodata_values: optional list of extra sentinel values to treat as
+            missing, beyond the raster's own declared nodata (e.g. MS-NFI's
+            32766/32767)
+        callback: Optional function(current_tile, total_tiles) for progress
+
+    Returns:
+        vectors: float32 array, shape (N, 128)
+        labels: int array, shape (N,) for classification (0-indexed), or
+            float32 array, shape (N,) for regression
+        class_names: list of str, class names in label-index order
+            (empty list for regression)
+        stats: dict with tile_count, tiles_with_data, total_pixels, n_classes
+        task: str, "classification" or "regression" (echoes the input, or
+            the auto-detected value)
+
+    Raises:
+        ValueError: If no GeoTessera tiles are found for bbox/year, or no
+            valid pixels are found across any tile
+    """
+    import rasterio
+    import rasterio.features
+    from rasterio.warp import transform_bounds, transform_geom
+    from rasterio.windows import from_bounds as _window_from_bounds
+    from sklearn.preprocessing import LabelEncoder
+
+    from tessera_eval.rasterize import align_raster_to_grid
+
+    nodata_values = nodata_values or []
+    bbox_geom_4326 = _box(*bbox)
+
+    if task is None:
+        # Memory-bounded pre-scan: read at reduced resolution (capped
+        # regardless of the source raster's size) just to guess the task,
+        # so the correct resampling method is used in the tile loop below.
+        with rasterio.open(raster_path) as src:
+            west, south, east, north = bbox
+            raster_bounds = transform_bounds("EPSG:4326", src.crs, west, south, east, north)
+            window = _window_from_bounds(*raster_bounds, transform=src.transform)
+            scale = min(1.0, 2000 / max(window.width, window.height, 1))
+            out_shape = (max(1, int(window.height * scale)), max(1, int(window.width * scale)))
+            sample = src.read(band, window=window, out_shape=out_shape, masked=True).astype(
+                np.float64
+            )
+        for v in nodata_values:
+            sample = np.ma.masked_equal(sample, v)
+        sample_values = sample.compressed()
+        if len(sample_values) == 0:
+            raise ValueError(
+                "No valid pixel values found in raster (within bbox) for task auto-detection"
+            )
+        task = "regression" if len(np.unique(sample_values)) > 20 else "classification"
+
+    resampling = "bilinear" if task == "regression" else "nearest"
+
+    tiles = gt_instance.registry.load_blocks_for_region(bbox, year)
+    total_tiles = len(tiles)
+    if total_tiles == 0:
+        raise ValueError(f"No GeoTessera tiles found for bbox {bbox}, year {year}")
+
+    all_vectors, all_raw_labels = [], []
+    tiles_with_data = 0
+
+    for tile_idx, (yr, tile_lon, tile_lat, tile_emb, tile_crs, tile_transform) in enumerate(
+        gt_instance.fetch_embeddings(tiles)
+    ):
+        if callback:
+            callback(tile_idx + 1, total_tiles)
+
+        h, w, dim = tile_emb.shape
+        aligned = align_raster_to_grid(
+            raster_path,
+            tile_transform,
+            tile_crs,
+            w,
+            h,
+            band=band,
+            resampling=resampling,
+            nodata_values=nodata_values,
+        )
+
+        # Clip to the actual requested bbox, not just to non-nodata pixels —
+        # a tile can extend well beyond bbox, and (for spatial hold-out)
+        # two nearby bboxes can share a tile.
+        bbox_geom_tile_crs = transform_geom("EPSG:4326", tile_crs, bbox_geom_4326.__geo_interface__)
+        bbox_mask = rasterio.features.rasterize(
+            [(bbox_geom_tile_crs, 1)],
+            out_shape=(h, w),
+            transform=tile_transform,
+            fill=0,
+            dtype=np.uint8,
+        ).astype(bool)
+
+        valid_mask = ~np.isnan(aligned) & bbox_mask
+        if not valid_mask.any():
+            continue
+        tiles_with_data += 1
+        all_vectors.append(tile_emb[valid_mask])
+        all_raw_labels.append(aligned[valid_mask])
+
+    if not all_vectors:
+        raise ValueError("No valid pixels found across any tiles")
+
+    raw_labels = np.concatenate(all_raw_labels, axis=0)
+    vectors = np.concatenate(all_vectors, axis=0).astype(np.float32)
+
+    if task == "classification":
+        le = LabelEncoder()
+        labels = le.fit_transform(raw_labels).astype(np.int32)
+        class_names = [str(c) for c in le.classes_]
+    else:
+        labels = raw_labels.astype(np.float32)
+        class_names = []
+
+    stats = {
+        "tile_count": total_tiles,
+        "tiles_with_data": tiles_with_data,
+        "total_pixels": len(labels),
+        "n_classes": len(class_names) if task == "classification" else None,
+    }
+    return vectors, labels, class_names, stats, task
