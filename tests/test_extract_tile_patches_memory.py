@@ -51,9 +51,7 @@ def test_extract_tile_patches_copies_out_of_the_source_tile(monkeypatch):
     tile_size_px, dim = 300, 8
     tlon, tlat, year = 10.05, 45.05, 2024
     # All-finite tile: the no-NaN branch, which never copied before this fix.
-    tile_emb = np.random.default_rng(0).random((tile_size_px, tile_size_px, dim)).astype(
-        np.float32
-    )
+    tile_emb = np.random.default_rng(0).random((tile_size_px, tile_size_px, dim)).astype(np.float32)
     crs = "EPSG:4326"
     res = 0.1 / tile_size_px  # tile spans 0.1 deg, matching real tile granularity
     transform = Affine(res, 0, tlon - 0.05, 0, -res, tlat + 0.05)

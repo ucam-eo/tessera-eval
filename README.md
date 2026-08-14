@@ -72,6 +72,7 @@ Already have a TEE vector directory on disk? Load it directly:
 
 ```python
 from tessera_eval import load_tee_vectors
+
 vectors, coords, metadata = load_tee_vectors("/path/to/vectors/aoi/2024")
 # vectors: float32 (N, 128); coords: int32 (N, 2) pixel (x, y); metadata: dict
 ```
