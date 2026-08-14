@@ -27,36 +27,49 @@ def _bboxes_overlap(a, b):
     return a_minx < b_maxx and b_minx < a_maxx and a_miny < b_maxy and b_miny < a_maxy
 
 
+def _detect_source_kind(path: str) -> str:
+    """Guess whether a ground-truth file is a raster or a vector
+    (shapefile/GeoJSON), from its extension."""
+    ext = Path(path).suffix.lower()
+    if ext in (".tif", ".tiff"):
+        return "raster"
+    if ext in (".geojson", ".json", ".shp", ".gpkg"):
+        return "shapefile"
+    raise typer.BadParameter(
+        f"Could not determine file type for {path} (unrecognized extension "
+        f"'{ext}'). Expected .tif/.tiff for rasters, or .geojson/.shp/.gpkg "
+        "for vector data."
+    )
+
+
 app = typer.Typer()
 
 
 def _get_vectors_and_labels(
-    data: str | None, field: str | None, year: int, vectors_path: str | None
+    data: str | None,
+    field: str | None,
+    year: int,
+    vectors_path: str | None,
+    bbox: str | None = None,
+    band: int = 1,
+    nodata: str | None = None,
 ):
-    """Load vectors, labels, and task type from a cached .npz, or fresh from a shapefile.
-
-    Falls back to the default cache file (DEFAULT_VECTORS_PATH) in the current
-    directory if neither vectors_path nor data is given.
+    """Load vectors, labels, task, and class names either from a cached
+    .npz, or fresh from a shapefile/GeoJSON or GeoTIFF.
 
     Args:
-        data: path to a shapefile/GeoJSON with labelled polygons, or None to
-            load from a cache instead
-        field: column name in data containing the class/target label
+        data: path to a shapefile/GeoJSON or GeoTIFF, or None to load from a cache
+        field: class/target column (required if data is a shapefile/GeoJSON)
         year: Tessera embedding year, used only when loading fresh from data
-        vectors_path: path to a cached .npz previously written by `load`, or
-            None to use the default cache path or fall back to data
+        vectors_path: path to a cached .npz, or None to use the default cache
+            path or fall back to data
+        bbox: minx,miny,maxx,maxy in EPSG:4326, required if data is a raster
+        band: 1-based band index to read (raster only)
+        nodata: comma-separated extra sentinel nodata values (raster only)
 
     Returns:
-        vectors: float32 array, shape (N, 128), one embedding per labelled pixel
-        labels: int array, shape (N,) for classification, or float32 array,
-            shape (N,) for regression
-        class_names: list of str, class names in label-index order
-            (meaningless for regression, kept for a consistent return shape)
-        task: str, "classification" or "regression"
+        vectors, labels, class_names, task — see load/learning_curve docstrings
     """
-
-    # No explicit --vectors and no --data given: fall back to the default
-    # cache file in the current directory, if it exists.
     if vectors_path is None and data is None:
         if not DEFAULT_VECTORS_PATH.exists():
             raise typer.BadParameter("No cached vectors found — run `load` first, or pass --data.")
@@ -68,8 +81,12 @@ def _get_vectors_and_labels(
         task = str(npz["task"]) if "task" in npz.files else "classification"
         return npz["vectors"], npz["labels"], list(npz["class_names"]), task
 
-    if not data or not field:
-        raise typer.BadParameter("Provide either --vectors, or both --data and --field.")
+    if not data:
+        raise typer.BadParameter("Provide either --vectors, or --data.")
+    if year is None:
+        raise typer.BadParameter("--year is required when --data is given directly.")
+
+    source_kind = _detect_source_kind(data)
 
     try:
         from geotessera import GeoTessera
@@ -78,20 +95,54 @@ def _get_vectors_and_labels(
             'Loading from --data requires the geotessera extra: pip install -e ".[geotessera]"'
         ) from exc
 
-    gdf = gpd.read_file(data)
-    task = detect_field_type(gdf, field)
-    gt = GeoTessera()  # defaults embeddings_dir to the current working directory
-    print(f"Loading embeddings from {data} (field={field}, year={year})...")
-    print(f"Detected task: {task}")
-    vectors, labels, class_names, stats = load_embeddings_for_shapefile(
-        gdf,
-        field=field,
-        year=year,
-        gt_instance=gt,
-        callback=lambda i, n: print(f"  tile {i}/{n}", end="\r"),
-    )
-    print(f"\n{stats['total_pixels']:,} pixels, {stats['n_classes']} classes: {class_names}")
-    return vectors, labels, class_names, task
+    gt = GeoTessera()
+
+    if source_kind == "shapefile":
+        if not field:
+            raise typer.BadParameter("--field is required when --data is a shapefile/GeoJSON.")
+        gdf = gpd.read_file(data)
+        task = detect_field_type(gdf, field)
+        print(f"Loading embeddings from {data} (field={field}, year={year})...")
+        print(f"Detected task: {task}")
+        vectors, labels, class_names, stats = load_embeddings_for_shapefile(
+            gdf,
+            field=field,
+            year=year,
+            gt_instance=gt,
+            callback=lambda i, n: print(f"  tile {i}/{n}", end="\r"),
+        )
+        print(f"\n{stats['total_pixels']:,} pixels, {stats['n_classes']} classes: {class_names}")
+        return vectors, labels, class_names, task
+
+    else:  # raster
+        if not bbox:
+            raise typer.BadParameter(
+                "--bbox is required when --data is a raster, since a raster has "
+                "no natural area boundary the way labelled polygons do."
+            )
+        try:
+            minx, miny, maxx, maxy = (float(v) for v in bbox.split(","))
+        except ValueError as exc:
+            raise typer.BadParameter(
+                "--bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
+            ) from exc
+        nodata_values = [float(v) for v in nodata.split(",")] if nodata else None
+
+        print(f"Loading embeddings for {data} (bbox={bbox}, year={year})...")
+        vectors, labels, class_names, stats, task = load_embeddings_for_raster(
+            data,
+            bbox=(minx, miny, maxx, maxy),
+            year=year,
+            gt_instance=gt,
+            band=band,
+            nodata_values=nodata_values,
+            callback=lambda i, n: print(f"  tile {i}/{n}", end="\r"),
+        )
+        print(f"\nDetected task: {task}")
+        print(
+            f"{stats['total_pixels']:,} pixels across {stats['tiles_with_data']}/{stats['tile_count']} tiles"
+        )
+        return vectors, labels, class_names, task
 
 
 @app.command()
@@ -103,136 +154,141 @@ def version():
 
 
 @app.command()
-@app.command()
 def load(
-    data: str = typer.Option(..., help="Path to a shapefile/GeoJSON with labelled polygons"),
-    field: str = typer.Option(..., help="Column name containing the class/target label"),
-    year: int = typer.Option(2024, help="Tessera embedding year"),
-    output: str = typer.Option(None, help=f"Output .npz path (default: {DEFAULT_VECTORS_PATH})"),
-):
-    """Download embeddings once and cache vectors/labels/task to disk for reuse.
-
-    Args:
-        data: path to a shapefile/GeoJSON with labelled polygons
-        field: column name in data containing the class/target label
-        year: Tessera embedding year
-        output: .npz path to write; defaults to DEFAULT_VECTORS_PATH if not given
-    """
-    output_path = Path(output) if output else DEFAULT_VECTORS_PATH
-
-    vectors, labels, class_names, task = _get_vectors_and_labels(data, field, year, None)
-    np.savez(
-        output_path,
-        vectors=vectors,
-        labels=labels,
-        class_names=np.array(class_names, dtype=object),
-        source_data=data,
-        source_field=field,
-        source_year=year,
-        source_kind="shapefile",
-        task=task,
-    )
-    print(f"Saved to {output_path}")
-
-
-@app.command(name="load-raster")
-@app.command(name="load-raster")
-def load_raster(
-    raster: str = typer.Option(..., help="Path to a GeoTIFF (or other rasterio-readable raster)"),
+    data: str = typer.Option(..., help="Path to a shapefile/GeoJSON or GeoTIFF ground-truth file"),
+    field: str = typer.Option(None, help="Class/target column (required for shapefile/GeoJSON)"),
     bbox: str = typer.Option(
-        ...,
-        help="minx,miny,maxx,maxy in EPSG:4326 (longitude,latitude in degrees) — "
-        "required, since a raster may cover a much larger area than you want "
-        "to process",
+        None, help="minx,miny,maxx,maxy, EPSG:4326 — required for raster input"
     ),
-    year: int = typer.Option(2024, help="Tessera embedding year"),
-    band: int = typer.Option(1, help="1-based band index to read"),
+    year: int = typer.Option(None, help="Tessera embedding year (required)"),
+    band: int = typer.Option(1, help="1-based band index to read (raster only)"),
     nodata: str = typer.Option(
-        None,
-        help="Comma-separated extra sentinel values to treat as missing "
-        "(e.g. 32766,32767), beyond the raster's own declared nodata",
+        None, help="Comma-separated extra sentinel nodata values (raster only)"
     ),
     task: str = typer.Option(
         None, help="'classification' or 'regression' (default: auto-detected)"
     ),
     output: str = typer.Option(None, help=f"Output .npz path (default: {DEFAULT_VECTORS_PATH})"),
 ):
-    """Download embeddings for pixels covered by an already-rasterized reference
-    layer (e.g. a forest-inventory GeoTIFF), and cache them for reuse.
+    """Download embeddings for labelled ground truth and cache them for reuse.
+
+    Accepts either a shapefile/GeoJSON of labelled polygons, or a GeoTIFF of
+    an already-rasterized reference layer — detected automatically from the
+    file extension.
 
     Args:
-        raster: path to a GeoTIFF (or other rasterio-readable raster)
-        bbox: minx,miny,maxx,maxy in EPSG:4326, bounding the area to process
-        year: Tessera embedding year
-        band: 1-based band index to read
-        nodata: comma-separated extra sentinel values to treat as missing
+        data: path to a shapefile/GeoJSON or GeoTIFF ground-truth file
+        field: class/target label column (required for shapefile/GeoJSON)
+        bbox: minx,miny,maxx,maxy in EPSG:4326 (required for raster input)
+        year: Tessera embedding year (required)
+        band: 1-based band index to read (raster only)
+        nodata: comma-separated extra sentinel values to treat as missing (raster only)
         task: "classification" or "regression"; auto-detected if not given
         output: .npz path to write; defaults to DEFAULT_VECTORS_PATH if not given
     """
-    try:
-        minx, miny, maxx, maxy = (float(v) for v in bbox.split(","))
-    except ValueError as exc:
-        raise typer.BadParameter(
-            "--bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
-        ) from exc
-    if not (
-        -180 <= minx <= 180 and -180 <= maxx <= 180 and -90 <= miny <= 90 and -90 <= maxy <= 90
-    ):
-        raise typer.BadParameter(
-            f"--bbox values look out of range for EPSG:4326 degrees: {bbox}. "
-            "Did you pass coordinates in meters instead?"
+    if year is None:
+        raise typer.BadParameter("--year is required.")
+
+    source_kind = _detect_source_kind(data)
+    output_path = Path(output) if output else DEFAULT_VECTORS_PATH
+
+    if source_kind == "shapefile":
+        if not field:
+            raise typer.BadParameter("--field is required when --data is a shapefile/GeoJSON.")
+        vectors, labels, class_names, task_out = _get_vectors_and_labels(data, field, year, None)
+        np.savez(
+            output_path,
+            vectors=vectors,
+            labels=labels,
+            class_names=np.array(class_names, dtype=object),
+            source_data=data,
+            source_field=field,
+            source_year=year,
+            source_kind="shapefile",
+            task=task_out,
+        )
+    else:  # raster
+        if not bbox:
+            raise typer.BadParameter(
+                "--bbox is required when --data is a raster, since a raster has "
+                "no natural area boundary the way labelled polygons do."
+            )
+        try:
+            minx, miny, maxx, maxy = (float(v) for v in bbox.split(","))
+        except ValueError as exc:
+            raise typer.BadParameter(
+                "--bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
+            ) from exc
+        if not (
+            -180 <= minx <= 180 and -180 <= maxx <= 180 and -90 <= miny <= 90 and -90 <= maxy <= 90
+        ):
+            raise typer.BadParameter(
+                f"--bbox values look out of range for EPSG:4326 degrees: {bbox}. "
+                "Did you pass coordinates in meters instead?"
+            )
+
+        nodata_values = [float(v) for v in nodata.split(",")] if nodata else None
+
+        try:
+            from geotessera import GeoTessera
+        except ImportError as exc:
+            raise typer.BadParameter(
+                'Loading rasters requires the geotessera extra: pip install -e ".[geotessera]"'
+            ) from exc
+
+        gt = GeoTessera()
+        print(f"Loading embeddings for {data} (bbox={bbox}, year={year})...")
+        vectors, labels, class_names, stats, task_out = load_embeddings_for_raster(
+            data,
+            bbox=(minx, miny, maxx, maxy),
+            year=year,
+            gt_instance=gt,
+            band=band,
+            task=task,
+            nodata_values=nodata_values,
+            callback=lambda i, n: print(f"  tile {i}/{n}", end="\r"),
+        )
+        print(f"\nDetected task: {task_out}")
+        print(
+            f"{stats['total_pixels']:,} pixels across {stats['tiles_with_data']}/{stats['tile_count']} tiles"
         )
 
-    nodata_values = [float(v) for v in nodata.split(",")] if nodata else None
+        np.savez(
+            output_path,
+            vectors=vectors,
+            labels=labels,
+            class_names=np.array(class_names, dtype=object),
+            source_data=data,
+            source_field="",
+            source_year=year,
+            source_kind="raster",
+            source_bbox=bbox,
+            source_band=band,
+            source_nodata=nodata or "",
+            task=task_out,
+        )
 
-    try:
-        from geotessera import GeoTessera
-    except ImportError as exc:
-        raise typer.BadParameter(
-            'load-raster requires the geotessera extra: pip install -e ".[geotessera]"'
-        ) from exc
-
-    gt = GeoTessera()
-    print(f"Loading embeddings for {raster} (bbox={bbox}, year={year})...")
-    vectors, labels, class_names, stats, detected_task = load_embeddings_for_raster(
-        raster,
-        bbox=(minx, miny, maxx, maxy),
-        year=year,
-        gt_instance=gt,
-        band=band,
-        task=task,
-        nodata_values=nodata_values,
-        callback=lambda i, n: print(f"  tile {i}/{n}", end="\r"),
-    )
-    task = task or detected_task
-    print(f"\nDetected task: {task}")
-    print(
-        f"{stats['total_pixels']:,} pixels across {stats['tiles_with_data']}/{stats['tile_count']} tiles"
-    )
-
-    output_path = Path(output) if output else DEFAULT_VECTORS_PATH
-    np.savez(
-        output_path,
-        vectors=vectors,
-        labels=labels,
-        class_names=np.array(class_names, dtype=object),
-        source_data=raster,
-        source_field="",
-        source_year=year,
-        source_kind="raster",
-        source_bbox=bbox,
-        source_band=band,
-        source_nodata=nodata or "",
-        task=task,
-    )
     print(f"Saved to {output_path}")
 
 
 @app.command()
 def kfold(
-    data: str = typer.Option(None, help="Path to a shapefile/GeoJSON (skip if using --vectors)"),
-    field: str = typer.Option(None, help="Class/target label column (skip if using --vectors)"),
-    year: int = typer.Option(2024, help="Tessera embedding year"),
+    data: str = typer.Option(
+        None, help="Path to a shapefile/GeoJSON or GeoTIFF (skip if using --vectors)"
+    ),
+    field: str = typer.Option(None, help="Class/target label column (shapefile/GeoJSON only)"),
+    bbox: str = typer.Option(
+        None, help="minx,miny,maxx,maxy, EPSG:4326 — required if --data is a raster"
+    ),
+    band: int = typer.Option(1, help="1-based band index to read (raster only)"),
+    nodata: str = typer.Option(
+        None, help="Comma-separated extra sentinel nodata values (raster only)"
+    ),
+    year: int = typer.Option(
+        None,
+        help="Tessera embedding year. Required if --data is given directly; "
+        "inferred from the cache otherwise.",
+    ),
     vectors_path: str = typer.Option(
         None, "--vectors", help=f"Path to a cached .npz (default: {DEFAULT_VECTORS_PATH})"
     ),
@@ -245,10 +301,7 @@ def kfold(
     ),
     seed: int = typer.Option(42, help="Random seed for reproducible fold splits"),
     max_samples: int = typer.Option(
-        None,
-        help="Cap the training set size per fold — recommended for dense, "
-        "wall-to-wall data (e.g. from load-raster), where every pixel in the "
-        "area is a labelled example rather than a sparse hand-labelled subset",
+        None, help="Cap the training set size per fold (random, not stratified by class)"
     ),
     confusion: bool = typer.Option(
         True, help="Print per-class recall / confusion summary (classification only)"
@@ -257,9 +310,12 @@ def kfold(
     """Cross-validate classifiers/regressors on labelled data and print results.
 
     Args:
-        data: path to a shapefile/GeoJSON (skip if using vectors_path)
-        field: class/target label column in data (skip if using vectors_path)
-        year: Tessera embedding year, used only when loading fresh from data
+        data: path to a shapefile/GeoJSON or GeoTIFF (skip if using vectors_path)
+        field: class/target label column (shapefile/GeoJSON only)
+        bbox: minx,miny,maxx,maxy, EPSG:4326; required if data is a raster
+        band: 1-based band index to read (raster only)
+        nodata: comma-separated extra sentinel nodata values (raster only)
+        year: Tessera embedding year; required if data is given directly
         vectors_path: path to a cached .npz from `load`
         models: comma-separated model/regressor names passed to run_kfold_cv
         k: number of cross-validation folds
@@ -270,7 +326,13 @@ def kfold(
     """
     model_list = models.split(",")
     vectors, labels, class_names, detected_task = _get_vectors_and_labels(
-        data, field, year, vectors_path
+        data,
+        field,
+        year,
+        vectors_path,
+        bbox=bbox,
+        band=band,
+        nodata=nodata,
     )
     task = task or detected_task
     if task not in ("classification", "regression"):
@@ -312,46 +374,52 @@ def kfold(
 
 @app.command()
 def learning_curve(
-    data: str = typer.Option(None, help="Path to a shapefile/GeoJSON (skip if using --vectors)"),
-    field: str = typer.Option(None, help="Class/target label column (skip if using --vectors)"),
-    raster: str = typer.Option(
-        None, help="Path to a GeoTIFF instead of --data (skip if using --vectors)"
+    data: str = typer.Option(
+        None, help="Path to a shapefile/GeoJSON or GeoTIFF (skip if using --vectors)"
+    ),
+    field: str = typer.Option(None, help="Class/target label column (shapefile/GeoJSON only)"),
+    bbox: str = typer.Option(
+        None,
+        help="Training region, EPSG:4326. Required if --data is a raster. For "
+        "--spatial-holdout with a shapefile, this is optional (defaults to the "
+        "polygons' own extent).",
+    ),
+    band: int = typer.Option(1, help="1-based band index to read (raster only)"),
+    nodata: str = typer.Option(
+        None, help="Comma-separated extra sentinel nodata values (raster only)"
     ),
     year: int = typer.Option(
         None,
-        help="Tessera embedding year (default: 2024, or the cached year with --spatial-holdout)",
+        help="Tessera embedding year for training. Required if --data is given "
+        "directly; inferred from the cache if using --spatial-holdout/--test-data "
+        "without --data.",
     ),
     vectors_path: str = typer.Option(
         None, "--vectors", help=f"Path to a cached .npz (default: {DEFAULT_VECTORS_PATH})"
     ),
     spatial_holdout: bool = typer.Option(
-        False, help="Hold out a separate test region from --data/--raster"
-    ),
-    bbox: str = typer.Option(
-        None,
-        help="Training/overall region. For --data: optional, defaults to the "
-        "polygons' own extent. For --raster: required — the area to load "
-        "(minx,miny,maxx,maxy, EPSG:4326). If --test-bbox is omitted, this "
-        "region is split in half by longitude for train/test.",
+        False,
+        help="Hold out a separate test region, splitting --data itself if --test-data isn't given",
     ),
     test_bbox: str = typer.Option(
         None,
-        help="Held-out test region (minx,miny,maxx,maxy, EPSG:4326). If "
-        "omitted, --bbox (or the polygons' own extent, for --data) is split "
-        "in half by longitude for train/test instead.",
-    ),
-    band: int = typer.Option(1, help="1-based band index to read (--raster only)"),
-    nodata: str = typer.Option(
-        None, help="Comma-separated extra sentinel nodata values (--raster only)"
+        help="Held-out test region, EPSG:4326. Required if the test source (--test-data, "
+        "or --data under --spatial-holdout) is a raster and doesn't already have its own bbox. "
+        "If omitted under plain --spatial-holdout, --data's region is split in half by longitude.",
     ),
     test_data: str = typer.Option(
         None,
-        help="Path to a separate shapefile/GeoJSON to use as a fixed, independent "
-        "test set. Takes precedence over --spatial-holdout/--bbox/--test-bbox. "
-        "Not supported for --raster.",
+        help="A separate shapefile/GeoJSON or GeoTIFF to use as the test set — a "
+        "different region, a different year (with --test-year), or both. "
+        "Required whenever --test-year is given.",
     ),
     test_field: str = typer.Option(
         None, help="Class/target label column in --test-data (default: same as --field)"
+    ),
+    test_year: int = typer.Option(
+        None,
+        help="Year for the test set. Requires --test-data — a different year always "
+        "needs its own ground-truth file, since labels may have changed.",
     ),
     models: str = typer.Option("rf", help="Comma-separated model/regressor names"),
     training_pcts: str = typer.Option(
@@ -366,27 +434,26 @@ def learning_curve(
 ):
     """See how model performance changes as training-label percentage increases.
 
-    Three ways to get a spatially separate test set: --test-data (a separate
-    shapefile/region), --spatial-holdout with --test-bbox (you choose the
-    held-out region), or --spatial-holdout alone (automatic east/west split
-    of --data's extent, or of --bbox for --raster).
+    Held-out test sets, in order of precedence:
+    --test-data alone (a separate region and/or year, fully independent);
+    --spatial-holdout (splits --data itself into train/test regions, same
+    year, unless --test-year + --test-data are also given); otherwise a
+    random split of --data/--vectors.
 
     Args:
-        data: path to a shapefile/GeoJSON (skip if using vectors_path or raster)
-        field: class/target label column in data (skip if using vectors_path)
-        raster: path to a GeoTIFF instead of data (skip if using vectors_path)
-        year: Tessera embedding year; falls back to the cached year with
-            spatial_holdout, or 2024 otherwise
-        vectors_path: path to a cached .npz from `load`/`load-raster`
-        spatial_holdout: hold out a separate test region from data/raster
-        bbox: training/overall region; required for raster, optional for data
-        test_bbox: held-out test region; if omitted, bbox (or data's own
-            extent) is split in half by longitude instead
+        data: path to a shapefile/GeoJSON or GeoTIFF (skip if using vectors_path)
+        field: class/target label column (shapefile/GeoJSON only)
+        bbox: training region, EPSG:4326; required if data is a raster
         band: 1-based band index to read (raster only)
         nodata: comma-separated extra sentinel nodata values (raster only)
-        test_data: path to a separate shapefile/GeoJSON for a fixed,
-            independent test set; not supported for raster
+        year: Tessera embedding year for training; required if data is given directly
+        vectors_path: path to a cached .npz from `load`
+        spatial_holdout: hold out a separate test region from data
+        test_bbox: held-out test region, EPSG:4326
+        test_data: separate shapefile/GeoJSON or GeoTIFF for the test set;
+            required if test_year is given
         test_field: class/target label column in test_data (default: same as field)
+        test_year: year for the test set; requires test_data
         models: comma-separated model/regressor names passed to run_learning_curve
         training_pcts: comma-separated training-set percentages to evaluate at
         repeats: repeats per training percentage
@@ -394,238 +461,247 @@ def learning_curve(
     """
     model_list = models.split(",")
     pcts = [int(p) for p in training_pcts.split(",")]
-
     test_vectors, test_labels = None, None
-    source_kind = "raster" if raster else ("shapefile" if data else None)
 
-    # Fill in source info from the cached .npz's saved metadata, but only
-    # for whichever the user didn't explicitly pass.
-    if (spatial_holdout or test_data) and not data and not raster:
+    if test_year is not None and not test_data:
+        raise typer.BadParameter(
+            "--test-year requires --test-data — a different year always needs "
+            "its own ground-truth file."
+        )
+
+    # Fill in --data/--field/--bbox/--year from the cached .npz's saved
+    # metadata, but only for whichever the user didn't explicitly pass.
+    if (spatial_holdout or test_data) and not data:
         if not DEFAULT_VECTORS_PATH.exists():
-            raise typer.BadParameter(
-                "No cached vectors found — run `load`/`load-raster` first, or pass --data/--raster."
-            )
+            raise typer.BadParameter("No cached vectors found — run `load` first, or pass --data.")
         npz = np.load(DEFAULT_VECTORS_PATH, allow_pickle=True)
+        data = str(npz["source_data"])
         source_kind = str(npz["source_kind"]) if "source_kind" in npz.files else "shapefile"
         if source_kind == "raster":
-            raster = str(npz["source_data"])
             bbox = bbox or str(npz["source_bbox"])
             band = int(npz["source_band"]) if "source_band" in npz.files else band
             if not nodata and "source_nodata" in npz.files:
                 nodata = str(npz["source_nodata"]) or None
         else:
-            data = str(npz["source_data"])
             field = field or str(npz["source_field"])
         if year is None:
             year = int(npz["source_year"])
         if task is None and "task" in npz.files:
             task = str(npz["task"])
-        print(
-            f"Using cached source: kind={source_kind}, "
-            f"data={data or raster}, field={field}, year={year}"
+        print(f"Using cached source: data={data}, field={field}, year={year}")
+
+    if data and year is None:
+        raise typer.BadParameter(
+            "--year is required when --data is given directly (no cached .npz to infer it from)."
         )
+    eval_year = test_year if test_year is not None else year
 
-    if year is None:
-        year = 2024
+    try:
+        from geotessera import GeoTessera
+    except ImportError as exc:
+        raise typer.BadParameter(
+            'Loading embeddings requires the geotessera extra: pip install -e ".[geotessera]"'
+        ) from exc
 
-    if test_data:
-        if source_kind == "raster":
-            raise typer.BadParameter("--test-data is not supported with --raster.")
-        if not data or not field:
-            raise typer.BadParameter(
-                "--test-data requires --data and --field for the training side."
+    def _load_side(src_path, src_bbox, src_field, src_year, label):
+        """Load one side (train or test) of the split, auto-detecting type."""
+        kind = _detect_source_kind(src_path)
+        if kind == "shapefile":
+            if not src_field:
+                raise typer.BadParameter(f"--field is required for {label} (shapefile/GeoJSON).")
+            gdf = gpd.read_file(src_path)
+            if len(gdf) == 0:
+                raise typer.BadParameter(f"{label} file {src_path} contains no polygons.")
+            gt_local = GeoTessera()
+            print(f"Loading {label} data from {src_path} ({src_year})...")
+            vecs, labs, cnames, _ = load_embeddings_for_shapefile(
+                gdf, field=src_field, year=src_year, gt_instance=gt_local
             )
-
-        try:
-            from geotessera import GeoTessera
-        except ImportError as exc:
-            raise typer.BadParameter(
-                'Loading from --data requires the geotessera extra: pip install -e ".[geotessera]"'
-            ) from exc
-
-        train_gdf = gpd.read_file(data)
-        if len(train_gdf) == 0:
-            raise typer.BadParameter(f"--data {data} contains no polygons.")
-        if task is None:
-            task = detect_field_type(train_gdf, field)
-        if task == "regression":
-            raise typer.BadParameter("learning-curve does not currently support regression")
-
-        gt = GeoTessera()
-        print(f"Loading training data from {data}...")
-        vectors, labels, class_names, _ = load_embeddings_for_shapefile(
-            train_gdf, field=field, year=year, gt_instance=gt
-        )
-        print(f"Loading independent test data from {test_data}...")
-        test_gdf = gpd.read_file(test_data)
-        if len(test_gdf) == 0:
-            raise typer.BadParameter(f"--test-data {test_data} contains no polygons.")
-        test_vectors, test_labels, test_class_names, _ = load_embeddings_for_shapefile(
-            test_gdf, field=test_field or field, year=year, gt_instance=gt
-        )
-        if task == "classification" and list(test_class_names) != list(class_names):
-            raise typer.BadParameter(
-                f"Class mismatch between train ({class_names}) and test ({test_class_names}) — "
-                "both must contain the same classes."
-            )
-
-    elif spatial_holdout and source_kind == "raster":
-        if not raster or not bbox:
-            raise typer.BadParameter(
-                "--spatial-holdout with --raster requires --bbox (the training/overall region)."
-            )
-        try:
-            minx, miny, maxx, maxy = (float(v) for v in bbox.split(","))
-        except ValueError as exc:
-            raise typer.BadParameter(
-                "--bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
-            ) from exc
-
-        if test_bbox:
+            return vecs, labs, cnames, "classification" if task != "regression" else task
+        else:  # raster
+            if not src_bbox:
+                raise typer.BadParameter(f"--bbox is required for {label} (raster).")
             try:
-                test_minx, test_miny, test_maxx, test_maxy = (
-                    float(v) for v in test_bbox.split(",")
-                )
+                minx, miny, maxx, maxy = (float(x) for x in src_bbox.split(","))
             except ValueError as exc:
                 raise typer.BadParameter(
-                    "--test-bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
+                    f"bbox for {label} must be four comma-separated numbers: minx,miny,maxx,maxy"
                 ) from exc
-            train_region = (minx, miny, maxx, maxy)
-            test_region = (test_minx, test_miny, test_maxx, test_maxy)
+            nodata_values = [float(x) for x in nodata.split(",")] if nodata else None
+            gt_local = GeoTessera()
+            print(f"Loading {label} data from {src_path} ({src_year})...")
+            vecs, labs, cnames, _, t = load_embeddings_for_raster(
+                src_path,
+                bbox=(minx, miny, maxx, maxy),
+                year=src_year,
+                gt_instance=gt_local,
+                band=band,
+                task=task,
+                nodata_values=nodata_values,
+            )
+            return vecs, labs, cnames, t
 
-            if _bboxes_overlap(train_region, test_region):
-                raise typer.BadParameter(
-                    f"--bbox {bbox} and --test-bbox {test_bbox} overlap — they must be "
-                    "disjoint, since --bbox defines the training region and shared "
-                    "pixels would leak between train and test."
-                )
-        else:
-            # No --test-bbox given: auto-split --bbox in half by longitude,
-            # matching the shapefile east/west default.
-            mid = (minx + maxx) / 2
-            train_region = (minx, miny, mid, maxy)
-            test_region = (mid, miny, maxx, maxy)
-
-        print(f"Raster spatial split: train {train_region}, test (held-out) {test_region}")
-
-        try:
-            from geotessera import GeoTessera
-        except ImportError as exc:
-            raise typer.BadParameter(
-                'Spatial hold-out requires the geotessera extra: pip install -e ".[geotessera]"'
-            ) from exc
-
-        nodata_values = [float(v) for v in nodata.split(",")] if nodata else None
-        gt = GeoTessera()
-        print("Loading training data...")
-        vectors, labels, class_names, _, task = load_embeddings_for_raster(
-            raster,
-            bbox=train_region,
-            year=year,
-            gt_instance=gt,
-            band=band,
-            task=task,
-            nodata_values=nodata_values,
-        )
+    if test_data:
+        vectors, labels, class_names, task = _load_side(data, bbox, field, year, "training")
         if task == "regression":
             raise typer.BadParameter("learning-curve does not currently support regression")
-        print("Loading held-out test data...")
-        test_vectors, test_labels, test_class_names, _, _ = load_embeddings_for_raster(
-            raster,
-            bbox=test_region,
-            year=year,
-            gt_instance=gt,
-            band=band,
-            task=task,
-            nodata_values=nodata_values,
+        test_vectors, test_labels, test_class_names, _ = _load_side(
+            test_data, test_bbox, test_field or field, eval_year, "test"
         )
         if list(test_class_names) != list(class_names):
             raise typer.BadParameter(
-                f"Class mismatch between train ({class_names}) and test ({test_class_names}) "
-                "regions — try a different bbox or explicit --test-bbox."
+                f"Class mismatch between train ({class_names}) and test "
+                f"({test_class_names}) — both must contain the same classes."
             )
 
     elif spatial_holdout:
-        if not data or not field:
-            raise typer.BadParameter("--spatial-holdout requires --data and --field.")
+        if not data:
+            raise typer.BadParameter("--spatial-holdout requires --data.")
+        source_kind = _detect_source_kind(data)
 
-        gdf = gpd.read_file(data)
-        if len(gdf) == 0:
-            raise typer.BadParameter(f"--data {data} contains no polygons.")
-        if task is None:
-            task = detect_field_type(gdf, field)
-        if task == "regression":
-            raise typer.BadParameter("learning-curve does not currently support regression")
-
-        centroids = gdf.centroid
-        if test_bbox:
+        if source_kind == "raster":
+            if not bbox:
+                raise typer.BadParameter("--spatial-holdout with a raster --data requires --bbox.")
             try:
-                minx, miny, maxx, maxy = (float(v) for v in test_bbox.split(","))
+                minx, miny, maxx, maxy = (float(v) for v in bbox.split(","))
             except ValueError as exc:
                 raise typer.BadParameter(
-                    "--test-bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
+                    "--bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
                 ) from exc
-            in_box = (
-                (centroids.x >= minx)
-                & (centroids.x <= maxx)
-                & (centroids.y >= miny)
-                & (centroids.y <= maxy)
+            if test_bbox:
+                try:
+                    test_minx, test_miny, test_maxx, test_maxy = (
+                        float(v) for v in test_bbox.split(",")
+                    )
+                except ValueError as exc:
+                    raise typer.BadParameter(
+                        "--test-bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
+                    ) from exc
+                train_region = (minx, miny, maxx, maxy)
+                test_region = (test_minx, test_miny, test_maxx, test_maxy)
+                if _bboxes_overlap(train_region, test_region):
+                    raise typer.BadParameter(
+                        f"--bbox {bbox} and --test-bbox {test_bbox} overlap — they must "
+                        "be disjoint, since --bbox defines the training region and "
+                        "shared pixels would leak between train and test."
+                    )
+            else:
+                mid = (minx + maxx) / 2
+                train_region = (minx, miny, mid, maxy)
+                test_region = (mid, miny, maxx, maxy)
+            print(f"Raster spatial split: train {train_region}, test {test_region}")
+
+            nodata_values = [float(v) for v in nodata.split(",")] if nodata else None
+            gt = GeoTessera()
+            print(f"Loading training data ({year})...")
+            vectors, labels, class_names, _, task = load_embeddings_for_raster(
+                data,
+                bbox=train_region,
+                year=year,
+                gt_instance=gt,
+                band=band,
+                task=task,
+                nodata_values=nodata_values,
             )
-            train_gdf, test_gdf = gdf[~in_box], gdf[in_box]
-            print(
-                f"Bounding-box split: {len(train_gdf)} training polygons, "
-                f"{len(test_gdf)} held-out polygons inside {test_bbox}"
+            if task == "regression":
+                raise typer.BadParameter("learning-curve does not currently support regression")
+            print(f"Loading held-out test data ({eval_year})...")
+            test_vectors, test_labels, test_class_names, _, _ = load_embeddings_for_raster(
+                data,
+                bbox=test_region,
+                year=eval_year,
+                gt_instance=gt,
+                band=band,
+                task=task,
+                nodata_values=nodata_values,
             )
-            if len(test_gdf) == 0:
+            if list(test_class_names) != list(class_names):
                 raise typer.BadParameter(
-                    f"No polygons found inside --test-bbox {test_bbox}. Check that "
-                    f"the coordinates are in the same CRS as --data (currently {gdf.crs})."
-                )
-            if len(train_gdf) == 0:
-                raise typer.BadParameter(
-                    f"--test-bbox {test_bbox} covers all polygons in --data — "
-                    "nothing left to train on."
-                )
-        else:
-            minx, miny, maxx, maxy = gdf.total_bounds
-            mid = (minx + maxx) / 2
-            train_gdf = gdf[centroids.x < mid]
-            test_gdf = gdf[centroids.x >= mid]
-            print(
-                f"Spatial split: {len(train_gdf)} polygons west, "
-                f"{len(test_gdf)} polygons east of {mid:.4f}"
-            )
-            if len(test_gdf) == 0 or len(train_gdf) == 0:
-                raise typer.BadParameter(
-                    "Spatial split produced an empty train or test set — your "
-                    "polygons may all share the same location, or check --data's CRS."
+                    f"Class mismatch between train ({class_names}) and test "
+                    f"({test_class_names}) — try a different bbox or check coverage."
                 )
 
-        try:
-            from geotessera import GeoTessera
-        except ImportError as exc:
-            raise typer.BadParameter(
-                'Spatial hold-out requires the geotessera extra: pip install -e ".[geotessera]"'
-            ) from exc
+        else:  # shapefile
+            if not field:
+                raise typer.BadParameter(
+                    "--spatial-holdout with a shapefile --data requires --field."
+                )
+            gdf = gpd.read_file(data)
+            if len(gdf) == 0:
+                raise typer.BadParameter(f"--data {data} contains no polygons.")
+            if task is None:
+                task = detect_field_type(gdf, field)
+            if task == "regression":
+                raise typer.BadParameter("learning-curve does not currently support regression")
 
-        gt = GeoTessera()
-        print("Loading training data...")
-        vectors, labels, class_names, _ = load_embeddings_for_shapefile(
-            train_gdf, field=field, year=year, gt_instance=gt
-        )
-        print("Loading held-out test data...")
-        test_vectors, test_labels, test_class_names, _ = load_embeddings_for_shapefile(
-            test_gdf, field=field, year=year, gt_instance=gt
-        )
-        if task == "classification" and list(test_class_names) != list(class_names):
-            raise typer.BadParameter(
-                f"Class mismatch between train ({class_names}) and test ({test_class_names}) "
-                "regions — try a different split or check label coverage on both sides."
+            centroids = gdf.centroid
+            if test_bbox:
+                try:
+                    minx, miny, maxx, maxy = (float(v) for v in test_bbox.split(","))
+                except ValueError as exc:
+                    raise typer.BadParameter(
+                        "--test-bbox must be four comma-separated numbers: minx,miny,maxx,maxy"
+                    ) from exc
+                in_box = (
+                    (centroids.x >= minx)
+                    & (centroids.x <= maxx)
+                    & (centroids.y >= miny)
+                    & (centroids.y <= maxy)
+                )
+                train_gdf, test_gdf = gdf[~in_box], gdf[in_box]
+                print(
+                    f"Bounding-box split: {len(train_gdf)} training polygons, "
+                    f"{len(test_gdf)} held-out polygons inside {test_bbox}"
+                )
+                if len(test_gdf) == 0:
+                    raise typer.BadParameter(
+                        f"No polygons found inside --test-bbox {test_bbox}. Check that "
+                        f"the coordinates are in the same CRS as --data (currently {gdf.crs})."
+                    )
+                if len(train_gdf) == 0:
+                    raise typer.BadParameter(
+                        f"--test-bbox {test_bbox} covers all polygons in --data — "
+                        "nothing left to train on."
+                    )
+            else:
+                minx, miny, maxx, maxy = gdf.total_bounds
+                mid = (minx + maxx) / 2
+                train_gdf = gdf[centroids.x < mid]
+                test_gdf = gdf[centroids.x >= mid]
+                print(
+                    f"Spatial split: {len(train_gdf)} polygons west, "
+                    f"{len(test_gdf)} polygons east of {mid:.4f}"
+                )
+                if len(test_gdf) == 0 or len(train_gdf) == 0:
+                    raise typer.BadParameter(
+                        "Spatial split produced an empty train or test set — your "
+                        "polygons may all share the same location, or check --data's CRS."
+                    )
+
+            gt = GeoTessera()
+            print(f"Loading training data ({year})...")
+            vectors, labels, class_names, _ = load_embeddings_for_shapefile(
+                train_gdf, field=field, year=year, gt_instance=gt
             )
+            print(f"Loading held-out test data ({eval_year})...")
+            test_vectors, test_labels, test_class_names, _ = load_embeddings_for_shapefile(
+                test_gdf, field=field, year=eval_year, gt_instance=gt
+            )
+            if task == "classification" and list(test_class_names) != list(class_names):
+                raise typer.BadParameter(
+                    f"Class mismatch between train ({class_names}) and test "
+                    f"({test_class_names}) — try a different split or check label coverage."
+                )
 
     else:
         vectors, labels, class_names, detected_task = _get_vectors_and_labels(
-            data, field, year, vectors_path
+            data,
+            field,
+            year,
+            vectors_path,
+            bbox=bbox,
+            band=band,
+            nodata=nodata,
         )
         task = task or detected_task
 
