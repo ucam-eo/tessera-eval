@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0]
+
+### Added
+- CLI: `tessera-eval` command (`load`/`kfold`/`learning-curve`), with raster
+  (GeoTIFF) support and a `learning-curve --test-year` option to score a
+  classifier trained on one year's embeddings against a different year's
+  embeddings from a separate `--test-data` file.
+- `server.py`'s `/api/evaluation/run-large-area` accepts the equivalent
+  `train_year`/`test_year` in the request body (in place of a single `year`;
+  `train_year` falls back to `year` for compatibility, `test_year` defaults
+  to `train_year`) to score a classifier trained on one year's embeddings
+  against a different year's embeddings at the *same* locations. Both this
+  and the CLI option feed `run_learning_curve`'s pre-existing `test_vectors`/
+  `test_labels` fixed-test-set mechanism, which is unchanged.
+
 ## [1.2.0]
 
 ### Changed
