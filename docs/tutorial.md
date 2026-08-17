@@ -18,7 +18,7 @@ from tessera_eval import detect_field_type
 gdf = gpd.read_file("habitats.geojson")
 print(gdf.columns.tolist())
 print(gdf["habitat"].value_counts())
-print(detect_field_type(gdf, "habitat"))   # "classification" or "regression"
+print(detect_field_type(gdf, "habitat"))  # "classification" or "regression"
 ```
 
 `detect_field_type` treats a numeric column with many unique values as a regression
@@ -33,7 +33,10 @@ from tessera_eval import load_embeddings_for_shapefile
 
 gt = GeoTessera()
 vectors, labels, class_names, stats = load_embeddings_for_shapefile(
-    gdf, field="habitat", year=2024, gt_instance=gt,
+    gdf,
+    field="habitat",
+    year=2024,
+    gt_instance=gt,
     callback=lambda i, n: print(f"tile {i}/{n}", end="\r"),
 )
 print(f"\n{stats['total_pixels']:,} pixels, {stats['n_classes']} classes: {class_names}")
@@ -52,8 +55,10 @@ from tessera_eval import run_kfold_cv
 for event in run_kfold_cv(vectors, labels, ["nn", "rf", "mlp"], k=5):
     if event["type"] == "aggregate":
         for name, m in event["models"].items():
-            print(f"{name:>4}: macro-F1 {m['mean_f1']:.3f} ± {m['std_f1']:.3f} "
-                  f"| weighted-F1 {m['mean_f1w']:.3f}")
+            print(
+                f"{name:>4}: macro-F1 {m['mean_f1']:.3f} ± {m['std_f1']:.3f} "
+                f"| weighted-F1 {m['mean_f1w']:.3f}"
+            )
 ```
 
 **Read both numbers.** Macro-F1 averages classes equally (rare classes count);
@@ -70,7 +75,8 @@ import numpy as np
 
 curve = {}
 for event in run_learning_curve(
-    vectors, labels,
+    vectors,
+    labels,
     classifier_names=["rf"],
     training_pcts=[1, 5, 10, 30, 50, 80],
     repeats=5,
@@ -97,15 +103,18 @@ mid = (minx + maxx) / 2
 west, east = gdf[gdf.centroid.x < mid], gdf[gdf.centroid.x >= mid]
 
 Xtr, ytr, names, _ = load_embeddings_for_shapefile(west, "habitat", 2024, gt)
-Xte, yte, _,     _ = load_embeddings_for_shapefile(east, "habitat", 2024, gt)
+Xte, yte, _, _ = load_embeddings_for_shapefile(east, "habitat", 2024, gt)
 
 for event in run_learning_curve(
-    Xtr, ytr, ["rf"], training_pcts=[10, 50, 100],
-    test_vectors=Xte, test_labels=yte,     # <- fixed spatial test set
+    Xtr,
+    ytr,
+    ["rf"],
+    training_pcts=[10, 50, 100],
+    test_vectors=Xte,
+    test_labels=yte,  # <- fixed spatial test set
 ):
     if event["type"] == "progress":
-        print(f"{event['pct']:>3}% → spatial macro-F1 "
-              f"{event['classifiers']['rf']['mean_f1']:.3f}")
+        print(f"{event['pct']:>3}% → spatial macro-F1 {event['classifiers']['rf']['mean_f1']:.3f}")
 ```
 
 Expect lower (more realistic) F1 than the random split. The gap between random and
@@ -128,8 +137,7 @@ recall = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
 for i, name in enumerate(class_names):
     off_diag = [(j, recall[i, j]) for j in range(len(class_names)) if j != i]
     worst_idx, worst_val = max(off_diag, key=lambda x: x[1])
-    print(f"{name:>20}: recall {recall[i, i]:.2f} "
-          f"(most confused with {class_names[worst_idx]})")
+    print(f"{name:>20}: recall {recall[i, i]:.2f} (most confused with {class_names[worst_idx]})")
 ```
 
 ## 7. Spatial features (optional)

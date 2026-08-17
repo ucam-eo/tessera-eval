@@ -36,7 +36,7 @@ must dequantize first.
 from tessera_eval import dequantize_int8, load_geotessera_tile
 
 # From arrays you already hold:
-emb = dequantize_int8(int8_tile, scales)        # (H, W, 128) float32
+emb = dequantize_int8(int8_tile, scales)  # (H, W, 128) float32
 
 # Or from a pair of .npy files:
 emb = load_geotessera_tile("tile.npy", "tile_scales.npy")
