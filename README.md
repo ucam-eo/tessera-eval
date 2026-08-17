@@ -84,7 +84,7 @@ curve → confusion matrix → interpretation).
 
 The workflow covered in the [tutorial](docs/tutorial.md) can also be run through the command line.
 
-First, install the `geotessera` package needed for the `load`/`load-raster` steps below:
+First, install the `geotessera` package needed for the `load` step below:
 
 ```
 pip install -e ".[geotessera]"
@@ -96,16 +96,18 @@ Optional installation for using xgboost:
 pip install -e ".[xgboost]"
 ```
 
-Download the Tessera embeddings for the area covered by your labelled polygons (shapefile/GeoJSON), and save the result to a file (vectors.npz by default, change the name with argument `--output`). The argument `--field` is the column in your data holding the class or target values (e.g. `habitat`).
+Download the Tessera embeddings for your labelled ground truth, and save the result to a file (vectors.npz by default, change the name with argument `--output`). `--data` accepts either a shapefile/GeoJSON of labelled polygons or a GeoTIFF of an already-rasterized reference layer.
+
+For a shapefile/GeoJSON, `--field` is the column holding the class or target values (e.g. `habitat`):
 
 ```bash
 tessera-eval load --data /path/to/habitats.geojson --field habitat --year 2024
 ```
 
-If your labels are already a raster instead of hand-labelled polygons, use `load-raster` instead. A bounding box is required, in EPSG:4326 (longitude,latitude in degrees), and `--nodata` marks any missing-value codes:
+For a GeoTIFF, `--bbox` is required, in EPSG:4326 (longitude,latitude in degrees), since a raster has no natural area boundary the way labelled polygons do. `--nodata` marks any missing-value codes:
 
 ```bash
-tessera-eval load-raster --raster site_type.tif --bbox 27.1,67.75,27.2,67.85 --year 2024 --nodata 32766,32767
+tessera-eval load --data site_type.tif --bbox 27.1,67.75,27.2,67.85 --year 2024 --nodata 32766,32767
 ```
 
 `kfold` and `learning-curve` reuse the cached `vectors.npz` automatically. Pass `--vectors <path>` to use a different cached file instead.
@@ -124,7 +126,7 @@ Optional arguments:
 # --seed: random seed for reproducible fold splits (default: 42)
 # --confusion / --no-confusion: show or hide the confusion summary (for classification only)
 # --vectors: path to a different cached .npz (default: vectors.npz from `load`)
-# --max-samples: cap the training set size per fold (random, not stratified by class) —
+# --max-samples: cap the training set size per fold (random, not stratified by class) -
 #   usually needed for raster-derived data, which labels every pixel, not a hand-picked subset
 tessera-eval kfold --models rf --k 10 --seed 1 --no-confusion --max-samples 50000
 ```
@@ -136,29 +138,35 @@ tessera-eval learning-curve --models rf --training-pcts 1,5,10,30,50,80 --repeat
 
 
 
-Since neighbouring pixels are usually very similar, a random split can overstate how accurate the model really is (see [tutorial](docs/tutorial.md)). For a more reliable estimate, train on one geographic half of your area and test on the other:
+Since neighbouring pixels are usually very similar, a random split can overstate how accurate the model really is (see [tutorial](docs/tutorial.md)). For a more reliable estimate, train on one geographic half of your area and test on the other, splitting by longitude:
 
 ```bash
 tessera-eval learning-curve --models rf --spatial-holdout
 ```
 
-You can also choose exactly which region to hold out, by passing a bounding box (for `--data`, in the same CRS as your data; for `--raster`, always EPSG:4326):
+You can also choose exactly which region to hold out, by passing a bounding box (for a shapefile/GeoJSON, in the same CRS as your data; for a GeoTIFF, always EPSG:4326):
 
 
 ```bash
 tessera-eval learning-curve --models rf --spatial-holdout --test-bbox 27.16,67.77,27.23,67.82
 ```
 
-For `--raster`, `--bbox` sets the training region (required, since a raster has no natural extent like polygons do); omitting `--test-bbox` splits it in half instead of requiring both:
+You can also use a completely separate file as the test set - a different region, a different year, or both. If you are evaluating on a different year, pass `--test-year` along with `--test-data`.
 
 ```bash
-tessera-eval learning-curve --raster site_type.tif --spatial-holdout --bbox 27.1,67.75,27.2,67.85 --test-bbox 27.3,67.77,27.4,67.82 --models rf
+tessera-eval learning-curve --models rf --test-data /path/to/other_region.geojson --test-year 2023
 ```
 
-For shapefiles/GeoJSON, you can also use a completely separate shapefile/GeoJSON as the test set:
+For a GeoTIFF, `--test-bbox` is also required, defining the test region within that file:
 
 ```bash
-tessera-eval learning-curve --models rf --test-data /path/to/other_region.geojson
+tessera-eval learning-curve --test-data site_type_2023.tif --test-bbox 27.1,67.75,27.2,67.85 --test-year 2023 --models rf
+```
+
+This reuses the cached `vectors.npz` as the training data by default. To use a different training area or year instead, pass `--data`/`--bbox`/`--year` explicitly:
+
+```bash
+tessera-eval learning-curve --data site_type_2019.tif --bbox 27.1,67.75,27.2,67.85 --year 2019 --test-data site_type_2023.tif --test-bbox 27.1,67.75,27.2,67.85 --test-year 2023 --models rf
 ```
 
 Run any command with `--help` for a list of all possible arguments. 
