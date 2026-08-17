@@ -635,7 +635,11 @@ def run_large_area():
         return jsonify({"error": "Invalid JSON"}), 400
 
     field_name = body.get("field")
-    year = body.get("year", 2024)
+    # "year" is accepted as an alias for train_year so any stray old
+    # client/config keeps working. test_year defaults to train_year, i.e.
+    # zero behavior change for anyone who doesn't set it.
+    train_year = body.get("train_year", body.get("year", 2024))
+    test_year = body.get("test_year", train_year)
     classifiers = body.get("classifiers", ["nn", "rf"])
     classifier_params = body.get("classifier_params", {})
     max_train = body.get("max_training_samples")
@@ -736,14 +740,18 @@ def run_large_area():
         t0 = time.time()
 
         # Check in-memory cache first, then disk cache
-        cache_key = (field_name, year, sampling)
+        cache_key = (field_name, train_year, test_year, sampling)
         vectors = labels = class_names = stats = None
         spatial_3x3 = spatial_5x5 = unet_patches = None
         spatial_labels_3x3 = spatial_labels_5x5 = None
         all_sample_points = None  # (lon, lat) coordinates of all sample points
         all_valid_mask = None  # boolean mask: True for points with valid embeddings
 
-        has_spatial_bboxes = bool(train_bboxes or test_bboxes)
+        # Also true when train/test years differ: that path needs the same
+        # sample-point coordinates (to re-fetch the test role at test_year)
+        # that spatial bbox splitting needs, so it must force the same
+        # reload-if-missing / skip-disk-cache-shortcut behavior below.
+        has_spatial_bboxes = bool(train_bboxes or test_bboxes) or test_year != train_year
         if _tile_cache["key"] == cache_key and _tile_cache["vectors"] is not None:
             vectors = _tile_cache["vectors"]
             labels = _tile_cache["labels"]
@@ -754,7 +762,9 @@ def run_large_area():
             unet_patches = _tile_cache.get("unet_patches", [])
             all_sample_points = _tile_cache.get("sample_points")
             all_valid_mask = _tile_cache.get("valid_mask")
-            logger.info("In-memory cache hit for %s/%s (%d pixels)", field_name, year, len(labels))
+            logger.info(
+                "In-memory cache hit for %s/%s (%d pixels)", field_name, train_year, len(labels)
+            )
 
             # See _cached_tiles_need_reload's docstring: setting vectors =
             # None alone (without also invalidating _tile_cache["key"]) used
@@ -780,7 +790,7 @@ def run_large_area():
 
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
-            cached_result = _load_cached_result(field_name, year, gdf, sampling)
+            cached_result = _load_cached_result(field_name, train_year, gdf, sampling)
             if (
                 cached_result
                 and not needs_spatial_3x3
@@ -790,7 +800,10 @@ def run_large_area():
             ):
                 vectors, labels, class_names, stats = cached_result
                 logger.info(
-                    "Disk result cache hit for %s/%s (%d pixels)", field_name, year, len(labels)
+                    "Disk result cache hit for %s/%s (%d pixels)",
+                    field_name,
+                    train_year,
+                    len(labels),
                 )
 
         if vectors is not None:
@@ -1008,7 +1021,7 @@ def run_large_area():
                                 gt,
                                 gdf,
                                 field_name,
-                                year,
+                                train_year,
                                 le,
                                 n_classes,
                                 max_patches=max_patches,
@@ -1096,7 +1109,7 @@ def run_large_area():
                                 progress_q.put(("tile", current, total))
 
                             vecs = gt.sample_embeddings_at_points(
-                                sample_points, year=year, progress_callback=_cb
+                                sample_points, year=train_year, progress_callback=_cb
                             )
                             result_holder[0] = vecs
                         except Exception as e:
@@ -1188,7 +1201,7 @@ def run_large_area():
                 # Count tiles used
                 bounds = gdf.total_bounds
                 bbox = (bounds[0], bounds[1], bounds[2], bounds[3])
-                tiles = gt.registry.load_blocks_for_region(bbox, year)
+                tiles = gt.registry.load_blocks_for_region(bbox, train_year)
                 total_tiles = len(tiles)
 
                 stats = {
@@ -1214,7 +1227,7 @@ def run_large_area():
                     }
                 )
                 _save_cached_result(
-                    field_name, year, gdf, vectors, labels, class_names, stats, sampling
+                    field_name, train_year, gdf, vectors, labels, class_names, stats, sampling
                 )
 
                 all_sample_points = sample_points
@@ -1331,6 +1344,155 @@ def run_large_area():
             labels = spatial_train_labels
             total_labelled = len(vectors)
 
+        # ── Train/test-year split ──
+        # When test_year != train_year, the test role's points get their
+        # embeddings re-fetched at test_year and fed into run_learning_curve's
+        # pre-existing test_vectors/test_labels fixed-test-set mechanism --
+        # the same mechanism tessera-eval's `learning-curve --test-year` CLI
+        # command (ucam-eo/tessera-eval#2) validated for this exact use case,
+        # just fed from server.py instead of the CLI. Two cases, mirroring
+        # what the CLI supports:
+        #   - no bboxes drawn: every point serves as both a training example
+        #     (at train_year) and a test example (re-embedded at test_year)
+        #     -- "does a classifier trained on year A still work on year B
+        #     at the same locations".
+        #   - bboxes drawn: keep today's spatial train/test-region split, but
+        #     embed the test region at test_year instead of train_year.
+        year_split_test_vectors = year_split_test_labels = None
+        if test_year != train_year:
+            if all_sample_points is None or all_valid_mask is None:
+                # Shouldn't happen -- has_spatial_bboxes forces a fresh fetch
+                # (which always populates these) whenever years differ. Kept
+                # as a defensive check rather than trusting that invariant.
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": (
+                                "Different train/test years requires sample point "
+                                "coordinates, unexpectedly unavailable -- please retry."
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            if has_spatial_split:
+                test_role_points = sp[test_mask_sp]
+                test_role_labels_pool = spatial_test_labels
+            else:
+                sp_all = np.array(all_sample_points)
+                if all_valid_mask.sum() < len(sp_all):
+                    sp_all = sp_all[all_valid_mask]
+                test_role_points = sp_all
+                test_role_labels_pool = labels
+
+            # Lazy-init GeoTessera, same pattern as the primary fetch above --
+            # needed even on a cache hit for train_year, since that path never
+            # touches GeoTessera at all. (No `global` redeclaration here: it's
+            # already declared global earlier in this same function -- doing
+            # it twice with a use in between is itself a SyntaxError.)
+            if _geotessera_instance is None:
+                tile_cache_dir = _get_cache_dir() / "tiles"
+                tile_cache_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                except Exception as e:
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "message": f"Could not initialize GeoTessera for test-year fetch: {e}",
+                            }
+                        )
+                        + "\n"
+                    )
+                    return
+            gt = _geotessera_instance
+
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            f"Fetching test-year ({test_year}) embeddings for "
+                            f"{len(test_role_points):,} points..."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+
+            ty_holder = [None, None]
+
+            def _fetch_test_year():
+                try:
+                    ty_holder[0] = gt.sample_embeddings_at_points(
+                        test_role_points.tolist(), year=test_year
+                    )
+                except Exception as e:
+                    ty_holder[1] = e
+
+            ty_thread = threading.Thread(target=_fetch_test_year, daemon=True)
+            ty_thread.start()
+            while ty_thread.is_alive():
+                if _cancelled():
+                    yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
+                    return
+                ty_thread.join(timeout=5)
+                if ty_thread.is_alive():
+                    yield json.dumps({"event": "heartbeat"}) + "\n"
+
+            if ty_holder[1] is not None:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": f"Test-year ({test_year}) sampling failed: {ty_holder[1]}",
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            ty_vectors = ty_holder[0]
+            ty_valid = ~np.isnan(ty_vectors).any(axis=1)
+            if ty_valid.sum() < len(ty_vectors):
+                n_removed = len(ty_vectors) - ty_valid.sum()
+                logger.info(
+                    "Test year %d: %d/%d points outside tile coverage, dropped",
+                    test_year,
+                    n_removed,
+                    len(ty_vectors),
+                )
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": (
+                                f"Test year {test_year}: {n_removed:,} points outside "
+                                f"coverage, dropped"
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+            if ty_valid.sum() == 0:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": f"No valid embeddings found at test year {test_year}",
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            year_split_test_vectors = ty_vectors[ty_valid].astype(np.float32)
+            year_split_test_labels = test_role_labels_pool[ty_valid]
+
         # Training percentages (% of labelled area)
         training_pcts = [1, 3, 5, 10, 20, 30, 50, 80]
         if max_train:
@@ -1400,11 +1562,17 @@ def run_large_area():
             "confusion_matrix_labels": class_names if is_classification else [],
             "training_pcts": training_pcts,
             "stats": stats,
+            "train_year": train_year,
+            "test_year": test_year,
         }
         if has_spatial_split:
             start_event["spatial_split"] = True
             start_event["train_count"] = int(len(spatial_train_labels))
             start_event["test_count"] = int(len(spatial_test_labels))
+        if year_split_test_vectors is not None:
+            start_event["year_split"] = True
+            start_event["train_count"] = int(len(labels))
+            start_event["test_count"] = int(len(year_split_test_labels))
         yield json.dumps(start_event) + "\n"
 
         # Run learning curve (all classifiers including U-Net)
@@ -1422,6 +1590,12 @@ def run_large_area():
         if has_spatial_split:
             lc_kwargs["test_vectors"] = spatial_test_vectors
             lc_kwargs["test_labels"] = spatial_test_labels
+        if year_split_test_vectors is not None:
+            # Overrides the has_spatial_split assignment above when both
+            # apply (bboxes drawn AND years differ) -- the test role's
+            # vectors must come from test_year, not train_year.
+            lc_kwargs["test_vectors"] = year_split_test_vectors
+            lc_kwargs["test_labels"] = year_split_test_labels
 
         for event in run_learning_curve(
             vectors,
@@ -1491,7 +1665,8 @@ def run_large_area():
                     "event": "done",
                     "elapsed_seconds": round(elapsed, 1),
                     "field": field_name,
-                    "year": year,
+                    "train_year": train_year,
+                    "test_year": test_year,
                     "models_available": list(_trained_models.keys()),
                 }
             )
@@ -1780,6 +1955,9 @@ def create_map():
                 return
         gt = _geotessera_instance
 
+        # cache["key"] is (field_name, train_year, test_year, sampling) -- the
+        # generated map applies the *trained* model, so it must use the year
+        # the model was actually trained on, index 1 regardless of test_year.
         year = cache["key"][1] if cache.get("key") else 2024
 
         # Clean up old map files
