@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.2]
+
+### Fixed
+- `create_map` ("Create Map" GeoTIFF generation) had never been adapted for
+  regression — it unconditionally trained via `make_classifier` and wrote
+  predictions as `uint8` with `nodata=0`. XGBoost's classifier validates
+  class labels strictly and crashed outright ("Invalid classes inferred
+  from unique values of y") the moment continuous values (e.g. heights)
+  were passed as `y`. k-NN/RF/MLP don't validate that, so they silently
+  "succeeded" — training as an enormous multi-class classifier over
+  continuous values treated as arbitrary class IDs, then truncating real
+  predictions to `uint8` and colliding a real value of 0 with the nodata
+  sentinel. Now dispatches `make_classifier`/`make_regressor` via the
+  cached task (`_is_classification`, same mechanism as 1.5.1's Download
+  Models fix) and a UI-name → `_reg`-suffixed lookup (`_CLF_TO_REG`,
+  hoisted to module level), and writes regression output as `float32` with
+  NaN nodata instead of `uint8`/0.
+
 ## [1.5.1]
 
 ### Fixed

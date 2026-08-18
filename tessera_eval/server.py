@@ -37,6 +37,13 @@ def _add_cors(response):
     return response
 
 
+# Pixel classifier UI name -> its regression counterpart (make_regressor's
+# naming convention). Used wherever a request carries a plain classifier name
+# ("rf") that needs to become the right model for the cached task
+# (run_large_area, create_map) -- make_regressor only recognizes the "_reg"
+# suffixed names.
+_CLF_TO_REG = {"nn": "nn_reg", "rf": "rf_reg", "mlp": "mlp_reg", "xgboost": "xgboost_reg"}
+
 # ── State (single-user, one process) ──
 
 _uploaded_shapefiles = []  # list of (filename, gdf) tuples
@@ -749,7 +756,6 @@ def run_large_area():
         task = detect_field_type(gdf, field_name)
 
     is_classification = task == "classification"
-    _CLF_TO_REG = {"nn": "nn_reg", "rf": "rf_reg", "mlp": "mlp_reg", "xgboost": "xgboost_reg"}
     # Expand hyperparameter variants: if classifier_params[name] is a list,
     # each element becomes a separate variant (e.g., "mlp_v1", "mlp_v2").
     import re as _re
@@ -2079,6 +2085,23 @@ def create_map():
     labels = cache["labels"]
     class_names = cache.get("class_names", [])
     model_params = cache.get("_model_params", {})
+    # Older cache entries (from before this key existed) default to
+    # classification -- the only task this endpoint supported at the time.
+    is_classification = cache.get("_is_classification", True)
+    # classifier_name is a plain UI name ("rf", "xgboost", ...) either way --
+    # the frontend doesn't know about the "_reg" suffix convention. For
+    # regression this was previously fed straight into make_classifier(),
+    # which either crashed (XGBoost validates class labels strictly) or
+    # silently "succeeded" by treating continuous height values as an
+    # arbitrary set of classes (k-NN/RF/MLP don't validate that) -- a wrong
+    # map, not a safe one. model_key is what actually selects/looks up the
+    # model; classifier_name (unchanged) still names the UI selection in
+    # status messages and GeoTIFF tags.
+    model_key = (
+        _CLF_TO_REG.get(classifier_name, classifier_name)
+        if not is_classification
+        else classifier_name
+    )
 
     import re as _re
 
@@ -2115,9 +2138,13 @@ def create_map():
         )
 
         try:
-            from tessera_eval.classify import make_classifier
+            from tessera_eval.classify import make_classifier, make_regressor
 
-            clf = make_classifier(classifier_name, model_params.get(classifier_name, {}))
+            clf = (
+                make_classifier(model_key, model_params.get(model_key, {}))
+                if is_classification
+                else make_regressor(model_key, model_params.get(model_key, {}))
+            )
             clf.fit(vectors, labels)
         except Exception as e:
             yield (
@@ -2305,14 +2332,23 @@ def create_map():
 
                         # Identify valid (non-NaN) pixels
                         nan_mask = np.isnan(flat).any(axis=1)
-                        predictions = np.zeros(flat.shape[0], dtype=np.uint8)
+                        if is_classification:
+                            predictions = np.zeros(flat.shape[0], dtype=np.uint8)
+                        else:
+                            # Real continuous values -- uint8 would truncate
+                            # them and collide 0-as-nodata with 0 as a real
+                            # height. NaN is the nodata sentinel instead.
+                            predictions = np.full(flat.shape[0], np.nan, dtype=np.float32)
 
                         if (~nan_mask).sum() > 0:
                             valid_flat = flat[~nan_mask].astype(np.float32)
                             preds = clf.predict(valid_flat)
-                            # Class labels are 0-based from LabelEncoder.
-                            # Store as 1-based (0 = nodata).
-                            predictions[~nan_mask] = preds.astype(np.uint8) + 1
+                            if is_classification:
+                                # Class labels are 0-based from LabelEncoder.
+                                # Store as 1-based (0 = nodata).
+                                predictions[~nan_mask] = preds.astype(np.uint8) + 1
+                            else:
+                                predictions[~nan_mask] = preds.astype(np.float32)
 
                         predicted_2d = predictions.reshape(h, w)
                         chunk_results.append((predicted_2d, transform, crs, chunk_bbox))
@@ -2358,6 +2394,12 @@ def create_map():
                 import rasterio.io
                 from rasterio.merge import merge as _rasterio_merge
 
+                # Classification: 1-based class IDs, 0 = nodata, fits uint8.
+                # Regression: real continuous values (e.g. heights), NaN =
+                # nodata (0 is a valid real value, can't double as nodata).
+                out_dtype = "uint8" if is_classification else "float32"
+                out_nodata = 0 if is_classification else np.nan
+
                 if len(chunk_results) == 1:
                     # Single chunk — write directly
                     predicted_2d, transform, crs, _ = chunk_results[0]
@@ -2374,15 +2416,15 @@ def create_map():
                             height=predicted_2d.shape[0],
                             width=predicted_2d.shape[1],
                             count=1,
-                            dtype="uint8",
+                            dtype=out_dtype,
                             crs=crs,
                             transform=transform,
-                            nodata=0,
+                            nodata=out_nodata,
                         )
                         ds.write(predicted_2d, 1)
                         datasets.append(ds)
 
-                    mosaic, out_transform = _rasterio_merge(datasets, nodata=0)
+                    mosaic, out_transform = _rasterio_merge(datasets, nodata=out_nodata)
                     out_arr = mosaic[0]
                     out_crs = chunk_results[0][2]
 
@@ -2403,18 +2445,22 @@ def create_map():
                     height=out_arr.shape[0],
                     width=out_arr.shape[1],
                     count=1,
-                    dtype="uint8",
+                    dtype=out_dtype,
                     crs=out_crs,
                     transform=out_transform,
-                    nodata=0,
+                    nodata=out_nodata,
                     compress="lz4",
                 ) as dst:
                     dst.write(out_arr, 1)
-                    # Store class names as tags
+                    # Store class names as tags (classification) -- empty for
+                    # regression, which has no class taxonomy; tag the field
+                    # name instead so a regression GeoTIFF is still self-describing.
                     tags = {f"class_{i + 1}": name for i, name in enumerate(class_names)}
                     tags["classifier"] = classifier_name
                     tags["train_year"] = str(train_year)
                     tags["map_year"] = str(map_year)
+                    if not is_classification:
+                        tags["field"] = cache["key"][0] if cache.get("key") else ""
                     dst.update_tags(**tags)
 
                 _generated_maps[map_name] = tmp.name
