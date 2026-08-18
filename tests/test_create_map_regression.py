@@ -31,6 +31,15 @@ from affine import Affine
 
 import tessera_eval.server as srv
 
+try:
+    import xgboost  # noqa: F401
+
+    _HAS_XGBOOST = True
+except ImportError:
+    _HAS_XGBOOST = False
+
+_needs_xgboost = pytest.mark.skipif(not _HAS_XGBOOST, reason="xgboost not installed")
+
 EMBED_DIM = 8
 
 
@@ -99,13 +108,17 @@ def _run(client, **body):
     return events
 
 
-@pytest.mark.parametrize("classifier", ["nn", "rf", "xgboost", "mlp"])
+@pytest.mark.parametrize(
+    "classifier",
+    ["nn", "rf", pytest.param("xgboost", marks=_needs_xgboost), "mlp"],
+)
 def test_pixel_regressors_create_a_map_without_crashing(client, classifier):
     events = _run(client, classifier=classifier)
     ready = [e for e in events if e["event"] == "map_ready"]
     assert ready, f"{classifier}: no map_ready event"
 
 
+@_needs_xgboost
 def test_xgboost_no_longer_raises_invalid_classes(client):
     """The exact reported crash: XGBClassifier's fit-time label validation
     rejected continuous, non-contiguous height values."""
