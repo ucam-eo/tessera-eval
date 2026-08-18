@@ -1812,6 +1812,10 @@ def run_large_area():
         _tile_cache["_active_models"] = active_models
         _tile_cache["_model_params"] = model_params
         _tile_cache["_unet_patches"] = unet_patches
+        # train_models() (Download Models) runs in a later, separate request
+        # with no body of its own -- it needs to know whether to dispatch to
+        # make_classifier or make_regressor, so stash it here.
+        _tile_cache["_is_classification"] = is_classification
 
         _cancel_flag = None  # reset cancellation flag
         elapsed = time.time() - t0
@@ -1851,17 +1855,27 @@ def train_models():
     unet_patches = cache.get("_unet_patches", [])
     spatial_3x3 = cache.get("spatial_3x3")
     spatial_5x5 = cache.get("spatial_5x5")
+    # Older cache entries (from before this key existed) default to
+    # classification -- the only task this endpoint supported at the time.
+    is_classification = cache.get("_is_classification", True)
 
     if not active_models:
         return jsonify({"error": "No classifiers configured."}), 400
 
-    valid_class_names = [
-        class_names[lbl] if lbl < len(class_names) else f"Class {lbl}"
-        for lbl in sorted(np.unique(labels))
-    ]
+    # For regression, `labels` are continuous values (e.g. tree heights), not
+    # class indices -- np.unique(labels) would produce one "class" per
+    # distinct float and class_names is empty anyway (see run_large_area).
+    valid_class_names = (
+        [
+            class_names[lbl] if lbl < len(class_names) else f"Class {lbl}"
+            for lbl in sorted(np.unique(labels))
+        ]
+        if is_classification
+        else []
+    )
 
     def stream():
-        from tessera_eval.classify import make_classifier
+        from tessera_eval.classify import make_classifier, make_regressor
 
         # Clean up old models
         for old_path in _trained_models.values():
@@ -1886,21 +1900,37 @@ def train_models():
                 if _bn == "unet":
                     import torch as _torch
 
-                    from tessera_eval.unet import _HAS_TORCH, train_unet_on_patches
+                    if is_classification:
+                        from tessera_eval.unet import _HAS_TORCH, train_unet_on_patches
+                    else:
+                        from tessera_eval.unet import (
+                            _HAS_TORCH,
+                        )
+                        from tessera_eval.unet import (
+                            train_unet_regressor_on_patches as train_unet_on_patches,
+                        )
 
                     if _HAS_TORCH and unet_patches:
-                        n_cls = len(np.unique(labels))
                         _unet_progress = []
 
                         def _unet_cb(epoch, total, loss):
                             _unet_progress.append((epoch, total, loss))
 
-                        model = train_unet_on_patches(
-                            unet_patches,
-                            n_cls,
-                            model_params.get(name, {}),
-                            progress_callback=_unet_cb,
-                        )
+                        if is_classification:
+                            n_cls = len(np.unique(labels))
+                            model = train_unet_on_patches(
+                                unet_patches,
+                                n_cls,
+                                model_params.get(name, {}),
+                                progress_callback=_unet_cb,
+                            )
+                        else:
+                            # Regression U-Net is single-channel -- no n_cls arg.
+                            model = train_unet_on_patches(
+                                unet_patches,
+                                model_params.get(name, {}),
+                                progress_callback=_unet_cb,
+                            )
                         for ep, tot, loss in _unet_progress:
                             yield (
                                 json.dumps(
@@ -1930,6 +1960,18 @@ def train_models():
                             + "\n"
                         )
                         continue
+                elif _bn in ("spatial_mlp", "spatial_mlp_5x5") and not is_classification:
+                    # No regressor variant exists for spatial-context models yet.
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "status",
+                                "message": f"{name} skipped — spatial MLP regression isn't supported yet",
+                            }
+                        )
+                        + "\n"
+                    )
+                    continue
                 elif _bn == "spatial_mlp" and spatial_3x3 is not None:
                     from tessera_eval.classify import augment_spatial
 
@@ -1957,7 +1999,11 @@ def train_models():
                     joblib.dump({"model": clf, "class_names": valid_class_names}, tmp.name)
                     _trained_models[name] = tmp.name
                 else:
-                    clf = make_classifier(name, model_params.get(name, {}))
+                    clf = (
+                        make_classifier(name, model_params.get(name, {}))
+                        if is_classification
+                        else make_regressor(name, model_params.get(name, {}))
+                    )
                     clf.fit(vectors, labels)
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".joblib", prefix=f"{name}_model_", delete=False

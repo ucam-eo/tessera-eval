@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1]
+
+### Fixed
+- "Download Models" (`train_models`/`/api/evaluation/train-models`) always
+  called `make_classifier`, never `make_regressor` — clicking it after a
+  regression run (e.g. kNN regression) failed every model with "Unknown
+  classifier: nn_reg". This endpoint retrains a final model in a separate
+  request after evaluation finishes, so it had no `is_classification`
+  context of its own; the earlier regression fixes in `run_learning_curve`/
+  `run_large_area` (1.3.1-1.4.1) didn't reach it. Now `run_large_area`
+  stashes `is_classification` in the tile cache and `train_models` dispatches
+  on it, for the plain pixel-classifier path and the U-Net path (using
+  `train_unet_regressor_on_patches`). Spatial MLP (3x3/5x5) has no
+  regressor variant yet, so it's skipped with a clear status message for
+  regression rather than silently mis-training or crashing.
+
 ## [1.5.0]
 
 ### Added
