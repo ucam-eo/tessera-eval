@@ -234,13 +234,14 @@ class TestKfoldClassification:
         assert result.exit_code == 0
         assert "macro-F1" in result.stdout
 
-    def test_confusion_summary_printed_by_default(self, classification_npz):
+    def test_confusion_summary_always_printed(self, classification_npz):
         result = runner.invoke(
             app, ["kfold", "--vectors", str(classification_npz), "--models", "nn"]
         )
+        assert result.exit_code == 0
         assert "Confusion summary" in result.stdout
 
-    def test_no_confusion_flag_suppresses_summary(self, classification_npz):
+    def test_confusion_matrix_flag_adds_full_matrix(self, classification_npz):
         result = runner.invoke(
             app,
             [
@@ -249,19 +250,24 @@ class TestKfoldClassification:
                 str(classification_npz),
                 "--models",
                 "nn",
-                "--no-confusion",
+                "--confusion-matrix",
             ],
         )
         assert result.exit_code == 0
-        assert "Confusion summary" not in result.stdout
+        assert "Confusion summary" in result.stdout
+        assert "Confusion matrix" in result.stdout
+
+    def test_confusion_matrix_absent_by_default(self, classification_npz):
+        result = runner.invoke(
+            app, ["kfold", "--vectors", str(classification_npz), "--models", "nn"]
+        )
+        assert "Confusion matrix" not in result.stdout
 
     def test_confusion_never_reports_self_confusion(self, classification_npz):
         result = runner.invoke(
             app, ["kfold", "--vectors", str(classification_npz), "--models", "nn"]
         )
         assert result.exit_code == 0
-        # For each class line, the "most confused with" name must differ from
-        # the class itself.
         for line in result.output.splitlines():
             if "most confused with" in line:
                 class_name = line.split(":")[0].strip()
