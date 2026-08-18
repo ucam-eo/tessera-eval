@@ -155,3 +155,37 @@ def test_regression_labels_are_real_field_values_not_label_encoder_ranks(client,
     # a valid LabelEncoder rank for 6 classes, which would top out at 5)
     # must be present, since it's the most-sampled row in the fixture.
     assert 6.0 in labels
+
+
+def test_sample_point_count_respects_the_budget_with_many_rows(monkeypatch):
+    """The actual "25x too many pixels" bug report: a shapefile with far
+    more rows than the requested max_training_samples budget used to
+    generate roughly len(gdf) points regardless of the budget (every row's
+    "at least 1 point" floor, unconstrained). 500 rows, budget 50 -- must
+    land near 50, not 500."""
+    n_rows = 500
+    heights = list(np.linspace(1.0, 50.0, n_rows))
+    geoms = [box(i * 0.01, i * 0.01, i * 0.01 + 0.005, i * 0.01 + 0.005) for i in range(n_rows)]
+    big_gdf = gpd.GeoDataFrame({"height": heights}, geometry=geoms, crs="EPSG:4326")
+
+    srv.app.config["TESTING"] = True
+    monkeypatch.setattr(srv, "_get_merged_gdf", lambda: big_gdf)
+    monkeypatch.setattr(srv, "_geotessera_instance", None)
+    monkeypatch.setattr(srv, "_tile_cache", {"key": None, "vectors": None})
+    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    client = srv.app.test_client()
+
+    captured = {}
+
+    def _fake_run_learning_curve(vectors, labels, active_models, training_pcts, **lc_kwargs):
+        captured["n_points"] = len(labels)
+        return iter(())
+
+    monkeypatch.setattr(ev, "run_learning_curve", _fake_run_learning_curve)
+
+    _run(client, max_training_samples=50)
+
+    assert captured["n_points"] <= 60, (  # small slack for valid_mask/coverage filtering
+        f"expected ~50 points (the requested budget), got {captured['n_points']} "
+        f"out of {n_rows} rows -- the budget isn't being respected"
+    )

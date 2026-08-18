@@ -113,6 +113,55 @@ def _load_cached_result(field, year, gdf, sampling="equal"):
 from tessera_zarr_utils import get_zarr, probe_zarr_coverage
 
 
+def _sample_points_within_budget(rows_gdf, budget, rng):
+    """Sample up to `budget` points total from rows_gdf's polygons.
+
+    geopandas' sample_points(size=N) generates N points PER ROW, not N
+    total -- so a caller wanting "at least 1 point per row" (so no row is
+    left with zero representation) combined with "no more than `budget`
+    points total" has a real conflict whenever there are more rows than
+    budget: drawing 1 point from every row produces len(rows_gdf) points,
+    ignoring the budget outright. Confirmed live (Louis Driver): a
+    420,000-row shapefile with a 200,000-point default budget generated
+    ~420,000 points -- every row got its floor-guaranteed 1 point,
+    regardless of budget.
+
+    When there are more rows than budget, this subsamples *which* rows to
+    draw from first (a random subset, not just the first `budget` rows --
+    a shapefile's row order often correlates with something geographic,
+    e.g. a raster-to-polygon conversion scanning left-to-right/top-to-bottom)
+    rather than drawing 1 point from every row and blowing past the budget.
+
+    Returns (coords, row_index): row_index maps each point back to its
+    source row's index in rows_gdf (0 points -> two empty arrays).
+    """
+    import warnings
+
+    n_rows = len(rows_gdf)
+    empty_coords = np.empty((0, 2))
+    empty_idx = np.empty((0,), dtype=rows_gdf.index.dtype if n_rows else np.int64)
+    if n_rows == 0 or budget <= 0:
+        return empty_coords, empty_idx
+
+    if n_rows > budget:
+        chosen = rng.choice(rows_gdf.index.to_numpy(), size=budget, replace=False)
+        source = rows_gdf.loc[chosen]
+        pts_per_row = 1
+    else:
+        source = rows_gdf
+        pts_per_row = max(1, budget // n_rows)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        pts = source.sample_points(size=pts_per_row)
+    pts_exploded = pts[~pts.is_empty].explode(index_parts=False)
+    if len(pts_exploded) == 0:
+        return empty_coords, empty_idx
+    coords = np.array([(p.x, p.y) for p in pts_exploded])
+    row_index = pts_exploded.index.to_numpy()
+    return coords, row_index
+
+
 def _extract_tile_patches(
     gt,
     gdf,
@@ -1004,24 +1053,16 @@ def run_large_area():
                         equal_n = MAX_SAMPLE_PIXELS // n_classes
                         raw_alloc = {c: equal_n for c in range(n_classes)}
 
+                    sampling_rng = np.random.RandomState(42)
                     for cls_idx in range(n_classes):
                         cls_gdf = valid_gdf[valid_gdf["_label_id"] == cls_idx]
                         if cls_gdf.empty:
                             continue
                         per_class = raw_alloc.get(cls_idx, MIN_PER_CLASS)
-                        # sample_points(size=N) generates N points PER ROW.
-                        # We want per_class total, so divide by number of rows.
-                        n_rows = len(cls_gdf)
-                        pts_per_row = max(1, per_class // n_rows)
                         try:
-                            import warnings
-
-                            with warnings.catch_warnings():
-                                warnings.simplefilter("ignore", UserWarning)
-                                pts = cls_gdf.sample_points(size=pts_per_row)
-                            # Extract coordinates from MultiPoint/Point geometries (vectorized)
-                            pts_exploded = pts[~pts.is_empty].explode(index_parts=False)
-                            coords = np.array([(p.x, p.y) for p in pts_exploded])
+                            coords, _row_idx = _sample_points_within_budget(
+                                cls_gdf, per_class, sampling_rng
+                            )
                             if len(coords) > 0:
                                 sample_points.extend(coords.tolist())
                                 sample_labels.extend([cls_idx] * len(coords))
@@ -1035,31 +1076,19 @@ def run_large_area():
                     # for regression rather than repurposed into something
                     # that doesn't map cleanly. One combined budget across
                     # every labelled row instead.
-                    n_rows = len(valid_gdf)
-                    if n_rows > 0:
-                        pts_per_row = max(1, MAX_SAMPLE_PIXELS // n_rows)
-                        try:
-                            import warnings
-
-                            with warnings.catch_warnings():
-                                warnings.simplefilter("ignore", UserWarning)
-                                pts = valid_gdf.sample_points(size=pts_per_row)
-                            pts_exploded = pts[~pts.is_empty].explode(index_parts=False)
-                            coords = np.array([(p.x, p.y) for p in pts_exploded])
-                            if len(coords) > 0:
-                                # sample_points/explode preserve the source
-                                # row's index, repeated once per point split
-                                # from that row's MultiPoint -- use it to
-                                # look up each point's *real* field value,
-                                # not a LabelEncoder rank.
-                                row_idx = pts_exploded.index.to_numpy()
-                                values = valid_gdf.loc[row_idx, field_name].to_numpy(
-                                    dtype=np.float64
-                                )
-                                sample_points.extend(coords.tolist())
-                                sample_labels.extend(values.tolist())
-                        except Exception as e:
-                            logger.warning("sample_points failed for regression: %s", e)
+                    sampling_rng = np.random.RandomState(42)
+                    try:
+                        coords, row_idx = _sample_points_within_budget(
+                            valid_gdf, MAX_SAMPLE_PIXELS, sampling_rng
+                        )
+                        if len(coords) > 0:
+                            # Look up each point's *real* field value via its
+                            # source row, not a LabelEncoder rank.
+                            values = valid_gdf.loc[row_idx, field_name].to_numpy(dtype=np.float64)
+                            sample_points.extend(coords.tolist())
+                            sample_labels.extend(values.tolist())
+                    except Exception as e:
+                        logger.warning("sample_points failed for regression: %s", e)
 
                 n_points = len(sample_points)
                 if n_points == 0:
