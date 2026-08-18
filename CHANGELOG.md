@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0]
+
+### Added
+- U-Net regression support. `rasterize_shapefile_continuous` burns real
+  field values (not `LabelEncoder` ranks — U-Net patches previously always
+  went through the same class-encoding as pixel classifiers, regardless of
+  task), `train_unet_regressor_on_patches`/`predict_unet_tile_regression`
+  train/predict a single-channel `TinyUNet` with a masked-MSE loss, and
+  `run_learning_curve`'s U-Net branch reports R²/RMSE/MAE for regression
+  the same way pixel regressors do (v1.3.1). Spatial MLP regression is
+  still not supported (no regressor variant exists for it).
+
 ## [1.3.3]
 
 ### Fixed
