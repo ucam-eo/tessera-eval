@@ -2012,6 +2012,13 @@ def create_map():
 
     classifier_name = body.get("classifier", "rf")
     map_bboxes = body.get("map_bboxes", [])
+    # Optional: predict using a *different* year's embeddings than the model
+    # was trained on -- e.g. train on 2025 (validated in the Validation
+    # pane), then map 2018 to look for change over time. Pure inference: no
+    # ground truth needed for map_year, nothing gets scored, the model is
+    # just applied as-is. Defaults to the training year (today's existing
+    # behavior) when omitted.
+    map_year_override = body.get("map_year")
 
     if not map_bboxes:
         return jsonify(
@@ -2111,10 +2118,28 @@ def create_map():
                 return
         gt = _geotessera_instance
 
-        # cache["key"] is (field_name, train_year, test_year, sampling) -- the
-        # generated map applies the *trained* model, so it must use the year
-        # the model was actually trained on, index 1 regardless of test_year.
-        year = cache["key"][1] if cache.get("key") else 2024
+        # cache["key"] is (field_name, train_year, test_year, sampling) --
+        # index 1 regardless of test_year. map_year defaults to this (today's
+        # existing behavior: map the same year the model was trained on) but
+        # can be overridden to run the trained model as pure inference
+        # against a different year's embeddings entirely -- see map_year's
+        # comment above for why.
+        train_year = cache["key"][1] if cache.get("key") else 2024
+        map_year = map_year_override or train_year
+
+        if map_year != train_year:
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            f"Trained on {train_year} -- predicting {map_year} "
+                            f"embeddings (inference only, not re-evaluated)"
+                        ),
+                    }
+                )
+                + "\n"
+            )
 
         # Clean up old map files
         for old_path in _generated_maps.values():
@@ -2168,7 +2193,7 @@ def create_map():
             # Probe zarr coverage
             gtz = get_zarr()
             use_zarr = gtz is not None and probe_zarr_coverage(
-                gtz, (west, south, east, north), year
+                gtz, (west, south, east, north), map_year
             )
 
             yield (
@@ -2211,10 +2236,10 @@ def create_map():
 
                     try:
                         if use_zarr:
-                            emb, transform, crs = gtz.read_region(chunk_bbox, year)
+                            emb, transform, crs = gtz.read_region(chunk_bbox, map_year)
                         else:
                             # Fall back to NPY: fetch tiles overlapping this chunk
-                            tiles = gt.registry.load_blocks_for_region(chunk_bbox, year)
+                            tiles = gt.registry.load_blocks_for_region(chunk_bbox, map_year)
                             tiles = list(tiles)
                             if not tiles:
                                 continue
@@ -2342,6 +2367,8 @@ def create_map():
                     # Store class names as tags
                     tags = {f"class_{i + 1}": name for i, name in enumerate(class_names)}
                     tags["classifier"] = classifier_name
+                    tags["train_year"] = str(train_year)
+                    tags["map_year"] = str(map_year)
                     dst.update_tags(**tags)
 
                 _generated_maps[map_name] = tmp.name
@@ -2359,6 +2386,8 @@ def create_map():
                             "width": out_arr.shape[1],
                             "height": out_arr.shape[0],
                             "n_classes": len(class_names),
+                            "train_year": train_year,
+                            "map_year": map_year,
                         }
                     )
                     + "\n"
