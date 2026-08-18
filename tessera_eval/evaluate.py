@@ -123,18 +123,28 @@ def run_learning_curve(
     unet_patches=None,
     test_vectors=None,
     test_labels=None,
+    task="classification",
     **kwargs,
 ):
     """Generator that yields progress events after each training percentage.
 
-    Runs stratified sampling at each training percentage, computing F1 scores
-    (macro and weighted) with multiple random repeats. Yields confusion matrices
-    at the largest percentage. Supports U-Net via patch-based train/test splits.
+    Runs sampling at each training percentage with multiple random repeats.
+    For classification: stratified per-class sampling, F1 scores (macro and
+    weighted), confusion matrices at the largest percentage. For regression:
+    plain random sampling (no classes to stratify by), R2/RMSE/MAE, and a
+    final "aggregate" event carrying the largest percentage's metrics (no
+    confusion matrix -- doesn't apply). Supports U-Net via patch-based
+    train/test splits -- classification only for now, see the U-Net branch's
+    own docstring/comments.
 
     Args:
         vectors: float32 array, shape (N, dim) — labelled pixel embeddings
-        labels: int array, shape (N,) — class labels (0-indexed)
-        classifier_names: list of classifier names (e.g., ['nn', 'rf', 'unet'])
+        labels: array, shape (N,) — class labels (0-indexed int) for
+            classification, or continuous regression targets (float) for
+            regression
+        classifier_names: list of classifier/regressor names (e.g. ['nn',
+            'rf', 'unet'] for classification, ['nn_reg', 'rf_reg'] for
+            regression)
         training_pcts: list of floats — training percentages (e.g., [1, 5, 10, 30, 50, 80])
         repeats: Number of random repeats per size (default 5)
         classifier_params: Optional dict of {classifier_name: {param: value}}
@@ -144,13 +154,23 @@ def run_learning_curve(
         unet_patches: Optional list of (emb_patch, label_patch) tuples for U-Net
         test_vectors: Optional fixed test set vectors (spatial split mode)
         test_labels: Optional fixed test set labels (spatial split mode)
+        task: "classification" or "regression"
         **kwargs: Extra arguments accepted for compatibility.
 
     Yields:
         dict events:
-        - {"type": "progress", "pct": float, "classifiers": {name: {mean_f1, std_f1, mean_f1w, std_f1w}}}
+        - {"type": "progress", "pct": float, "classifiers": {name: metrics_dict}}
+          -- metrics_dict is {mean_f1, std_f1, mean_f1w, std_f1w} for
+          classification, {mean_r2, std_r2, mean_rmse, std_rmse, mean_mae,
+          std_mae} for regression
         - {"type": "confusion_matrices", "confusion_matrices": {name: [[int]]}}
+          (classification only)
+        - {"type": "aggregate", "models": {name: metrics_dict}} (regression
+          only -- the largest percentage's metrics, mirroring run_kfold_cv's
+          event shape so the frontend's existing regression display, built
+          against that shape, works here too)
     """
+    is_classification = task == "classification"
     warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
     warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
     from sklearn.exceptions import ConvergenceWarning
@@ -165,8 +185,22 @@ def run_learning_curve(
     spatial_split = test_vectors is not None and test_labels is not None
 
     n_samples = len(labels)
-    all_labels = np.concatenate([labels, test_labels]) if spatial_split else labels
-    n_classes = len(np.unique(all_labels))
+
+    # n_classes / per-class indices / confusion matrices only make sense for
+    # classification -- regression targets are continuous, there's no
+    # "class" to stratify sampling by or build a confusion matrix over.
+    if is_classification:
+        all_labels = np.concatenate([labels, test_labels]) if spatial_split else labels
+        n_classes = len(np.unique(all_labels))
+        cm_accum = {
+            name: np.zeros((n_classes, n_classes), dtype=np.int64) for name in classifier_names
+        }
+        # Pre-compute per-class indices once (avoid N*n_classes scans in the loop)
+        precomputed_cls_indices = [np.where(labels == cls)[0] for cls in range(n_classes)]
+    else:
+        n_classes = None
+        cm_accum = {}
+        precomputed_cls_indices = None
 
     # Detect U-Net classifiers (use base name for type checks)
     has_unet = (
@@ -183,11 +217,6 @@ def run_learning_curve(
             unet_patch_pixel_counts.append(int((lbl_p > 0).sum()))
     total_unet_pixels = sum(unet_patch_pixel_counts)
 
-    cm_accum = {name: np.zeros((n_classes, n_classes), dtype=np.int64) for name in classifier_names}
-
-    # Pre-compute per-class indices once (avoid N*n_classes scans in the loop)
-    precomputed_cls_indices = [np.where(labels == cls)[0] for cls in range(n_classes)]
-
     MAX_TEST = 200_000  # subsample test set for speed (negligible accuracy loss)
 
     # Pre-subsample the fixed test set if too large (spatial split mode)
@@ -201,18 +230,18 @@ def run_learning_curve(
 
     if spatial_split:
         logger.info(
-            "Learning curve (spatial split): %d train, %d test pixels, %d classes, %d classifiers, pcts=%s",
+            "Learning curve (spatial split): %d train, %d test pixels, %s, %d classifiers, pcts=%s",
             n_samples,
             len(test_labels),
-            n_classes,
+            f"{n_classes} classes" if is_classification else "regression",
             len(classifier_names),
             training_pcts,
         )
     else:
         logger.info(
-            "Learning curve: %d pixels, %d classes, %d classifiers, pcts=%s",
+            "Learning curve: %d pixels, %s, %d classifiers, pcts=%s",
             n_samples,
-            n_classes,
+            f"{n_classes} classes" if is_classification else "regression",
             len(classifier_names),
             training_pcts,
         )
@@ -223,6 +252,9 @@ def run_learning_curve(
         active_pixel = [n for n in active if _strip_variant_suffix(n) != "unet"]
         f1_scores = {name: [] for name in active}
         f1w_scores = {name: [] for name in active}
+        # Regression equivalent of f1_scores/f1w_scores above -- unused (stays
+        # empty) when is_classification.
+        reg_scores = {name: {"r2": [], "rmse": [], "mae": []} for name in active}
         is_largest = pct == training_pcts[-1]
 
         # Number of pixels for this percentage
@@ -239,22 +271,31 @@ def run_learning_curve(
         for seed in range(n_repeats):
             rng = np.random.RandomState(seed)
 
-            # Stratified pixel sampling (using pre-computed indices)
-            per_class = max(1, size // n_classes)
-            train_idx = []
-            for cls in range(n_classes):
-                cls_indices = precomputed_cls_indices[cls]
-                if len(cls_indices) == 0:
-                    continue
+            if is_classification:
+                # Stratified pixel sampling (using pre-computed indices)
+                per_class = max(1, size // n_classes)
+                train_idx = []
+                for cls in range(n_classes):
+                    cls_indices = precomputed_cls_indices[cls]
+                    if len(cls_indices) == 0:
+                        continue
+                    if spatial_split:
+                        # In spatial split mode, all of vectors/labels are train pool
+                        n_take = min(per_class, len(cls_indices))
+                    else:
+                        n_take = min(per_class, int(0.8 * len(cls_indices)))
+                    n_take = max(1, n_take)
+                    chosen = rng.choice(cls_indices, size=n_take, replace=False)
+                    train_idx.extend(chosen)
+                train_idx = np.array(train_idx)
+            else:
+                # Regression: no classes to stratify by -- plain random sample.
                 if spatial_split:
-                    # In spatial split mode, all of vectors/labels are train pool
-                    n_take = min(per_class, len(cls_indices))
+                    n_take = min(size, n_samples)
                 else:
-                    n_take = min(per_class, int(0.8 * len(cls_indices)))
+                    n_take = min(size, int(0.8 * n_samples))
                 n_take = max(1, n_take)
-                chosen = rng.choice(cls_indices, size=n_take, replace=False)
-                train_idx.extend(chosen)
-            train_idx = np.array(train_idx)
+                train_idx = rng.choice(n_samples, size=n_take, replace=False)
 
             if spatial_split:
                 # Fixed test set from spatial bounding boxes
@@ -353,24 +394,47 @@ def run_learning_curve(
                     else:
                         y_test = labels[test_idx]
 
-                clf = make_classifier(name, (classifier_params or {}).get(name, {}))
-                try:
-                    y_pred = yield from _fit_predict_relabeled(
-                        clf, X_tr, y_tr_aug, X_te, interval=_HEARTBEAT_INTERVAL_S
-                    )
-                    f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
-                    f1w = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-                    f1_scores[name].append(f1)
-                    f1w_scores[name].append(f1w)
-                    if is_largest:
-                        cm = confusion_matrix(y_test, y_pred, labels=np.arange(n_classes))
-                        cm_accum[name] += cm
-                except Exception as exc:
-                    logger.warning(
-                        "Classifier %s failed at pct %.1f seed %d: %s", name, pct, seed, exc
-                    )
-                    f1_scores[name].append(0.0)
-                    f1w_scores[name].append(0.0)
+                # spatial_mlp/spatial_mlp_5x5 above are classification-only for
+                # now (no regressor variant exists yet -- make_regressor has
+                # no spatial_mlp_reg) -- this plain branch is the only one
+                # that actually dispatches on task.
+                if is_classification:
+                    clf = make_classifier(name, (classifier_params or {}).get(name, {}))
+                    try:
+                        y_pred = yield from _fit_predict_relabeled(
+                            clf, X_tr, y_tr_aug, X_te, interval=_HEARTBEAT_INTERVAL_S
+                        )
+                        f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+                        f1w = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+                        f1_scores[name].append(f1)
+                        f1w_scores[name].append(f1w)
+                        if is_largest:
+                            cm = confusion_matrix(y_test, y_pred, labels=np.arange(n_classes))
+                            cm_accum[name] += cm
+                    except Exception as exc:
+                        logger.warning(
+                            "Classifier %s failed at pct %.1f seed %d: %s", name, pct, seed, exc
+                        )
+                        f1_scores[name].append(0.0)
+                        f1w_scores[name].append(0.0)
+                else:
+                    reg = make_regressor(name, (classifier_params or {}).get(name, {}))
+                    try:
+                        yield from _fit_with_heartbeat(
+                            lambda: reg.fit(X_tr, y_tr_aug), interval=_HEARTBEAT_INTERVAL_S
+                        )
+                        y_pred = reg.predict(X_te)
+                        m = regression_metrics(y_test, y_pred)
+                        reg_scores[name]["r2"].append(m["r2"])
+                        reg_scores[name]["rmse"].append(m["rmse"])
+                        reg_scores[name]["mae"].append(m["mae"])
+                    except Exception as exc:
+                        logger.warning(
+                            "Regressor %s failed at pct %.1f seed %d: %s", name, pct, seed, exc
+                        )
+                        reg_scores[name]["r2"].append(0.0)
+                        reg_scores[name]["rmse"].append(0.0)
+                        reg_scores[name]["mae"].append(0.0)
 
             # U-Net: patch-based train/test split
             # Only run 1 repeat for U-Net (training is expensive, variance is dominated by SGD noise)
@@ -451,15 +515,31 @@ def run_learning_curve(
                         f1w_scores.setdefault(unet_name, []).append(0.0)
 
         pct_results = {}
-        for name in active:
-            scores = f1_scores[name]
-            scoresw = f1w_scores[name]
-            pct_results[name] = {
-                "mean_f1": round(float(np.mean(scores)), 4) if scores else 0.0,
-                "std_f1": round(float(np.std(scores)), 4) if scores else 0.0,
-                "mean_f1w": round(float(np.mean(scoresw)), 4) if scoresw else 0.0,
-                "std_f1w": round(float(np.std(scoresw)), 4) if scoresw else 0.0,
-            }
+        if is_classification:
+            for name in active:
+                scores = f1_scores[name]
+                scoresw = f1w_scores[name]
+                pct_results[name] = {
+                    "mean_f1": round(float(np.mean(scores)), 4) if scores else 0.0,
+                    "std_f1": round(float(np.std(scores)), 4) if scores else 0.0,
+                    "mean_f1w": round(float(np.mean(scoresw)), 4) if scoresw else 0.0,
+                    "std_f1w": round(float(np.std(scoresw)), 4) if scoresw else 0.0,
+                }
+        else:
+            for name in active:
+                r2s = reg_scores[name]["r2"]
+                rmses = reg_scores[name]["rmse"]
+                maes = reg_scores[name]["mae"]
+                pct_results[name] = {
+                    "mean_r2": round(float(np.mean(r2s)), 4) if r2s else 0.0,
+                    "std_r2": round(float(np.std(r2s)), 4) if r2s else 0.0,
+                    "mean_rmse": round(float(np.mean(rmses)), 4) if rmses else 0.0,
+                    "std_rmse": round(float(np.std(rmses)), 4) if rmses else 0.0,
+                    "mean_mae": round(float(np.mean(maes)), 4) if maes else 0.0,
+                    "std_mae": round(float(np.std(maes)), 4) if maes else 0.0,
+                }
+            if is_largest:
+                largest_pct_results = pct_results
 
         # Compute actual training pixel counts for unified x-axis
         pixel_train_count = len(train_idx)  # from last repeat (representative)
@@ -471,16 +551,21 @@ def run_learning_curve(
             unet_train_count = sum(unet_patch_pixel_counts[:n_train_patches])
 
         pct_elapsed = _time.time() - pct_t0
-        f1_summary = ", ".join(
-            f"{n}={pct_results[n]['mean_f1']:.3f}" for n in active if n in pct_results
-        )
+        if is_classification:
+            metric_summary = ", ".join(
+                f"{n}={pct_results[n]['mean_f1']:.3f}" for n in active if n in pct_results
+            )
+        else:
+            metric_summary = ", ".join(
+                f"{n}={pct_results[n]['mean_r2']:.3f}" for n in active if n in pct_results
+            )
         logger.info(
             "Pct %d/%d (%.0f%%) done in %.1fs — %s",
             pct_idx + 1,
             len(training_pcts),
             pct,
             pct_elapsed,
-            f1_summary,
+            metric_summary,
         )
         yield {
             "type": "progress",
@@ -492,12 +577,21 @@ def run_learning_curve(
             "total_unet_pixels": total_unet_pixels,
         }
 
-    confusion_matrices = {}
-    for name in classifier_names:
-        if cm_accum[name].any():
-            confusion_matrices[name] = cm_accum[name].tolist()
-    if confusion_matrices:
-        yield {"type": "confusion_matrices", "confusion_matrices": confusion_matrices}
+    if is_classification:
+        confusion_matrices = {}
+        for name in classifier_names:
+            if cm_accum[name].any():
+                confusion_matrices[name] = cm_accum[name].tolist()
+        if confusion_matrices:
+            yield {"type": "confusion_matrices", "confusion_matrices": confusion_matrices}
+    elif training_pcts:
+        # Mirrors run_kfold_cv's "aggregate" event shape -- the frontend's
+        # regression display (renderRegressionResults) is already built
+        # against that shape, it just never had anything to trigger it from
+        # this function before. Carries the largest percentage's metrics
+        # (the run_learning_curve analog of "the final result"), same
+        # percentage confusion matrices are captured from above.
+        yield {"type": "aggregate", "models": largest_pct_results}
 
 
 def evaluate(

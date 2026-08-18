@@ -1586,6 +1586,7 @@ def run_large_area():
             else spatial_labels_5x5,
             finish_classifiers=_finish_classifiers,
             unet_patches=unet_patches,
+            task=task,
         )
         if has_spatial_split:
             lc_kwargs["test_vectors"] = spatial_test_vectors
@@ -1639,6 +1640,22 @@ def run_large_area():
                         {
                             "event": "confusion_matrices",
                             "confusion_matrices": event["confusion_matrices"],
+                        }
+                    )
+                    + "\n"
+                )
+            elif event["type"] == "aggregate":
+                # Regression mode -- run_learning_curve's analog of
+                # confusion_matrices above (largest-percentage summary). The
+                # frontend's regression display already expects this exact
+                # {"event": "aggregate", "models": {...}} shape (built
+                # against run_kfold_cv's event, which run_large_area doesn't
+                # use, but the wire format matches).
+                yield (
+                    json.dumps(
+                        {
+                            "event": "aggregate",
+                            "models": event["models"],
                         }
                     )
                     + "\n"
