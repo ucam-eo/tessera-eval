@@ -880,84 +880,144 @@ def run_large_area():
             try:
                 MAX_SAMPLE_PIXELS = max_train if max_train else 200_000
 
-                le = LabelEncoder()
-                le.fit(gdf[field_name].dropna().unique())
-                class_names = le.classes_.tolist()
-                n_classes = len(class_names)
+                # LabelEncoder/class_names/n_classes are classification-only:
+                # regression targets are continuous, so there's no fixed
+                # class vocabulary to fit. Confirmed live (Louis Driver):
+                # this used to run unconditionally, silently LabelEncoding a
+                # continuous field (e.g. tree height) into arbitrary
+                # rank-order integers (0, 1, 2, ...) that then became the
+                # actual training targets all the way through -- regressors
+                # were fitting real-looking-but-meaningless R2/RMSE/MAE
+                # against those ranks, not real height values. It also drove
+                # the per-class point-budget/floor logic below, which is
+                # exactly why a 420,000-row, 25-unique-height shapefile
+                # generated ~25x more sample points than requested (each of
+                # the 25 LabelEncoder "classes" independently hit the "at
+                # least 1 point per polygon" floor).
+                if is_classification:
+                    le = LabelEncoder()
+                    le.fit(gdf[field_name].dropna().unique())
+                    class_names = le.classes_.tolist()
+                    n_classes = len(class_names)
+                else:
+                    class_names = []
+                    n_classes = 0
 
                 # Generate random sample points within shapefile polygons
-                logger.info("Generating sample points across %d classes...", n_classes)
-                yield (
-                    json.dumps(
-                        {
-                            "event": "status",
-                            "message": f"Generating sample points across {n_classes} classes...",
-                        }
+                if is_classification:
+                    logger.info("Generating sample points across %d classes...", n_classes)
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "status",
+                                "message": f"Generating sample points across {n_classes} classes...",
+                            }
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
+                else:
+                    logger.info("Generating sample points...")
+                    yield (
+                        json.dumps({"event": "status", "message": "Generating sample points..."})
+                        + "\n"
+                    )
 
                 valid_gdf = gdf.dropna(subset=[field_name]).copy()
-                label_ids = le.transform(valid_gdf[field_name])
-                valid_gdf["_label_id"] = label_ids
-
-                # Sampling strategy: equal, proportional, or sqrt-proportional
-                MIN_PER_CLASS = 50
-                if sampling in ("proportional", "sqrt"):
-                    import math
-
-                    area_crs = valid_gdf.estimate_utm_crs()
-                    projected = valid_gdf.to_crs(area_crs)
-                    projected["_area"] = projected.geometry.area
-                    valid_gdf["_area"] = projected["_area"].values
-                    class_areas = valid_gdf.groupby("_label_id")["_area"].sum()
-                    if sampling == "sqrt":
-                        weights = {c: math.sqrt(a) for c, a in class_areas.items()}
-                    else:
-                        weights = dict(class_areas)
-                    total_weight = sum(weights.values())
-                    raw_alloc = {
-                        c: max(MIN_PER_CLASS, int(MAX_SAMPLE_PIXELS * w / total_weight))
-                        for c, w in weights.items()
-                    }
-                    # Scale down if total exceeds budget
-                    alloc_total = sum(raw_alloc.values())
-                    if alloc_total > MAX_SAMPLE_PIXELS:
-                        scale = MAX_SAMPLE_PIXELS / alloc_total
-                        raw_alloc = {
-                            c: max(MIN_PER_CLASS, int(n * scale)) for c, n in raw_alloc.items()
-                        }
-                else:
-                    # Equal per class
-                    equal_n = MAX_SAMPLE_PIXELS // n_classes
-                    raw_alloc = {c: equal_n for c in range(n_classes)}
 
                 sample_points = []
                 sample_labels = []
 
-                for cls_idx in range(n_classes):
-                    cls_gdf = valid_gdf[valid_gdf["_label_id"] == cls_idx]
-                    if cls_gdf.empty:
-                        continue
-                    per_class = raw_alloc.get(cls_idx, MIN_PER_CLASS)
-                    # sample_points(size=N) generates N points PER ROW.
-                    # We want per_class total, so divide by number of rows.
-                    n_rows = len(cls_gdf)
-                    pts_per_row = max(1, per_class // n_rows)
-                    try:
-                        import warnings
+                if is_classification:
+                    label_ids = le.transform(valid_gdf[field_name])
+                    valid_gdf["_label_id"] = label_ids
 
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", UserWarning)
-                            pts = cls_gdf.sample_points(size=pts_per_row)
-                        # Extract coordinates from MultiPoint/Point geometries (vectorized)
-                        pts_exploded = pts[~pts.is_empty].explode(index_parts=False)
-                        coords = np.array([(p.x, p.y) for p in pts_exploded])
-                        if len(coords) > 0:
-                            sample_points.extend(coords.tolist())
-                            sample_labels.extend([cls_idx] * len(coords))
-                    except Exception as e:
-                        logger.warning("sample_points failed for class %d: %s", cls_idx, e)
+                    # Sampling strategy: equal, proportional, or sqrt-proportional
+                    MIN_PER_CLASS = 50
+                    if sampling in ("proportional", "sqrt"):
+                        import math
+
+                        area_crs = valid_gdf.estimate_utm_crs()
+                        projected = valid_gdf.to_crs(area_crs)
+                        projected["_area"] = projected.geometry.area
+                        valid_gdf["_area"] = projected["_area"].values
+                        class_areas = valid_gdf.groupby("_label_id")["_area"].sum()
+                        if sampling == "sqrt":
+                            weights = {c: math.sqrt(a) for c, a in class_areas.items()}
+                        else:
+                            weights = dict(class_areas)
+                        total_weight = sum(weights.values())
+                        raw_alloc = {
+                            c: max(MIN_PER_CLASS, int(MAX_SAMPLE_PIXELS * w / total_weight))
+                            for c, w in weights.items()
+                        }
+                        # Scale down if total exceeds budget
+                        alloc_total = sum(raw_alloc.values())
+                        if alloc_total > MAX_SAMPLE_PIXELS:
+                            scale = MAX_SAMPLE_PIXELS / alloc_total
+                            raw_alloc = {
+                                c: max(MIN_PER_CLASS, int(n * scale)) for c, n in raw_alloc.items()
+                            }
+                    else:
+                        # Equal per class
+                        equal_n = MAX_SAMPLE_PIXELS // n_classes
+                        raw_alloc = {c: equal_n for c in range(n_classes)}
+
+                    for cls_idx in range(n_classes):
+                        cls_gdf = valid_gdf[valid_gdf["_label_id"] == cls_idx]
+                        if cls_gdf.empty:
+                            continue
+                        per_class = raw_alloc.get(cls_idx, MIN_PER_CLASS)
+                        # sample_points(size=N) generates N points PER ROW.
+                        # We want per_class total, so divide by number of rows.
+                        n_rows = len(cls_gdf)
+                        pts_per_row = max(1, per_class // n_rows)
+                        try:
+                            import warnings
+
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", UserWarning)
+                                pts = cls_gdf.sample_points(size=pts_per_row)
+                            # Extract coordinates from MultiPoint/Point geometries (vectorized)
+                            pts_exploded = pts[~pts.is_empty].explode(index_parts=False)
+                            coords = np.array([(p.x, p.y) for p in pts_exploded])
+                            if len(coords) > 0:
+                                sample_points.extend(coords.tolist())
+                                sample_labels.extend([cls_idx] * len(coords))
+                        except Exception as e:
+                            logger.warning("sample_points failed for class %d: %s", cls_idx, e)
+                else:
+                    # Regression: no classes, so no per-class weighting/floor
+                    # either -- the "sampling" strategy param (equal/
+                    # proportional/sqrt) only makes sense as a *class*
+                    # weighting choice, so it's not applicable here; ignored
+                    # for regression rather than repurposed into something
+                    # that doesn't map cleanly. One combined budget across
+                    # every labelled row instead.
+                    n_rows = len(valid_gdf)
+                    if n_rows > 0:
+                        pts_per_row = max(1, MAX_SAMPLE_PIXELS // n_rows)
+                        try:
+                            import warnings
+
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", UserWarning)
+                                pts = valid_gdf.sample_points(size=pts_per_row)
+                            pts_exploded = pts[~pts.is_empty].explode(index_parts=False)
+                            coords = np.array([(p.x, p.y) for p in pts_exploded])
+                            if len(coords) > 0:
+                                # sample_points/explode preserve the source
+                                # row's index, repeated once per point split
+                                # from that row's MultiPoint -- use it to
+                                # look up each point's *real* field value,
+                                # not a LabelEncoder rank.
+                                row_idx = pts_exploded.index.to_numpy()
+                                values = valid_gdf.loc[row_idx, field_name].to_numpy(
+                                    dtype=np.float64
+                                )
+                                sample_points.extend(coords.tolist())
+                                sample_labels.extend(values.tolist())
+                        except Exception as e:
+                            logger.warning("sample_points failed for regression: %s", e)
 
                 n_points = len(sample_points)
                 if n_points == 0:
@@ -1162,7 +1222,9 @@ def run_large_area():
                 logger.info("Processing embeddings...")
                 yield json.dumps({"event": "status", "message": "Processing embeddings..."}) + "\n"
 
-                labels = np.array(sample_labels, dtype=np.int32)
+                labels = np.array(
+                    sample_labels, dtype=np.int32 if is_classification else np.float32
+                )
 
                 # Remove NaN rows (points outside tile coverage)
                 valid_mask = ~np.isnan(vectors).any(axis=1)
@@ -1501,12 +1563,17 @@ def run_large_area():
             if not training_pcts:
                 training_pcts = [max_pct]
 
-        # Class info
-        unique_labels, counts = np.unique(labels, return_counts=True)
+        # Class info (classification only -- regression labels are
+        # continuous floats, not a small fixed vocabulary to enumerate, and
+        # class_names[lbl] below would TypeError on a float lbl regardless;
+        # not used downstream for regression anyway, see "classes": ...
+        # if is_classification else [] at the start event).
         class_info = []
-        for lbl, cnt in zip(unique_labels, counts):
-            name = class_names[lbl] if lbl < len(class_names) else f"Class {lbl}"
-            class_info.append({"name": str(name), "pixels": int(cnt)})
+        if is_classification:
+            unique_labels, counts = np.unique(labels, return_counts=True)
+            for lbl, cnt in zip(unique_labels, counts):
+                name = class_names[lbl] if lbl < len(class_names) else f"Class {lbl}"
+                class_info.append({"name": str(name), "pixels": int(cnt)})
 
         # Filter classifiers that the user hasn't installed deps for
         active_models = []

@@ -124,3 +124,34 @@ def test_aggregate_event_reaches_the_client(client):
 
     cm_events = [e for e in events if e["event"] == "confusion_matrices"]
     assert not cm_events, "regression mode shouldn't produce a confusion matrix"
+
+
+def test_regression_labels_are_real_field_values_not_label_encoder_ranks(client, monkeypatch):
+    """The actual bug: labels used to always be LabelEncoder(field).transform(...)
+    -- e.g. heights [1.5, 3.2, 3.3, 10.7, 100.5, 200.9] became ranks
+    [0, 1, 2, 3, 4, 5], and *those* were what regressors actually trained
+    against. Capture what run_learning_curve is called with and confirm
+    every label is one of the real height values, not a small rank int."""
+    captured = {}
+
+    def _fake_run_learning_curve(vectors, labels, active_models, training_pcts, **lc_kwargs):
+        captured["labels"] = labels
+        return iter(())
+
+    monkeypatch.setattr(ev, "run_learning_curve", _fake_run_learning_curve)
+
+    real_heights = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0}
+    _run(client)
+
+    labels = captured["labels"]
+    assert len(labels) > 0
+    assert set(np.unique(labels).tolist()) <= real_heights, (
+        f"expected only real height values, got {sorted(set(labels.tolist()))}"
+    )
+    # The old (broken) behavior specifically produced small contiguous rank
+    # ints -- [0..5] here, coincidentally overlapping 1..5 of the real
+    # values, which is exactly why this needs an explicit set comparison
+    # rather than "looks like small integers": 6.0 (a real height, but not
+    # a valid LabelEncoder rank for 6 classes, which would top out at 5)
+    # must be present, since it's the most-sampled row in the fixture.
+    assert 6.0 in labels
