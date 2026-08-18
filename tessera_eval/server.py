@@ -900,6 +900,16 @@ def run_large_area():
                     class_names = le.classes_.tolist()
                     n_classes = len(class_names)
                 else:
+                    # le=None is a real, already-supported case in
+                    # _extract_tile_patches -> rasterize_shapefile (falls
+                    # back to its own per-tile LabelEncoder) -- needed here
+                    # since _extract_tile_patches is called unconditionally
+                    # below whenever spatial features are requested
+                    # (spatial_mlp/unet), regression included, and `le`
+                    # would otherwise be undefined for that call. n_classes
+                    # is accepted but unused inside _extract_tile_patches;
+                    # 0 is fine.
+                    le = None
                     class_names = []
                     n_classes = 0
 
