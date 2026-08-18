@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.1]
+
+### Fixed
+- `run_learning_curve` (used by `run-large-area`) now correctly runs pixel
+  regressors (`nn_reg`/`rf_reg`/`xgboost_reg`/`mlp_reg`) — previously it had
+  no classification/regression dispatch at all and always called
+  `make_classifier`, so every regression request crashed with `ValueError:
+  Unknown classifier: nn_reg` (etc.) the moment training started. Regression
+  runs now also emit an `"aggregate"` event (largest-percentage R²/RMSE/MAE)
+  that the frontend's regression display was already built to consume but
+  never received. Not yet fixed: Spatial MLP and U-Net regression (no
+  regressor variant exists for either yet).
+
 ## [1.3.0]
 
 ### Added
