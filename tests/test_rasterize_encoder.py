@@ -7,7 +7,7 @@ from affine import Affine
 from shapely.geometry import box
 from sklearn.preprocessing import LabelEncoder
 
-from tessera_eval.rasterize import rasterize_shapefile
+from tessera_eval.rasterize import rasterize_shapefile, rasterize_shapefile_continuous
 
 
 @pytest.fixture
@@ -64,3 +64,42 @@ def test_without_encoder_fits_locally(sample_gdf):
     # Should have exactly two class IDs plus 0 (nodata at edges if any)
     unique = set(np.unique(raster)) - {0}
     assert unique == {1, 2}
+
+
+def test_rasterize_continuous_burns_real_values_not_class_ids():
+    """Regression counterpart: the raster should carry the field's actual
+    numeric values, not LabelEncoder ranks -- this is the piece that was
+    missing for U-Net regression (patches would otherwise train against
+    ranks, repeating the same bug fixed in run_large_area's point sampling
+    for pixel classifiers)."""
+    gdf = gpd.GeoDataFrame(
+        {
+            "geometry": [box(0, 0, 5, 5), box(5, 0, 10, 5)],
+            "height": [1.5, 3.2],
+        },
+        crs="EPSG:4326",
+    )
+    transform = Affine(1, 0, 0, 0, -1, 10)
+    raster = rasterize_shapefile_continuous(gdf, "height", transform, width=10, height=10)
+
+    assert raster.dtype == np.float32
+    assert np.isclose(raster[5, 2], 1.5)  # left half
+    assert np.isclose(raster[5, 7], 3.2)  # right half
+
+
+def test_rasterize_continuous_fill_is_nan_not_zero():
+    """NaN as the nodata sentinel (not 0) is the whole point -- 0 is a
+    perfectly valid real target value (e.g. tree height at a bare patch),
+    and would silently collide with "no data" if reused as the fill."""
+    gdf = gpd.GeoDataFrame(
+        {"geometry": [box(0, 0, 5, 5)], "height": [0.0]},
+        crs="EPSG:4326",
+    )
+    transform = Affine(1, 0, 0, 0, -1, 10)
+    raster = rasterize_shapefile_continuous(gdf, "height", transform, width=10, height=10)
+
+    # Covered pixel: real value 0.0, distinguishable from nodata.
+    assert raster[5, 2] == 0.0
+    assert not np.isnan(raster[5, 2])
+    # Uncovered pixel: nodata.
+    assert np.isnan(raster[5, 8])

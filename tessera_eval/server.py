@@ -128,21 +128,33 @@ def _extract_tile_patches(
     logger=None,
     progress_cb=None,
     cancel_flag=None,
+    is_classification=True,
 ):
     """Extract pixel-aligned 2D patches and optionally point samples from tiles.
 
     Uses zarr read_region() when available (~0.2s/patch vs ~15s/tile via NPY).
     Falls back to gt.fetch_embeddings() for NPY tile downloads.
 
+    is_classification=False (regression): patches carry real continuous
+    target values (via rasterize_shapefile_continuous, NaN = unlabelled)
+    instead of LabelEncoder class IDs (via rasterize_shapefile, 0 =
+    unlabelled) -- le/n_classes are unused in that case (spatial_mlp/
+    spatial_mlp_5x5 regression isn't supported yet regardless -- no
+    regressor variant exists for either -- so needs_spatial_3x3/5x5 should
+    never actually be True alongside is_classification=False in practice,
+    but this function doesn't crash if it happens).
+
     Returns (unet_patches, spatial_3x3, spatial_5x5, point_vectors) where
-    point_vectors is a (N, 128) array if sample_points_lonlat was given, else None.
+    point_vectors is a (N, 128) array if sample_points_lonlat was given, else
+    None. unet_patches' label_patch is int32 for classification, float32
+    (NaN = ignore) for regression.
     """
     import rasterio.transform
     from rasterio.transform import array_bounds
     from shapely.geometry import box as _box
 
     from tessera_eval.classify import gather_spatial_features_2d
-    from tessera_eval.rasterize import rasterize_shapefile
+    from tessera_eval.rasterize import rasterize_shapefile, rasterize_shapefile_continuous
 
     rng = np.random.RandomState(42)
 
@@ -290,10 +302,17 @@ def _extract_tile_patches(
             continue
 
         # Rasterize labels for the full tile
-        tile_labels = rasterize_shapefile(tile_gdf, field_name, transform, h, w, label_encoder=le)
+        if is_classification:
+            tile_labels = rasterize_shapefile(
+                tile_gdf, field_name, transform, h, w, label_encoder=le
+            )
+            labelled_mask_tile = tile_labels > 0
+        else:
+            tile_labels = rasterize_shapefile_continuous(tile_gdf, field_name, transform, h, w)
+            labelled_mask_tile = ~np.isnan(tile_labels)
 
         # Find rows/cols where labels exist, with enough margin for a patch
-        labelled_rows, labelled_cols = np.where(tile_labels > 0)
+        labelled_rows, labelled_cols = np.where(labelled_mask_tile)
         if len(labelled_rows) == 0:
             continue
 
@@ -325,7 +344,10 @@ def _extract_tile_patches(
                 continue
             if label_patch.shape != (patch_size, patch_size):
                 continue
-            if (label_patch > 0).sum() < 10:
+            n_patch_labelled = (
+                (label_patch > 0).sum() if is_classification else (~np.isnan(label_patch)).sum()
+            )
+            if n_patch_labelled < 10:
                 continue
 
             # Basic slicing above returns a *view* into tile_emb -- copy() is not
@@ -350,11 +372,16 @@ def _extract_tile_patches(
             if nan_mask.any():
                 emb_patch[nan_mask] = 0.0
 
-            unet_patches.append((emb_patch, label_patch.astype(np.int32)))
+            # int32 for classification (class IDs); float32 as-is for
+            # regression (real values, NaN = ignore -- casting to int32
+            # would destroy both the precision and the NaN sentinel).
+            unet_patches.append(
+                (emb_patch, label_patch.astype(np.int32) if is_classification else label_patch)
+            )
 
             # Subsample labelled pixels for spatial features to cap memory
             # (~300MB per full 256×256 patch at 3×3, ~800MB at 5×5)
-            labelled_mask = label_patch > 0
+            labelled_mask = label_patch > 0 if is_classification else ~np.isnan(label_patch)
             MAX_SPATIAL_PX = 5000  # per patch — 100 patches × 5K = 500K total
             n_labelled = labelled_mask.sum()
             if n_labelled > MAX_SPATIAL_PX and (needs_spatial_3x3 or needs_spatial_5x5):
@@ -364,6 +391,11 @@ def _extract_tile_patches(
                 labelled_mask = np.zeros_like(labelled_mask)
                 labelled_mask[rows[keep], cols[keep]] = True
 
+            # spatial_mlp/spatial_mlp_5x5 regression isn't supported (no
+            # regressor variant exists), so these branches stay
+            # classification-shaped (the "- 1" 1-based→0-based shift would
+            # be meaningless for regression) -- needs_spatial_3x3/5x5 should
+            # never actually be True here when is_classification is False.
             if needs_spatial_3x3:
                 sf = gather_spatial_features_2d(emb_patch, radius=1, mask=labelled_mask)
                 all_spatial_3x3.append(sf)
@@ -1101,6 +1133,7 @@ def run_large_area():
                                 logger=logger,
                                 progress_cb=_tile_progress,
                                 cancel_flag=_cancel_flag,
+                                is_classification=is_classification,
                             )
                         except Exception as e:
                             tile_result[1] = e

@@ -46,6 +46,46 @@ def rasterize_shapefile(gdf, field, transform, width, height, label_encoder=None
     return class_raster
 
 
+def rasterize_shapefile_continuous(gdf, field, transform, width, height):
+    """Rasterize a shapefile field's real values onto a pixel grid (regression).
+
+    The regression counterpart to rasterize_shapefile: burns the field's
+    actual numeric values directly, not a LabelEncoder-assigned class ID.
+    Deliberately a separate function rather than a mode flag on
+    rasterize_shapefile -- that one's int32/1-based/0-as-nodata contract is
+    baked into every caller (U-Net's patch code checks `> 0` for "labelled"),
+    and mixing a float/NaN-as-nodata contract into the same function via a
+    branch would risk breaking the classification path for a regression-only
+    need.
+
+    Args:
+        gdf: GeoDataFrame with geometry and a numeric attribute column
+        field: Name of the attribute column to use as the regression target
+        transform: Affine transform mapping pixel coords to geographic coords
+        width: Raster width in pixels
+        height: Raster height in pixels
+
+    Returns:
+        float32 array, shape (height, width) -- NaN = nodata, everywhere
+        else the real field value of whichever polygon covers that pixel.
+    """
+    valid = gdf.dropna(subset=[field])
+    values = valid[field].astype(np.float64).to_numpy()
+
+    shapes = list(zip(valid.geometry, values))
+
+    target_raster = rasterio.features.rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=np.nan,
+        dtype=np.float32,
+        all_touched=True,
+    )
+
+    return target_raster
+
+
 def align_raster_to_grid(
     raster_path, transform, crs, width, height, band=1, resampling="nearest", nodata_values=None
 ):

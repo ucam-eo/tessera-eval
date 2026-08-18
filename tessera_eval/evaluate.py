@@ -443,11 +443,15 @@ def run_learning_curve(
                 yield {"type": "classifier_status", "message": f"Pct {pct}%: training U-Net..."}
                 for unet_name in unet_active:
                     try:
-                        from tessera_eval.unet import (
-                            _HAS_TORCH,
-                            predict_unet_tile,
-                            train_unet_on_patches,
-                        )
+                        from tessera_eval.unet import _HAS_TORCH
+
+                        if is_classification:
+                            from tessera_eval.unet import predict_unet_tile, train_unet_on_patches
+                        else:
+                            from tessera_eval.unet import (
+                                predict_unet_tile_regression,
+                                train_unet_regressor_on_patches,
+                            )
 
                         if _HAS_TORCH:
                             n_patches = len(unet_patches)
@@ -464,55 +468,96 @@ def run_learning_curve(
                                 # Use fewer epochs for learning curve (full epochs only for final model)
                                 unet_params = dict((classifier_params or {}).get(unet_name, {}))
                                 unet_params.setdefault("epochs", 15)
-                                model = yield from _fit_with_heartbeat(
-                                    lambda: train_unet_on_patches(
-                                        train_patches, n_classes, unet_params
-                                    ),
-                                    interval=_HEARTBEAT_INTERVAL_S,
-                                )
+                                if is_classification:
+                                    model = yield from _fit_with_heartbeat(
+                                        lambda: train_unet_on_patches(
+                                            train_patches, n_classes, unet_params
+                                        ),
+                                        interval=_HEARTBEAT_INTERVAL_S,
+                                    )
+                                else:
+                                    model = yield from _fit_with_heartbeat(
+                                        lambda: train_unet_regressor_on_patches(
+                                            train_patches, unet_params
+                                        ),
+                                        interval=_HEARTBEAT_INTERVAL_S,
+                                    )
 
                                 # Evaluate on test patches
                                 all_true, all_pred = [], []
                                 for emb_patch, lbl_patch in test_patches:
-                                    pred = predict_unet_tile(
-                                        model, emb_patch, patch_size=emb_patch.shape[0]
-                                    )
+                                    if is_classification:
+                                        pred = predict_unet_tile(
+                                            model, emb_patch, patch_size=emb_patch.shape[0]
+                                        )
+                                    else:
+                                        pred = predict_unet_tile_regression(
+                                            model, emb_patch, patch_size=emb_patch.shape[0]
+                                        )
                                     # Ensure pred and lbl_patch have matching shapes
                                     ph = min(pred.shape[0], lbl_patch.shape[0])
                                     pw = min(pred.shape[1], lbl_patch.shape[1])
                                     pred = pred[:ph, :pw]
                                     lbl = lbl_patch[:ph, :pw]
-                                    mask = lbl > 0
-                                    if mask.any():
-                                        all_true.append(lbl[mask] - 1)  # 1-based → 0-based
-                                        all_pred.append(pred[mask] - 1)
+                                    if is_classification:
+                                        mask = lbl > 0
+                                        if mask.any():
+                                            all_true.append(lbl[mask] - 1)  # 1-based → 0-based
+                                            all_pred.append(pred[mask] - 1)
+                                    else:
+                                        mask = ~np.isnan(lbl)
+                                        if mask.any():
+                                            all_true.append(lbl[mask])
+                                            all_pred.append(pred[mask])
 
                                 if all_true:
                                     y_true = np.concatenate(all_true)
                                     y_pred = np.concatenate(all_pred)
-                                    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-                                    f1w = f1_score(
-                                        y_true, y_pred, average="weighted", zero_division=0
-                                    )
-                                    f1_scores[unet_name].append(float(f1))
-                                    f1w_scores[unet_name].append(float(f1w))
-                                    if is_largest:
-                                        cm = confusion_matrix(
-                                            y_true, y_pred, labels=np.arange(n_classes)
+                                    if is_classification:
+                                        f1 = f1_score(
+                                            y_true, y_pred, average="macro", zero_division=0
                                         )
-                                        cm_accum[unet_name] += cm
-                                else:
+                                        f1w = f1_score(
+                                            y_true, y_pred, average="weighted", zero_division=0
+                                        )
+                                        f1_scores[unet_name].append(float(f1))
+                                        f1w_scores[unet_name].append(float(f1w))
+                                        if is_largest:
+                                            cm = confusion_matrix(
+                                                y_true, y_pred, labels=np.arange(n_classes)
+                                            )
+                                            cm_accum[unet_name] += cm
+                                    else:
+                                        m = regression_metrics(y_true, y_pred)
+                                        reg_scores[unet_name]["r2"].append(m["r2"])
+                                        reg_scores[unet_name]["rmse"].append(m["rmse"])
+                                        reg_scores[unet_name]["mae"].append(m["mae"])
+                                elif is_classification:
                                     f1_scores[unet_name].append(0.0)
                                     f1w_scores[unet_name].append(0.0)
-                            else:
+                                else:
+                                    reg_scores[unet_name]["r2"].append(0.0)
+                                    reg_scores[unet_name]["rmse"].append(0.0)
+                                    reg_scores[unet_name]["mae"].append(0.0)
+                            elif is_classification:
                                 f1_scores[unet_name].append(0.0)
                                 f1w_scores[unet_name].append(0.0)
+                            else:
+                                reg_scores[unet_name]["r2"].append(0.0)
+                                reg_scores[unet_name]["rmse"].append(0.0)
+                                reg_scores[unet_name]["mae"].append(0.0)
                     except Exception as exc:
                         logger.warning(
                             "U-Net %s failed at pct %.1f seed %d: %s", unet_name, pct, seed, exc
                         )
-                        f1_scores.setdefault(unet_name, []).append(0.0)
-                        f1w_scores.setdefault(unet_name, []).append(0.0)
+                        if is_classification:
+                            f1_scores.setdefault(unet_name, []).append(0.0)
+                            f1w_scores.setdefault(unet_name, []).append(0.0)
+                        else:
+                            reg_scores.setdefault(unet_name, {"r2": [], "rmse": [], "mae": []})
+                            reg_scores[unet_name]["r2"].append(0.0)
+                            reg_scores[unet_name]["rmse"].append(0.0)
+                            reg_scores[unet_name]["mae"].append(0.0)
 
         pct_results = {}
         if is_classification:

@@ -115,6 +115,81 @@ def extract_labelled_patches(tile_emb, class_raster, patch_size=256, min_labelle
     return patches
 
 
+def extract_labelled_patches_regression(tile_emb, target_raster, patch_size=256, min_labelled=10):
+    """Regression counterpart to extract_labelled_patches.
+
+    Identical clustering/cropping logic, but for a continuous target_raster
+    (from rasterize_shapefile_continuous) rather than an int class_raster --
+    "labelled" is ~isnan(...) instead of > 0, and NaN is the ignore sentinel
+    for pad/fill instead of 0 (0 is a valid real target value, e.g. tree
+    height at a bare patch, and would silently collide with "no data" if
+    reused as the classification convention's fill).
+
+    Args:
+        tile_emb: float32 array, shape (H, W, 128) -- tile embeddings.
+        target_raster: float32 array, shape (H, W) -- NaN = unlabelled.
+        patch_size: Patch side length in pixels (default 256).
+        min_labelled: Minimum labelled pixels required per patch (default 10).
+
+    Returns:
+        List of (emb_patch, target_patch) tuples where
+        - emb_patch is float32 (patch_size, patch_size, 128)
+        - target_patch is float32 (patch_size, patch_size), NaN = ignore
+    """
+    from scipy import ndimage
+
+    H, W, dim = tile_emb.shape
+    target_raster = np.asarray(target_raster)
+    mask = ~np.isnan(target_raster)
+
+    if not mask.any():
+        return []
+
+    structure = np.ones((3, 3), dtype=int)  # 8-connectivity
+    labelled_cc, n_components = ndimage.label(mask, structure=structure)
+
+    half = patch_size // 2
+    patches = []
+
+    for cc_id in range(1, n_components + 1):
+        ys, xs = np.where(labelled_cc == cc_id)
+        n_labelled = len(ys)
+
+        if n_labelled < min_labelled:
+            continue
+
+        cy = int(np.mean(ys))
+        cx = int(np.mean(xs))
+
+        r0 = cy - half
+        c0 = cx - half
+        r1 = r0 + patch_size
+        c1 = c0 + patch_size
+
+        sr0 = max(r0, 0)
+        sc0 = max(c0, 0)
+        sr1 = min(r1, H)
+        sc1 = min(c1, W)
+
+        dr0 = sr0 - r0
+        dc0 = sc0 - c0
+        dr1 = dr0 + (sr1 - sr0)
+        dc1 = dc0 + (sc1 - sc0)
+
+        emb_patch = np.zeros((patch_size, patch_size, dim), dtype=np.float32)
+        target_patch = np.full((patch_size, patch_size), np.nan, dtype=np.float32)
+
+        emb_patch[dr0:dr1, dc0:dc1] = tile_emb[sr0:sr1, sc0:sc1]
+        target_patch[dr0:dr1, dc0:dc1] = target_raster[sr0:sr1, sc0:sc1]
+
+        if (~np.isnan(target_patch)).sum() < min_labelled:
+            continue
+
+        patches.append((emb_patch, target_patch))
+
+    return patches
+
+
 # ---------------------------------------------------------------------------
 # TinyUNet model -- only defined when torch is available
 # ---------------------------------------------------------------------------
@@ -350,6 +425,138 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
     return model
 
 
+def train_unet_regressor_on_patches(patches, params=None, progress_callback=None):
+    """Regression counterpart to train_unet_on_patches.
+
+    Same TinyUNet architecture, augmentation, and training loop -- only two
+    real differences: a single output channel (n_classes=1, no "+1 for
+    background") instead of one per class, and a masked-MSE loss instead of
+    CrossEntropyLoss(ignore_index=0) (MSE has no built-in ignore-index, and
+    target_patch's NaN-as-ignore convention -- see
+    extract_labelled_patches_regression -- needs its own masking regardless).
+
+    Args:
+        patches: List of (emb_patch, target_patch) tuples from
+            :func:`extract_labelled_patches_regression`. target_patch is
+            float32, NaN = ignore.
+        params: Optional dict, same keys as train_unet_on_patches (epochs,
+            lr, depth, base_filters, batch_size).
+        progress_callback: Optional function(epoch, epochs, loss) called
+            every 10 epochs.
+
+    Returns:
+        Trained TinyUNet model (on CPU), single output channel.
+    """
+    _require_torch()
+
+    if not patches:
+        raise ValueError("No patches to train on")
+
+    p = params or {}
+    epochs = int(p.get("epochs", 50))
+    lr = float(p.get("lr", 0.001))
+    depth = int(p.get("depth", 3))
+    base_filters = int(p.get("base_filters", 64))
+    batch_size = int(p.get("batch_size", 4))
+
+    shapes = [(p[0].shape, p[1].shape) for p in patches]
+    target_emb_shape = max(
+        set(s[0] for s in shapes), key=lambda s: sum(1 for x in shapes if x[0] == s)
+    )
+    target_lbl_shape = target_emb_shape[:2]
+    filtered = [
+        (e, tgt)
+        for e, tgt in patches
+        if e.shape == target_emb_shape and tgt.shape == target_lbl_shape
+    ]
+    if len(filtered) < len(patches):
+        logger.warning(
+            "Filtered %d/%d patches with inconsistent shapes (target %s)",
+            len(patches) - len(filtered),
+            len(patches),
+            target_emb_shape,
+        )
+    if not filtered:
+        raise ValueError("No patches with consistent shapes")
+
+    # Same augmentation as train_unet_on_patches -- rotation/flip preserve
+    # NaN positions correctly; Gaussian noise is only ever added to the
+    # embeddings, never the targets, so it can't turn a NaN into a number.
+    rng_aug = np.random.RandomState(42)
+    emb_list = []
+    tgt_list = []
+    for emb_patch, tgt_patch in filtered:
+        emb = emb_patch.transpose(2, 0, 1)
+        tgt = tgt_patch.astype(np.float32)
+        for k in range(4):
+            emb_r = np.rot90(emb, k, axes=(1, 2)).copy()
+            tgt_r = np.rot90(tgt, k, axes=(0, 1)).copy()
+            emb_list.append(emb_r)
+            tgt_list.append(tgt_r)
+            noise = rng_aug.normal(0, 0.02, emb_r.shape).astype(np.float32)
+            emb_list.append(emb_r + noise)
+            tgt_list.append(tgt_r)
+            emb_f = emb_r[:, :, ::-1].copy()
+            tgt_f = tgt_r[:, ::-1].copy()
+            emb_list.append(emb_f)
+            tgt_list.append(tgt_f)
+            noise = rng_aug.normal(0, 0.02, emb_f.shape).astype(np.float32)
+            emb_list.append(emb_f + noise)
+            tgt_list.append(tgt_f)
+
+    aug_factor = len(emb_list) // len(filtered) if filtered else 0
+    X = torch.from_numpy(np.stack(emb_list))
+    Y = torch.from_numpy(np.stack(tgt_list))
+    logger.info(
+        "U-Net regressor training: %d original patches (×%d augmentation = %d)",
+        len(filtered),
+        aug_factor,
+        len(emb_list),
+    )
+
+    dataset = TensorDataset(X, Y)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    in_channels = X.shape[1]
+    model = TinyUNet(in_channels=in_channels, n_classes=1, depth=depth, base_filters=base_filters)
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        n_seen = 0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb).squeeze(1)  # (B, H, W), single channel
+            mask = ~torch.isnan(yb)
+            yb_safe = torch.where(mask, yb, torch.zeros_like(yb))
+            sq_err = (out - yb_safe) ** 2 * mask.float()
+            n_valid = mask.float().sum().clamp(min=1)
+            loss = sq_err.sum() / n_valid
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * xb.size(0)
+            n_seen += xb.size(0)
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            avg = total_loss / max(n_seen, 1)
+            logger.info("Epoch %d/%d  loss=%.4f", epoch + 1, epochs, avg)
+            if progress_callback:
+                progress_callback(epoch + 1, epochs, avg)
+
+    model.cpu()
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Tile-level prediction
 # ---------------------------------------------------------------------------
@@ -429,3 +636,68 @@ def predict_unet_tile(model, tile_emb, patch_size=256, overlap=32):
     # Argmax across class dimension
     preds = avg_probs.argmax(axis=0).astype(np.int32)
     return preds
+
+
+def predict_unet_tile_regression(model, tile_emb, patch_size=256, overlap=32):
+    """Regression counterpart to predict_unet_tile.
+
+    Simpler than the classification version: a single output channel means
+    there's no probability simplex to average -- overlapping patches are
+    just linearly averaged directly.
+
+    Args:
+        model: Trained TinyUNet (on CPU; moved to device internally),
+            single output channel.
+        tile_emb: float32 array, shape (H, W, dim) -- tile embeddings.
+        patch_size: Patch side length in pixels (default 256).
+        overlap: Overlap between adjacent patches in pixels (default 32).
+
+    Returns:
+        float32 array, shape (H, W) -- predicted continuous values.
+    """
+    _require_torch()
+
+    H, W, dim = tile_emb.shape
+    stride = patch_size - overlap
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    model.to(device).eval()
+
+    sum_vals = np.zeros((H, W), dtype=np.float32)
+    counts = np.zeros((H, W), dtype=np.float32)
+
+    row_starts = list(range(0, H, stride))
+    col_starts = list(range(0, W, stride))
+
+    with torch.no_grad():
+        for r0 in row_starts:
+            for c0 in col_starts:
+                r1 = min(r0 + patch_size, H)
+                c1 = min(c0 + patch_size, W)
+
+                patch = tile_emb[r0:r1, c0:c1]
+                ph, pw = patch.shape[:2]
+
+                if ph < patch_size or pw < patch_size:
+                    padded = np.zeros((patch_size, patch_size, dim), dtype=np.float32)
+                    padded[:ph, :pw] = patch
+                    patch = padded
+
+                x = torch.from_numpy(patch.transpose(2, 0, 1)[np.newaxis]).to(device)
+
+                out = model(x)  # (1, 1, ps, ps)
+                vals = out.squeeze(0).squeeze(0).cpu().numpy()
+
+                sum_vals[r0:r1, c0:c1] += vals[:ph, :pw]
+                counts[r0:r1, c0:c1] += 1.0
+
+    model.cpu()
+
+    counts[counts == 0] = 1.0
+    return (sum_vals / counts).astype(np.float32)
