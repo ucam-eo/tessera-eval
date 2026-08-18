@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.2]
+
+### Fixed
+- `run_large_area`'s regression targets were `LabelEncoder` rank integers
+  (0, 1, 2, ...), not the real field values — a continuous field like tree
+  height got silently discretized before v1.3.1's regressor fix ever saw
+  it, so regressors were fitting against meaningless ranks the whole time
+  despite producing plausible-looking R²/RMSE/MAE. Also the real mechanism
+  behind the reported "25x too many sample points" — the per-class
+  sampling floor that caused it only existed because regression was being
+  treated as N-way classification. Regression now samples against a single
+  combined point budget (no per-class weighting) and recovers each point's
+  real field value directly.
+
 ## [1.3.1]
 
 ### Fixed
