@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.1]
+
+### Fixed
+- `run_large_area`'s sample-point generation now actually respects
+  `max_training_samples` when a shapefile has more rows than the budget —
+  `sample_points(size=N)` generates N points *per row*, and the "every row
+  gets at least one point" floor had no corresponding cap, so a
+  420,000-row shapefile against a 200,000-point budget generated ~420,000
+  points regardless. Affects both classification and regression.
+
 ## [1.4.0]
 
 ### Added
