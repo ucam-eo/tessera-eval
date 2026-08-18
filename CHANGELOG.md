@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0]
+
+### Added
+- `create_map` accepts an optional `map_year`, independent of the model's
+  training year — trains as normal on one year, then runs that
+  already-trained model as pure inference against a *different* year's
+  embeddings across the map area (e.g. train on 2025, map 2018, to look
+  for change over time). No ground truth needed for `map_year`; nothing
+  gets scored. Distinct from the train/test-year Validation feature, which
+  evaluates against held-out ground truth at the same points rather than
+  generating a map.
+
 ## [1.4.1]
 
 ### Fixed
