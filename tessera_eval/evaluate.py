@@ -26,6 +26,28 @@ from tessera_eval.classify import (
 
 _HEARTBEAT_INTERVAL_S = 5  # matches server.py's tile-fetch heartbeat cadence
 
+# Cap on predicted-vs-actual points kept for the regression scatter plot --
+# a 100K+ pixel evaluation shouldn't turn into a 100K-point SSE payload just
+# because the user wants to eyeball fit quality.
+_MAX_SCATTER_POINTS = 1000
+
+
+def _subsample_for_scatter(y_true, y_pred, rng, max_points=None):
+    """Return (y_true, y_pred) trimmed to at most max_points, randomly
+    subsampled -- not just the first N, which could bias toward whatever
+    happened to be sampled/ordered first.
+
+    max_points defaults to the module-level _MAX_SCATTER_POINTS, looked up
+    at call time (not as a def-time default) so tests can monkeypatch it.
+    """
+    if max_points is None:
+        max_points = _MAX_SCATTER_POINTS
+    n = len(y_true)
+    if n <= max_points:
+        return y_true, y_pred
+    idx = rng.choice(n, size=max_points, replace=False)
+    return y_true[idx], y_pred[idx]
+
 
 def _fit_with_heartbeat(fit_fn, *, interval=_HEARTBEAT_INTERVAL_S):
     """Run a blocking ``fit_fn()`` (e.g. ``lambda: clf.fit(X, y)``) in a
@@ -168,7 +190,11 @@ def run_learning_curve(
         - {"type": "aggregate", "models": {name: metrics_dict}} (regression
           only -- the largest percentage's metrics, mirroring run_kfold_cv's
           event shape so the frontend's existing regression display, built
-          against that shape, works here too)
+          against that shape, works here too). metrics_dict additionally
+          carries "scatter": {"y_true": [...], "y_pred": [...]} when that
+          model had at least one successful fit at the largest percentage --
+          up to _MAX_SCATTER_POINTS actual-vs-predicted pairs, randomly
+          subsampled, for a predicted-vs-actual plot.
     """
     is_classification = task == "classification"
     warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -201,6 +227,12 @@ def run_learning_curve(
         n_classes = None
         cm_accum = {}
         precomputed_cls_indices = None
+        # Predicted-vs-actual points for a scatter plot, captured only at
+        # the largest training percentage (the "final" result, same as
+        # cm_accum for classification). Subsampled at capture time (see
+        # _MAX_SCATTER_POINTS below) so a 100K+ pixel evaluation doesn't
+        # blow up the SSE payload.
+        scatter_accum = {name: {"y_true": [], "y_pred": []} for name in classifier_names}
 
     # Detect U-Net classifiers (use base name for type checks)
     has_unet = (
@@ -428,6 +460,12 @@ def run_learning_curve(
                         reg_scores[name]["r2"].append(m["r2"])
                         reg_scores[name]["rmse"].append(m["rmse"])
                         reg_scores[name]["mae"].append(m["mae"])
+                        if is_largest:
+                            sc_true, sc_pred = _subsample_for_scatter(
+                                np.asarray(y_test), np.asarray(y_pred), rng
+                            )
+                            scatter_accum[name]["y_true"] = sc_true.tolist()
+                            scatter_accum[name]["y_pred"] = sc_pred.tolist()
                     except Exception as exc:
                         logger.warning(
                             "Regressor %s failed at pct %.1f seed %d: %s", name, pct, seed, exc
@@ -532,6 +570,12 @@ def run_learning_curve(
                                         reg_scores[unet_name]["r2"].append(m["r2"])
                                         reg_scores[unet_name]["rmse"].append(m["rmse"])
                                         reg_scores[unet_name]["mae"].append(m["mae"])
+                                        if is_largest:
+                                            sc_true, sc_pred = _subsample_for_scatter(
+                                                y_true, y_pred, rng
+                                            )
+                                            scatter_accum[unet_name]["y_true"] = sc_true.tolist()
+                                            scatter_accum[unet_name]["y_pred"] = sc_pred.tolist()
                                 elif is_classification:
                                     f1_scores[unet_name].append(0.0)
                                     f1w_scores[unet_name].append(0.0)
@@ -583,6 +627,8 @@ def run_learning_curve(
                     "mean_mae": round(float(np.mean(maes)), 4) if maes else 0.0,
                     "std_mae": round(float(np.std(maes)), 4) if maes else 0.0,
                 }
+                if is_largest and scatter_accum.get(name, {}).get("y_true"):
+                    pct_results[name]["scatter"] = scatter_accum[name]
             if is_largest:
                 largest_pct_results = pct_results
 

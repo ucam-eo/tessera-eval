@@ -109,7 +109,10 @@ def test_pixel_regressors_run_without_the_unknown_classifier_crash(client):
     for e in progress:
         for name in ("nn_reg", "rf_reg"):
             m = e["classifiers"][name]
-            assert set(m) == {"mean_r2", "std_r2", "mean_rmse", "std_rmse", "mean_mae", "std_mae"}
+            # "scatter" (predicted-vs-actual points) is present at the
+            # largest percentage too -- not asserted here, see
+            # test_run_learning_curve_regression.py's dedicated tests.
+            assert {"mean_r2", "std_r2", "mean_rmse", "std_rmse", "mean_mae", "std_mae"} <= set(m)
 
 
 def test_aggregate_event_reaches_the_client(client):

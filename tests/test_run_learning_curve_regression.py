@@ -14,6 +14,8 @@ already-built frontend path actually gets data.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 
 from tessera_eval.evaluate import run_learning_curve
@@ -62,7 +64,7 @@ def test_regression_does_not_crash_and_produces_r2_rmse_mae():
     for e in progress:
         for name in ("nn_reg", "rf_reg"):
             m = e["classifiers"][name]
-            assert set(m) == {"mean_r2", "std_r2", "mean_rmse", "std_rmse", "mean_mae", "std_mae"}
+            assert {"mean_r2", "std_r2", "mean_rmse", "std_rmse", "mean_mae", "std_mae"} <= set(m)
             # Learnable synthetic data -- a real regressor should do better than "no skill".
             assert m["mean_r2"] > 0.3
 
@@ -75,14 +77,16 @@ def test_regression_yields_aggregate_not_confusion_matrices():
     aggregates = [e for e in events if e["type"] == "aggregate"]
     assert len(aggregates) == 1
     assert set(aggregates[0]["models"]) == {"nn_reg"}
-    assert set(aggregates[0]["models"]["nn_reg"]) == {
+    # "scatter" (predicted-vs-actual points) is present too -- see the
+    # dedicated scatter tests below for its shape/content.
+    assert {
         "mean_r2",
         "std_r2",
         "mean_rmse",
         "std_rmse",
         "mean_mae",
         "std_mae",
-    }
+    } <= set(aggregates[0]["models"]["nn_reg"])
 
 
 def test_regression_aggregate_matches_largest_pct_progress_event():
@@ -138,3 +142,61 @@ def test_a_fit_time_failure_degrades_to_zero_not_crashing_the_stream(monkeypatch
     assert len(progress) == 2
     for e in progress:
         assert e["classifiers"]["nn_reg"]["mean_r2"] == 0.0
+    # A regressor that never successfully fit has nothing to scatter --
+    # confirm the key is just absent, not present-but-empty.
+    aggregate = next(e for e in events if e["type"] == "aggregate")
+    assert "scatter" not in aggregate["models"]["nn_reg"]
+
+
+def test_aggregate_includes_scatter_points_matching_the_test_set():
+    """The core feature: predicted-vs-actual points for a scatter plot,
+    carried on the largest percentage's aggregate event."""
+    vectors, labels = _regression_data()
+    events = _run(vectors, labels, ["rf_reg"], task="regression", training_pcts=(50, 80))
+
+    aggregate = next(e for e in events if e["type"] == "aggregate")
+    scatter = aggregate["models"]["rf_reg"]["scatter"]
+    assert set(scatter) == {"y_true", "y_pred"}
+    assert len(scatter["y_true"]) == len(scatter["y_pred"])
+    assert len(scatter["y_true"]) > 0
+    # Real regression targets/predictions, not something degenerate.
+    assert len(set(scatter["y_true"])) > 1
+    # And a real fit -- predictions should correlate with actuals on this
+    # learnable synthetic data, not just be noise.
+    corr = np.corrcoef(scatter["y_true"], scatter["y_pred"])[0, 1]
+    assert corr > 0.5
+
+
+def test_scatter_is_only_on_the_largest_percentage_not_every_progress_event():
+    vectors, labels = _regression_data()
+    events = _run(vectors, labels, ["rf_reg"], task="regression", training_pcts=(30, 50, 80))
+
+    progress = [e for e in events if e["type"] == "progress"]
+    non_largest = [e for e in progress if e["pct"] != max(e["pct"] for e in progress)]
+    for e in non_largest:
+        assert "scatter" not in e["classifiers"]["rf_reg"]
+
+
+def test_scatter_points_are_capped_for_a_large_test_set(monkeypatch):
+    """A big evaluation shouldn't turn into an unbounded SSE payload just
+    because someone wants to eyeball fit quality."""
+    # `import tessera_eval.evaluate as ev` is *also* an attribute lookup on
+    # the `tessera_eval` package under the hood (import a.b as c ==
+    # import a.b; c = a.b), and tessera_eval/__init__.py re-exports a
+    # function named `evaluate` that shadows the submodule on that
+    # attribute -- sys.modules is the only reliable way to get the real
+    # submodule to patch.
+    ev = sys.modules["tessera_eval.evaluate"]
+
+    monkeypatch.setattr(ev, "_MAX_SCATTER_POINTS", 10)
+
+    rng = np.random.RandomState(1)
+    n = 500
+    vectors = rng.rand(n, DIM).astype(np.float32)
+    weights = rng.rand(DIM)
+    labels = (vectors @ weights).astype(np.float32)
+
+    events = _run(vectors, labels, ["rf_reg"], task="regression", training_pcts=(80,))
+    aggregate = next(e for e in events if e["type"] == "aggregate")
+    scatter = aggregate["models"]["rf_reg"]["scatter"]
+    assert len(scatter["y_true"]) == 10

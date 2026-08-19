@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0]
+
+### Added
+- Predicted-vs-actual scatter points for regression evaluations, requested
+  by Louis Driver ("a scatterplot/heatmap of the prediction vs actual data
+  along with the model results"). `run_learning_curve`'s `"aggregate"`
+  event now carries `"scatter": {"y_true": [...], "y_pred": [...]}` on
+  each model that had at least one successful fit at the largest training
+  percentage -- up to 1000 actual-vs-predicted pairs (`_MAX_SCATTER_POINTS`),
+  randomly subsampled so a large evaluation doesn't turn into an unbounded
+  SSE payload. Works for both plain pixel regressors and U-Net regression.
+  server.py already forwards the `"aggregate"` event's `"models"` dict
+  verbatim, so no server.py change was needed.
+
 ## [1.5.5]
 
 ### Fixed
