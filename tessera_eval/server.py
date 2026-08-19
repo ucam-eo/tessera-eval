@@ -510,10 +510,12 @@ def _save_cached_result(field, year, gdf, vectors, labels, class_names, stats, s
 def _cached_tiles_need_reload(
     cached_spatial_3x3,
     cached_spatial_5x5,
+    cached_unet_patches,
     cached_sample_points,
     *,
     needs_spatial_3x3,
     needs_spatial_5x5,
+    needs_unet,
     has_spatial_bboxes,
 ):
     """Does an in-memory _tile_cache hit (same key, vectors present) still
@@ -521,22 +523,34 @@ def _cached_tiles_need_reload(
     entry doesn't have?
 
     True when the cache was populated by an earlier request that didn't need
-    spatial_mlp/spatial_mlp_5x5 features, or didn't need a spatial train/test
-    split (so never cached sample-point coordinates), and *this* request
-    does. Whoever calls this with True must also invalidate the cache's own
-    key (not just its own local `vectors` variable) -- confirmed live as a
-    real bug otherwise: run_large_area's cache-hit branch used to set
-    `vectors = None` here without touching `_tile_cache["key"]`, so the
-    later "reload from GeoTessera" block (guarded by
-    `_tile_cache["key"] != cache_key`) never triggered either, since the key
-    still matched. vectors stayed None all the way through and crashed
-    downstream at `len(vectors)` (TypeError: object of type 'NoneType' has
-    no len()) on a spatial_mlp request that hit a cache entry from a prior
-    non-spatial run.
+    spatial_mlp/spatial_mlp_5x5 features, didn't need U-Net patches, or
+    didn't need a spatial train/test split (so never cached sample-point
+    coordinates), and *this* request does. Whoever calls this with True must
+    also invalidate the cache's own key (not just its own local `vectors`
+    variable) -- confirmed live as a real bug otherwise: run_large_area's
+    cache-hit branch used to set `vectors = None` here without touching
+    `_tile_cache["key"]`, so the later "reload from GeoTessera" block
+    (guarded by `_tile_cache["key"] != cache_key`) never triggered either,
+    since the key still matched. vectors stayed None all the way through and
+    crashed downstream at `len(vectors)` (TypeError: object of type
+    'NoneType' has no len()) on a spatial_mlp request that hit a cache entry
+    from a prior non-spatial run.
+
+    The needs_unet check below is the same bug for U-Net, confirmed live
+    (Louis Driver): running any plain pixel regressor first (field/year/
+    sampling unchanged, no U-Net needed) cached unet_patches=[]. Checking
+    U-Net next, with the same field/year/sampling, hit this in-memory cache
+    -- and since this function didn't know about needs_unet, it reported
+    "no reload needed", silently reusing the empty patch list. U-Net then
+    got filtered out of active_models entirely (server.py's "no labelled
+    patches found" skip), producing a 0-classifier run that finished
+    suspiciously fast with no error at all.
     """
     if (needs_spatial_3x3 and cached_spatial_3x3 is None) or (
         needs_spatial_5x5 and cached_spatial_5x5 is None
     ):
+        return True
+    if needs_unet and not cached_unet_patches:
         return True
     return bool(has_spatial_bboxes and cached_sample_points is None)
 
@@ -861,15 +875,19 @@ def run_large_area():
             if _cached_tiles_need_reload(
                 spatial_3x3,
                 spatial_5x5,
+                unet_patches,
                 all_sample_points,
                 needs_spatial_3x3=needs_spatial_3x3,
                 needs_spatial_5x5=needs_spatial_5x5,
+                needs_unet=needs_unet,
                 has_spatial_bboxes=has_spatial_bboxes,
             ):
                 if (needs_spatial_3x3 and spatial_3x3 is None) or (
                     needs_spatial_5x5 and spatial_5x5 is None
                 ):
                     logger.info("Spatial features needed but not cached — reloading tiles")
+                elif needs_unet and not unet_patches:
+                    logger.info("U-Net needed but no patches cached — reloading tiles")
                 else:
                     logger.info("Spatial split needs point coordinates — reloading tiles")
                 vectors = None  # force reload

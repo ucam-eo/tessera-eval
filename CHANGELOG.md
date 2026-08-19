@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.3]
+
+### Fixed
+- U-Net regression could silently run with 0 classifiers and finish
+  suspiciously fast, with no error: `_cached_tiles_need_reload` (the
+  in-memory tile-cache staleness check) knew about `spatial_mlp`/
+  `spatial_mlp_5x5` needing a reload when their features weren't cached,
+  but never checked U-Net. Running any plain pixel regressor first (same
+  field/year/sampling) cached `unet_patches=[]`; selecting U-Net next, with
+  the same cache key, silently reused that empty patch list instead of
+  reloading tiles — U-Net then got filtered out of `active_models`
+  entirely. Root-caused against a real shapefile (205k polygons, Louis
+  Driver) after confirming the tile-fetch and patch-extraction logic
+  itself was correct in isolation.
+
 ## [1.5.2]
 
 ### Fixed
