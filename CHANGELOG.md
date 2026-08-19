@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.4]
+
+### Fixed
+- Bumped `tessera-zarr-utils` pin to v0.3.1, which restricts
+  `probe_zarr_coverage` to years actually known reliable (currently just
+  2024). The zarr store's own metadata advertises 2017-2025 as populated,
+  but only 2024 is genuinely trustworthy right now; other years returned
+  real-looking, non-NaN, but incorrect data, which caused `create_map`'s
+  `map_year` (added in 1.5.0) to silently use zarr for e.g. `map_year=2018`
+  and produce a map identical to the training year's, instead of falling
+  back to the NPY path (which does fetch correct, year-varying
+  embeddings). No code change needed here -- tessera-eval already falls
+  back to NPY whenever `probe_zarr_coverage` returns `False`.
+
 ## [1.5.3]
 
 ### Fixed
