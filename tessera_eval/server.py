@@ -14,6 +14,7 @@ import json
 import logging
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -2240,6 +2241,18 @@ def create_map():
                 pass
         _generated_maps.clear()
 
+        # map_name (below) used to be "map_{bbox_idx+1}" alone -- identical
+        # across every create_map() call for the same bbox slot, so
+        # /api/evaluation/download-map/map_1's URL never changed between
+        # generations. Confirmed harmless for the normal flow (the frontend
+        # downloads immediately after each run's own "done" event, before
+        # any later run's cleanup), but a real risk regardless: an
+        # intermediate cache (browser, proxy) keying purely on URL has no
+        # reason to know a *different* file now lives behind it, and could
+        # serve a stale map. A short random suffix, unique per create_map()
+        # call, means two generations never share a URL.
+        run_id = uuid.uuid4().hex[:8]
+
         for bbox_idx, bbox in enumerate(map_bboxes):
             if _cancelled():
                 yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
@@ -2449,8 +2462,9 @@ def create_map():
                     for ds in datasets:
                         ds.close()
 
-                # Write final GeoTIFF
-                map_name = f"map_{bbox_idx + 1}"
+                # Write final GeoTIFF. run_id makes this URL unique per
+                # create_map() call -- see the comment where it's generated.
+                map_name = f"map_{bbox_idx + 1}_{run_id}"
                 tmp = tempfile.NamedTemporaryFile(
                     suffix=".tif",
                     prefix=f"tee_map_{bbox_idx + 1}_",
@@ -2542,7 +2556,13 @@ def download_map(name):
     path = _generated_maps.get(name)
     if not path or not Path(path).exists():
         return jsonify({"error": f"No generated map '{name}'"}), 404
-    return send_file(path, as_attachment=True, download_name=f"{name}.tif", mimetype="image/tiff")
+    resp = send_file(path, as_attachment=True, download_name=f"{name}.tif", mimetype="image/tiff")
+    # map_name is now unique per create_map() call (see run_id in create_map),
+    # so this specific URL will never point at a different file in practice --
+    # but explicit no-store is cheap insurance against any browser/proxy that
+    # might otherwise cache a GET response by URL alone.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/health", methods=["GET"])

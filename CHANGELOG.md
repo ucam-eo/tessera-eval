@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.5]
+
+### Fixed
+- `create_map`'s download URL (`map_name`) was identical across every call
+  for the same bbox slot (`map_1`, `map_2`, ...), regardless of when or
+  what was generated. Harmless for the normal frontend flow (it downloads
+  immediately after each run's own `done` event, before any later run's
+  cleanup), but a real risk regardless: any cache keying on URL alone
+  (browser, proxy) has no way to know a *different* file now lives behind
+  it, and could serve a stale map. `map_name` now includes a short random
+  suffix unique per `create_map()` call, and `download-map` responses now
+  send `Cache-Control: no-store` as well.
+
 ## [1.5.4]
 
 ### Fixed
