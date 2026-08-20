@@ -1736,6 +1736,22 @@ def run_large_area():
 
         start_event = {
             "event": "start",
+            # "field_start" also carries the task, but it's only emitted on
+            # a cache miss (gated by `_tile_cache["key"] != cache_key`,
+            # further up) -- any run that hits the in-memory or disk cache
+            # (e.g. re-running with different classifiers but the same
+            # field/year/sampling, or after a prior identical run in the
+            # same session) never sees it. The frontend used to rely on
+            # field_start alone to set its task-tracking state, so a
+            # cache-hit run silently kept whatever task the *previous* run
+            # left it at (or null on the session's first run if something
+            # upstream ever skipped field_start) -- confirmed live (Louis
+            # Driver): R² stopped showing in the GUI (despite being logged
+            # server-side/CLI) for every evaluation after the first one in
+            # a session. "start" is unconditional regardless of cache
+            # state, so carrying task here directly removes that ordering
+            # dependency instead of just papering over one occurrence of it.
+            "task": task,
             "classifiers": active_models,
             "classes": class_info if is_classification else [],
             "total_labelled_pixels": total_labelled,

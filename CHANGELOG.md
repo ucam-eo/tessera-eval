@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.2]
+
+### Fixed
+- The `"start"` event now carries `"task"` directly. Previously the
+  frontend's only source for "is this run classification or regression"
+  was the `"field_start"` event — but that's gated by the tile cache key
+  changing, so it's only emitted on a cache miss. Re-running with the same
+  field/year/sampling (e.g. just changing which classifiers are checked)
+  hits the in-memory cache and skips `field_start` entirely, leaving the
+  frontend's task-tracking state stuck at whatever the *previous* run left
+  it at. Confirmed live, Louis Driver: R² stopped showing in the GUI
+  (despite being logged server-side/in the CLI) for every evaluation after
+  the first one in a session, and the learning curve failed to build.
+  `"start"` is unconditional regardless of cache state, so carrying task
+  there removes the ordering dependency instead of relying on
+  `field_start` having fired first.
+
 ## [1.7.1]
 
 ### Fixed
