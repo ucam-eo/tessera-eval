@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.3]
+
+### Changed
+- `kfold`'s per-class recall/confusion summary (classification only) is now
+  always printed; the `--confusion`/`--no-confusion` flag that used to
+  toggle it is removed.
+- Added `--confusion-matrix`, which additionally prints the full raw-count
+  confusion matrix (rows=true, cols=predicted) alongside the summary.
+  (sasormunen, #3)
+
 ## [1.7.2]
 
 ### Fixed
