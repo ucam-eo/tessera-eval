@@ -301,13 +301,21 @@ def kfold(
     ),
     seed: int = typer.Option(42, help="Random seed for reproducible fold splits"),
     max_samples: int = typer.Option(
-        None, help="Cap the training set size per fold (random, not stratified by class)"
+        None,
+        help="Cap the training set size per fold (random, not stratified by class) — "
+        "usually needed for raster-derived data, which labels every pixel, not a hand-picked subset",
     ),
-    confusion: bool = typer.Option(
-        True, help="Print per-class recall / confusion summary (classification only)"
+    confusion_matrix: bool = typer.Option(
+        False,
+        "--confusion-matrix",
+        help="Also print the full confusion matrix (raw counts), on top of the summary "
+        "(classification only)",
     ),
 ):
     """Cross-validate classifiers/regressors on labelled data and print results.
+
+    For classification, a per-class recall summary is always printed;
+    pass --confusion-matrix for the full raw-count matrix as well.
 
     Args:
         data: path to a shapefile/GeoJSON or GeoTIFF (skip if using vectors_path)
@@ -322,7 +330,7 @@ def kfold(
         task: "classification" or "regression"; auto-detected if not given
         seed: random seed for reproducible fold splits
         max_samples: optional cap on training set size per fold
-        confusion: whether to print a per-class recall summary (classification only)
+        confusion_matrix: whether to also print the full confusion matrix (classification only)
     """
     model_list = models.split(",")
     vectors, labels, class_names, detected_task = _get_vectors_and_labels(
@@ -358,7 +366,7 @@ def kfold(
         elif event["type"] == "confusion_matrices":
             confusion_matrices = event["confusion_matrices"]
 
-    if confusion and task == "classification":
+    if task == "classification":
         for name, cm_raw in confusion_matrices.items():
             cm = np.array(cm_raw)
             recall = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
@@ -370,6 +378,14 @@ def kfold(
                     f"  {cname:>20}: recall {recall[i, i]:.2f} "
                     f"(most confused with {class_names[most_confused_idx]})"
                 )
+
+            if confusion_matrix:
+                print(f"\nConfusion matrix [{name}] (rows=true, cols=predicted):")
+                header = "".join(f"{cn[:10]:>12}" for cn in class_names)
+                print(f"{'':>20}{header}")
+                for i, cname in enumerate(class_names):
+                    row = "".join(f"{cm[i, j]:>12,}" for j in range(len(class_names)))
+                    print(f"{cname:>20}{row}")
 
 
 @app.command()

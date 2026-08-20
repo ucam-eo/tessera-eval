@@ -124,11 +124,11 @@ Optional arguments:
 ```bash
 # --k: number of cross-validation folds (default: 5)
 # --seed: random seed for reproducible fold splits (default: 42)
-# --confusion / --no-confusion: show or hide the confusion summary (for classification only)
+# --confusion-matrix: also print the full confusion matrix (raw counts), on top of the summary shown by default (for classification only)
 # --vectors: path to a different cached .npz (default: vectors.npz from `load`)
 # --max-samples: cap the training set size per fold (random, not stratified by class) -
 #   usually needed for raster-derived data, which labels every pixel, not a hand-picked subset
-tessera-eval kfold --models rf --k 10 --seed 1 --no-confusion --max-samples 50000
+tessera-eval kfold --models rf --k 10 --seed 1 --confusion-matrix --max-samples 50000
 ```
 
 Investigate how accuracy changes using different fractions of training labels (currently only for classification task).
