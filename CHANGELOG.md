@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.1]
+
+### Fixed
+- Bumped `tessera-zarr-utils` pin to v0.4.0, which disables zarr entirely
+  (`get_zarr()` now returns `None` unconditionally) until a UTM-zone-
+  boundary bug still open upstream is actually fixed -- it's geographic,
+  not year-specific, so 1.5.4's `RELIABLE_ZARR_YEARS` restriction (2024
+  only) wasn't broad enough. No tessera-eval code change needed -- it
+  already falls back to NPY whenever `get_zarr()` returns `None`.
+
 ## [1.6.0]
 
 ### Added

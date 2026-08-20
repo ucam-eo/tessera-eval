@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tessera-eval"
-version = "1.6.0"
+version = "1.6.1"
 description = "Evaluate habitat classifiers on Tessera satellite embeddings"
 readme = "README.md"
 license = {text = "MIT"}
@@ -32,7 +32,7 @@ server = [
     "requests>=2.28",
     "geotessera>=0.9.0",
     # zarr fast path (server.py get_zarr/probe) now lives in its own package.
-    "tessera-zarr-utils[geotessera] @ git+https://github.com/ucam-eo/tessera-zarr-utils.git@v0.3.1",
+    "tessera-zarr-utils[geotessera] @ git+https://github.com/ucam-eo/tessera-zarr-utils.git@v0.4.0",
 ]
 dev = ["pytest>=7.0", "ruff>=0.16,<0.17", "mypy>=1.8"]
 all = ["geotessera>=0.9.0", "xgboost>=1.7", "matplotlib>=3.5"]
