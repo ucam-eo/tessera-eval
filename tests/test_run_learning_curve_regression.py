@@ -42,6 +42,21 @@ def _regression_data():
     return vectors, labels
 
 
+def _spatial_regression_data(window, n=300):
+    """Synthetic (spatial_vectors, spatial_labels) pair shaped like real
+    neighbourhood-augmented features: (n, window*window*dim), target
+    derived from the *centre* cell (a real spatial_mlp input would predict
+    from the whole neighbourhood, but a centre-derived target is enough to
+    confirm a real fit is happening, not a degenerate/constant one)."""
+    dim = DIM
+    vectors = RNG.rand(n, window * window * dim).astype(np.float32)
+    weights = RNG.rand(dim)
+    center = (window * window // 2) * dim
+    center_features = vectors[:, center : center + dim]
+    labels = (center_features @ weights + RNG.normal(scale=0.05, size=n)).astype(np.float32)
+    return vectors, labels
+
+
 def _run(vectors, labels, names, task, training_pcts=(50, 80)):
     return list(
         run_learning_curve(
@@ -146,6 +161,64 @@ def test_a_fit_time_failure_degrades_to_zero_not_crashing_the_stream(monkeypatch
     # confirm the key is just absent, not present-but-empty.
     aggregate = next(e for e in events if e["type"] == "aggregate")
     assert "scatter" not in aggregate["models"]["nn_reg"]
+
+
+def test_spatial_mlp_regression_trains_and_produces_a_real_r2():
+    """spatial_mlp/spatial_mlp_5x5 now support regression: make_regressor
+    recognizes both names directly (no "_reg" suffix -- see its docstring),
+    and _extract_tile_patches's spatial-label shift is now conditional on
+    is_classification. Previously this crashed the whole evaluation stream
+    outright (ValueError: Unknown regressor: spatial_mlp) -- confirmed live,
+    Louis Driver."""
+    vectors, labels = _regression_data()
+    sp_vectors, sp_labels = _spatial_regression_data(window=3)
+
+    events = list(
+        run_learning_curve(
+            vectors,
+            labels,
+            ["spatial_mlp"],
+            [50, 80],
+            repeats=2,
+            spatial_vectors=sp_vectors,
+            spatial_labels=sp_labels,
+            task="regression",
+        )
+    )
+
+    progress = [e for e in events if e["type"] == "progress"]
+    assert len(progress) == 2
+    for e in progress:
+        m = e["classifiers"]["spatial_mlp"]
+        assert {"mean_r2", "std_r2", "mean_rmse", "std_rmse", "mean_mae", "std_mae"} <= set(m)
+        # Learnable synthetic data -- a real fit should beat "no skill".
+        assert m["mean_r2"] > 0.3
+
+    aggregate = next(e for e in events if e["type"] == "aggregate")
+    assert set(aggregate["models"]) == {"spatial_mlp"}
+
+
+def test_spatial_mlp_5x5_regression_trains_and_produces_a_real_r2():
+    vectors, labels = _regression_data()
+    sp_vectors, sp_labels = _spatial_regression_data(window=5)
+
+    events = list(
+        run_learning_curve(
+            vectors,
+            labels,
+            ["spatial_mlp_5x5"],
+            [50, 80],
+            repeats=2,
+            spatial_vectors_5x5=sp_vectors,
+            spatial_labels=sp_labels,
+            task="regression",
+        )
+    )
+
+    progress = [e for e in events if e["type"] == "progress"]
+    assert len(progress) == 2
+    for e in progress:
+        assert e["classifiers"]["spatial_mlp_5x5"]["mean_r2"] > 0.3
 
 
 def test_aggregate_includes_scatter_points_matching_the_test_set():

@@ -426,10 +426,12 @@ def run_learning_curve(
                     else:
                         y_test = labels[test_idx]
 
-                # spatial_mlp/spatial_mlp_5x5 above are classification-only for
-                # now (no regressor variant exists yet -- make_regressor has
-                # no spatial_mlp_reg) -- this plain branch is the only one
-                # that actually dispatches on task.
+                # This one dispatch covers every pixel-based classifier
+                # name, spatial or not -- the branches above only decide
+                # *which* data (spatial_vectors vs plain vectors) X_tr/X_te
+                # come from; make_classifier/make_regressor both recognize
+                # spatial_mlp/spatial_mlp_5x5 directly (see make_regressor's
+                # docstring for why that name has no "_reg" suffix).
                 if is_classification:
                     clf = make_classifier(name, (classifier_params or {}).get(name, {}))
                     try:

@@ -94,15 +94,12 @@ def test_regression_patches_carry_real_values_not_label_encoder_ranks(fake_tile)
 
 def test_regression_patches_do_not_crash_with_spatial_features_requested(fake_tile):
     """The le=None safety fix (v1.3.3) -- confirms the whole call succeeds
-    even when spatial_mlp features are (nominally) requested alongside
-    regression, rather than just checking `le` is defined in isolation."""
+    when spatial_mlp features are requested alongside regression (now a
+    genuinely supported combination, not just a "shouldn't crash" case)."""
     tile_emb, transform = fake_tile
     gt = _FakeGeoTessera(tile_emb, transform)
     gdf = _make_gdf()
 
-    # Should not raise (NameError or otherwise), even though spatial_mlp
-    # regression isn't really supported -- this combination just shouldn't
-    # crash the whole extraction.
     result = srv._extract_tile_patches(
         gt,
         gdf,
@@ -116,3 +113,40 @@ def test_regression_patches_do_not_crash_with_spatial_features_requested(fake_ti
         is_classification=False,
     )
     assert result is not None
+
+
+def test_regression_spatial_labels_are_not_shifted_by_one(fake_tile):
+    """The actual bug in the spatial-mlp-regression data pipeline (not just
+    the ValueError crash it led to elsewhere): the 1-based-to-0-based '-1'
+    shift applied to spatial labels is meaningful for classification (class
+    IDs) but corrupts real continuous regression values -- every height (or
+    whatever field) would silently come out 1.0 too low. _make_gdf's single
+    polygon has height=3.7 everywhere it covers, so any shift is directly
+    visible."""
+    tile_emb, transform = fake_tile
+    gt = _FakeGeoTessera(tile_emb, transform)
+    gdf = _make_gdf()
+
+    _unet_patches, spatial_3x3, spatial_5x5, _pv, spatial_labels_3x3, spatial_labels_5x5 = (
+        srv._extract_tile_patches(
+            gt,
+            gdf,
+            "height",
+            2024,
+            le=None,
+            n_classes=0,
+            patch_size=32,
+            max_patches=5,
+            needs_spatial_3x3=True,
+            needs_spatial_5x5=True,
+            is_classification=False,
+        )
+    )
+
+    assert spatial_3x3 is not None and len(spatial_labels_3x3) > 0
+    assert np.allclose(spatial_labels_3x3, 3.7), (
+        f"expected the real field value 3.7, got {np.unique(spatial_labels_3x3)} "
+        "-- looks shifted by the classification-only '-1'"
+    )
+    assert spatial_5x5 is not None and len(spatial_labels_5x5) > 0
+    assert np.allclose(spatial_labels_5x5, 3.7)

@@ -204,7 +204,9 @@ def augment_spatial(X, y, window, dim):
 
 def available_regressors():
     """Return list of available regressor names."""
-    names = ["nn_reg", "rf_reg", "mlp_reg"]
+    # spatial_mlp/spatial_mlp_5x5 keep their unsuffixed names here too --
+    # see make_regressor's comment on why they don't get "_reg".
+    names = ["nn_reg", "rf_reg", "mlp_reg", "spatial_mlp", "spatial_mlp_5x5"]
     try:
         import xgboost  # noqa: F401
 
@@ -268,6 +270,28 @@ def make_regressor(name, params=None):
         return MLPRegressor(
             hidden_layer_sizes=hidden,
             max_iter=int(p.get("max_iter", 200)),
+            random_state=42,
+        )
+    elif base_name in ("spatial_mlp", "spatial_mlp_5x5"):
+        # Deliberately no "_reg" suffix, unlike every other regressor here --
+        # "spatial" describes which precomputed feature array (3x3 or 5x5
+        # neighbourhood-augmented embeddings) this trains on, which is
+        # entirely a server.py/evaluate.py data-selection concern keyed on
+        # this exact literal name (needs_spatial_3x3, the base_clf_name
+        # branch in run_learning_curve, etc.) -- renaming it per task would
+        # mean updating every one of those call sites too, for no benefit
+        # (the caller already knows whether to build a classifier or
+        # regressor; the name doesn't need to encode that here).
+        default_layers = "256,128" if base_name == "spatial_mlp" else "512,256"
+        default_iter = 300 if base_name == "spatial_mlp" else 400
+        layers_str = p.get("hidden_layers", default_layers)
+        if isinstance(layers_str, str):
+            hidden = tuple(int(x) for x in layers_str.split(","))
+        else:
+            hidden = tuple(int(x) for x in default_layers.split(","))
+        return MLPRegressor(
+            hidden_layer_sizes=hidden,
+            max_iter=int(p.get("max_iter", default_iter)),
             random_state=42,
         )
     else:

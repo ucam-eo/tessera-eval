@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0]
+
+### Added
+- Spatial MLP regression (`spatial_mlp`, `spatial_mlp_5x5`) — previously
+  crashed the entire evaluation stream (`ValueError: Unknown regressor:
+  spatial_mlp`), killing every other classifier's results in the same run
+  too, not just spatial_mlp's own. Confirmed live, Louis Driver.
+  `make_regressor` now recognizes both names directly (deliberately no
+  `_reg` suffix, unlike every other regressor — see its docstring for why).
+  Two independent, previously-unfixed data-pipeline bugs in
+  `_extract_tile_patches` are fixed alongside this, both silently
+  corrupting regression targets rather than crashing: an unconditional
+  1-based-to-0-based `-1` shift (meaningful for class IDs, wrong for
+  continuous values), and an unconditional `int32` cast on the assembled
+  spatial-label arrays (silently truncating e.g. a height of 3.7 to 3).
+  Both are now conditional on `is_classification`, matching the pattern
+  already used for `unet_patches`'s own label dtype.
+  Create Map still doesn't support spatial_mlp for either task (dense
+  per-pixel neighbourhood features are too expensive for full-map
+  prediction) — that's an unrelated, pre-existing, permanent limitation,
+  not something this touches. Download Models (`train_models`) also still
+  skips spatial_mlp for regression with a clear message rather than
+  training it — a deliberate scope boundary for this change, tracked
+  separately, since its existing spatial_mlp *classification* handling
+  pairs `spatial_3x3`/`spatial_5x5` with the plain per-point `labels`
+  array rather than the patch-derived `spatial_labels_3x3`/
+  `spatial_labels_5x5` run_learning_curve uses, which needs its own
+  investigation before extending to regression.
+
 ## [1.6.1]
 
 ### Fixed

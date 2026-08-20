@@ -195,11 +195,12 @@ def _extract_tile_patches(
     is_classification=False (regression): patches carry real continuous
     target values (via rasterize_shapefile_continuous, NaN = unlabelled)
     instead of LabelEncoder class IDs (via rasterize_shapefile, 0 =
-    unlabelled) -- le/n_classes are unused in that case (spatial_mlp/
-    spatial_mlp_5x5 regression isn't supported yet regardless -- no
-    regressor variant exists for either -- so needs_spatial_3x3/5x5 should
-    never actually be True alongside is_classification=False in practice,
-    but this function doesn't crash if it happens).
+    unlabelled) -- le/n_classes are unused in that case. spatial_mlp and
+    spatial_mlp_5x5 do support regression (make_regressor recognizes both
+    names directly, no "_reg" suffix -- see its docstring) -- the spatial
+    labels returned here (all_spatial_labels_3x3/5x5) carry real values for
+    regression too, not the 1-based-to-0-based-shifted class indices
+    classification needs.
 
     Returns (unet_patches, spatial_3x3, spatial_5x5, point_vectors) where
     point_vectors is a (N, 128) array if sample_points_lonlat was given, else
@@ -448,19 +449,21 @@ def _extract_tile_patches(
                 labelled_mask = np.zeros_like(labelled_mask)
                 labelled_mask[rows[keep], cols[keep]] = True
 
-            # spatial_mlp/spatial_mlp_5x5 regression isn't supported (no
-            # regressor variant exists), so these branches stay
-            # classification-shaped (the "- 1" 1-based→0-based shift would
-            # be meaningless for regression) -- needs_spatial_3x3/5x5 should
-            # never actually be True here when is_classification is False.
+            # The "- 1" shift converts label_patch's 1-based class IDs (0 =
+            # unlabelled, already excluded by labelled_mask) to 0-based
+            # indices make_classifier's models expect. Regression targets
+            # are real continuous values (e.g. heights), not class IDs --
+            # shifting them by 1 would silently corrupt every value.
             if needs_spatial_3x3:
                 sf = gather_spatial_features_2d(emb_patch, radius=1, mask=labelled_mask)
                 all_spatial_3x3.append(sf)
-                all_spatial_labels_3x3.append(label_patch[labelled_mask] - 1)  # 1-based → 0-based
+                lbls = label_patch[labelled_mask]
+                all_spatial_labels_3x3.append(lbls - 1 if is_classification else lbls)
             if needs_spatial_5x5:
                 sf = gather_spatial_features_2d(emb_patch, radius=2, mask=labelled_mask)
                 all_spatial_5x5.append(sf)
-                all_spatial_labels_5x5.append(label_patch[labelled_mask] - 1)
+                lbls = label_patch[labelled_mask]
+                all_spatial_labels_5x5.append(lbls - 1 if is_classification else lbls)
 
         if logger:
             logger.info("  %d patches so far (%d from this tile)", len(unet_patches), n_pick)
@@ -471,11 +474,24 @@ def _extract_tile_patches(
     spatial_5x5 = (
         np.concatenate(all_spatial_5x5, axis=0).astype(np.float32) if all_spatial_5x5 else None
     )
+    # int32 class IDs for classification; float32 real values for regression
+    # -- same reasoning as unet_patches's label dtype above. This cast used
+    # to be unconditionally int32 regardless of is_classification, which
+    # truncated every regression target to its integer part (e.g. a height
+    # of 3.7 silently became 3) -- a second, independent bug from the
+    # classification-only "-1" shift a few lines up (that one corrupted the
+    # value additively, this one corrupted it by truncation; both needed
+    # fixing, neither implies the other).
+    _spatial_label_dtype = np.int32 if is_classification else np.float32
     spatial_labels_3x3 = (
-        np.concatenate(all_spatial_labels_3x3).astype(np.int32) if all_spatial_labels_3x3 else None
+        np.concatenate(all_spatial_labels_3x3).astype(_spatial_label_dtype)
+        if all_spatial_labels_3x3
+        else None
     )
     spatial_labels_5x5 = (
-        np.concatenate(all_spatial_labels_5x5).astype(np.int32) if all_spatial_labels_5x5 else None
+        np.concatenate(all_spatial_labels_5x5).astype(_spatial_label_dtype)
+        if all_spatial_labels_5x5
+        else None
     )
 
     if logger:
