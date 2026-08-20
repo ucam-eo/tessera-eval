@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.1]
+
+### Fixed
+- `create_map`'s NPY fallback path raised `rasterio.errors.RasterioError:
+  CRS mismatch with source` for large map areas. Root cause: it called
+  `gt.registry.load_blocks_for_region()` + `gt.fetch_embeddings()` and took
+  only the *first* tile via `next(tile_gen)` — for a chunk spanning
+  multiple embedding tiles, this silently dropped the rest, and different
+  chunks ended up carrying whatever native UTM CRS their (arbitrarily
+  first) tile happened to be in. `rasterio.merge.merge()` requires every
+  source dataset to share one CRS. This was previously masked for large
+  areas because zarr's `read_region` already reprojected everything to a
+  shared EPSG:4326 grid before this code path was even hit — it only
+  surfaced once zarr was disabled (1.6.1, the UTM-boundary-bug fix) and
+  the NPY fallback became the only path. Likely also explains a related
+  report of small maps sometimes coming out slightly askew N/S in QGIS
+  (usually within one UTM zone, so no hard crash, but still unreprojected).
+  Fixed by calling `gt.fetch_mosaic_for_region(chunk_bbox, target_crs=
+  "EPSG:4326")` instead — geotessera's own purpose-built method for dense
+  raster prediction, which merges every overlapping tile *and* reprojects
+  to a common CRS internally. Confirmed live, Louis Driver.
+
 ## [1.7.0]
 
 ### Added

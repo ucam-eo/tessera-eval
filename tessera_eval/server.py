@@ -2358,17 +2358,28 @@ def create_map():
                         if use_zarr:
                             emb, transform, crs = gtz.read_region(chunk_bbox, map_year)
                         else:
-                            # Fall back to NPY: fetch tiles overlapping this chunk
-                            tiles = gt.registry.load_blocks_for_region(chunk_bbox, map_year)
-                            tiles = list(tiles)
-                            if not tiles:
-                                continue
-                            tile_gen = gt.fetch_embeddings(tiles)
-                            try:
-                                _, _, _, emb, crs, transform = next(tile_gen)
-                                emb = emb.astype(np.float32)
-                            except StopIteration:
-                                continue
+                            # Fall back to NPY: fetch_mosaic_for_region handles
+                            # multi-tile merging *and* reprojection to a common
+                            # CRS internally -- confirmed necessary live (Louis
+                            # Driver): a chunk_bbox spanning multiple embedding
+                            # tiles can span multiple UTM zones (each tile's
+                            # native CRS), and the previous code here only
+                            # grabbed the *first* tile via next(tile_gen),
+                            # silently dropping the rest of the chunk, while
+                            # leaving different chunks in genuinely different
+                            # per-tile CRSs -- rasterio.merge.merge() then
+                            # raised "CRS mismatch with source" trying to
+                            # combine chunk_results at the end (only for
+                            # larger areas with enough chunks/tiles to hit a
+                            # zone boundary; small areas usually stayed within
+                            # one zone, which is why this wasn't caught
+                            # earlier). ValueError ("no tiles found") from an
+                            # empty chunk is handled by the except below, same
+                            # as any other per-chunk failure.
+                            emb, transform, crs = gt.fetch_mosaic_for_region(
+                                chunk_bbox, year=map_year, target_crs="EPSG:4326"
+                            )
+                            emb = emb.astype(np.float32)
 
                         if emb is None or emb.size == 0:
                             continue

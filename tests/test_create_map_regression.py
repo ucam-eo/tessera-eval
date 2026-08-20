@@ -66,6 +66,17 @@ class _FakeGeoTessera:
 
         return gen()
 
+    def fetch_mosaic_for_region(
+        self, bbox, year=2024, target_crs="EPSG:4326", auto_download=True, progress_callback=None
+    ):
+        # create_map()'s NPY fallback calls this directly now (not
+        # fetch_embeddings/registry.load_blocks_for_region) -- it's the one
+        # that handles multi-tile merge + reprojection to a common CRS.
+        rng = np.random.RandomState(1)
+        emb = rng.uniform(0, 50, size=(16, 16, EMBED_DIM)).astype(np.float32)
+        transform = Affine(0.001, 0, 16.6, 0, -0.001, 48.25)
+        return emb, transform, target_crs
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
