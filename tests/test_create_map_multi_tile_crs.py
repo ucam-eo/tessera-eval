@@ -1,24 +1,18 @@
-"""create_map's NPY fallback must merge multi-tile/multi-CRS chunks correctly.
+"""create_map must predict on native embedding grids and still merge maps
+that span more than one UTM zone.
 
-Confirmed live (Louis Driver), traceback:
-    rasterio.errors.RasterioError: CRS mismatch with source: ...
-raised from rasterio.merge.merge() inside create_map()'s chunk-merging step,
-for a large map area. Root cause: the previous NPY fallback called
-gt.registry.load_blocks_for_region() + gt.fetch_embeddings() and took only
-the *first* tile via next(tile_gen) -- for a chunk_bbox overlapping multiple
-embedding tiles, this silently dropped the rest, and different chunks ended
-up carrying whatever native UTM CRS their (arbitrarily-chosen) first tile
-happened to be in. rasterio.merge.merge() requires every source dataset to
-share one CRS. This was previously masked for large areas because zarr's
-read_region already reprojected everything to a shared EPSG:4326 grid before
-this code path was hit at all -- it only surfaced once zarr was disabled
-(2026-08-19, the UTM-boundary-bug fix) and the NPY fallback became the only
-path.
+Embeddings are produced on each tile's native UTM grid, and the geotessera
+guidance is to classify on that grid and reproject only the result.  The
+NPY fallback used to reproject the embeddings themselves to EPSG:4326
+before predicting (resampling every 128-dimensional vector), and the zarr
+path handed rasterio.merge blocks in whichever UTM zone each chunk fell in,
+which raised "CRS mismatch with source" for map areas crossing a zone
+boundary.  Both paths must now predict on the grid the embeddings arrive
+on, with only the per-block *prediction* rasters reprojected onto a common
+CRS before merging.
 
-Fixed by calling gt.fetch_mosaic_for_region(chunk_bbox, target_crs=
-"EPSG:4326") instead -- the library's own purpose-built method for exactly
-this ("dense raster operations like classification"), which merges every
-overlapping tile *and* reprojects to a common CRS internally.
+The tiles here straddle the 18 degrees east meridian: zone 33 (EPSG:32633)
+to the west, zone 34 (EPSG:32634) to the east.
 """
 
 from __future__ import annotations
@@ -28,61 +22,81 @@ import json
 import numpy as np
 import pytest
 from affine import Affine
+from pyproj import Transformer
 
 import tessera_eval.server as srv
 
 EMBED_DIM = 8
+TILE_SIZE = 16
+RES_M = 10.0
+
+WEST_TILE = (17.95, 48.25, "EPSG:32633")
+EAST_TILE = (18.05, 48.25, "EPSG:32634")
+MAP_BBOX = [48.2, 17.9, 48.3, 18.1]  # [south, west, north, east]
+
+
+def _native_tile(tlon, tlat, crs):
+    """A TILE_SIZE x TILE_SIZE embedding block on a native UTM grid whose
+    top-left corner sits at (tlon, tlat)."""
+    to_utm = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    x0, y0 = to_utm.transform(tlon, tlat)
+    transform = Affine(RES_M, 0, x0, 0, -RES_M, y0)
+    rng = np.random.RandomState(int(tlon * 100))
+    emb = rng.uniform(0, 50, size=(TILE_SIZE, TILE_SIZE, EMBED_DIM)).astype(np.float32)
+    return emb, transform, crs
 
 
 class _FakeRegistry:
-    """Deliberately NOT exercised by create_map()'s NPY fallback anymore --
-    present only so nothing else on the fake object breaks if some other
-    code path still reaches for it."""
-
     def load_blocks_for_region(self, bbox, year):
-        raise AssertionError(
-            "create_map()'s NPY fallback must call fetch_mosaic_for_region, "
-            "not registry.load_blocks_for_region directly"
-        )
+        return [(year, WEST_TILE[0], WEST_TILE[1]), (year, EAST_TILE[0], EAST_TILE[1])]
 
 
 class _FakeGeoTessera:
-    """Each chunk_bbox gets embeddings in a *different* native UTM-like CRS
-    from fetch_mosaic_for_region's caller's perspective -- but since
-    fetch_mosaic_for_region is responsible for reprojecting to target_crs
-    before returning, this fake always honours target_crs in its return
-    value, exactly like the real method's contract. If create_map ever
-    reverts to using per-tile CRS without reprojecting, this fake alone
-    won't catch it (it's not simulating the merge-internals bug) -- the
-    real assertion is in test_map_with_multiple_chunks_merges_without_crs_
-    mismatch, which drives >1 chunk through the *real* rasterio merge.
-    """
+    """Serves each tile on its own native UTM grid, like the real tile
+    store.  fetch_mosaic_for_region reprojects embeddings before analysis,
+    so create_map must never call it."""
 
     def __init__(self, embeddings_dir=None):
         self.registry = _FakeRegistry()
-        self._call_count = 0
 
-    def fetch_mosaic_for_region(
-        self, bbox, year=2024, target_crs="EPSG:4326", auto_download=True, progress_callback=None
-    ):
-        self._call_count += 1
-        rng = np.random.RandomState(self._call_count)  # different data per chunk
-        emb = rng.uniform(0, 50, size=(16, 16, EMBED_DIM)).astype(np.float32)
-        west, south, _east, _north = bbox
-        transform = Affine(0.001, 0, west, 0, -0.001, south + 0.016)
-        return emb, transform, target_crs
+    def fetch_embeddings(self, tiles):
+        def gen():
+            for _yr, tlon, tlat in tiles:
+                crs = WEST_TILE[2] if tlon < 18.0 else EAST_TILE[2]
+                emb, transform, crs = _native_tile(tlon, tlat, crs)
+                yield (None, None, None, emb, crs, transform)
+
+        return gen()
+
+    def fetch_mosaic_for_region(self, *args, **kwargs):
+        raise AssertionError(
+            "create_map must not use fetch_mosaic_for_region: it reprojects "
+            "embeddings before prediction"
+        )
 
 
-@pytest.fixture
-def client(tmp_path, monkeypatch):
+class _FakeZarr:
+    """read_region returns each chunk on the native grid of whichever UTM
+    zone its centre falls in, like the real zarr store."""
+
+    def read_region(self, bbox, year):
+        lon0, lat0, lon1, lat1 = bbox
+        mid_lon = (lon0 + lon1) / 2
+        crs = "EPSG:32633" if mid_lon < 18.0 else "EPSG:32634"
+        return _native_tile(lon0, lat1, crs)
+
+
+def _client(monkeypatch, get_zarr, probe=None):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "get_zarr", lambda: None)  # force the NPY fallback path
+    monkeypatch.setattr(srv, "get_zarr", get_zarr)
+    if probe is not None:
+        monkeypatch.setattr(srv, "probe_zarr_coverage", probe)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
 
     rng = np.random.RandomState(0)
     n = 100
-    vectors = rng.rand(n, EMBED_DIM).astype(np.float32)
+    vectors = rng.uniform(0, 50, size=(n, EMBED_DIM)).astype(np.float32)
     labels = rng.randint(0, 2, size=n).astype(np.int32)
     monkeypatch.setattr(
         srv,
@@ -99,24 +113,55 @@ def client(tmp_path, monkeypatch):
     return srv.app.test_client()
 
 
-def test_map_with_multiple_chunks_merges_without_crs_mismatch(client):
-    """A map area larger than one 0.1deg chunk -- >1 chunk gets merged by
-    the real rasterio.merge.merge(), the exact call that raised
-    'CRS mismatch with source' live."""
-    body = {
-        "classifier": "rf",
-        # 0.25 x 0.15 deg -- multiple 0.1deg chunks in both directions.
-        "map_bboxes": [[48.0, 16.0, 48.15, 16.25]],
-    }
+@pytest.fixture
+def npy_client(monkeypatch):
+    return _client(monkeypatch, get_zarr=lambda: None)
+
+
+@pytest.fixture
+def zarr_client(monkeypatch):
+    zarr = _FakeZarr()
+    return _client(monkeypatch, get_zarr=lambda: zarr, probe=lambda *a, **k: True)
+
+
+def _run(client):
+    body = {"classifier": "rf", "map_bboxes": [MAP_BBOX]}
     resp = client.post("/api/evaluation/create-map", json=body)
     assert resp.status_code == 200
     events = [json.loads(line) for line in resp.text.strip().splitlines()]
-
     errors = [e for e in events if e.get("event") == "error"]
     assert not errors, f"create-map returned error event(s): {errors}"
+    return events
 
-    chunk_events = [e for e in events if e.get("event") == "map_progress"]
-    assert len(chunk_events) > 1, "test bbox must actually span multiple chunks"
 
+def test_npy_path_predicts_on_native_grids_and_merges_across_zones(npy_client):
+    events = _run(npy_client)
     ready = next(e for e in events if e["event"] == "map_ready")
     assert ready["width"] > 0 and ready["height"] > 0
+
+
+def test_zarr_path_merges_chunks_from_different_utm_zones(zarr_client):
+    events = _run(zarr_client)
+    ready = next(e for e in events if e["event"] == "map_ready")
+    assert ready["width"] > 0 and ready["height"] > 0
+
+
+def test_merge_prediction_rasters_handles_mixed_crs():
+    a = np.full((4, 4), 1, dtype=np.uint8)
+    b = np.full((4, 4), 2, dtype=np.uint8)
+    to_33 = Transformer.from_crs("EPSG:4326", "EPSG:32633", always_xy=True)
+    to_34 = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    ax, ay = to_33.transform(17.95, 48.25)
+    bx, by = to_34.transform(18.05, 48.25)
+
+    merged, transform, crs = srv._merge_prediction_rasters(
+        [
+            (a, Affine(10, 0, ax, 0, -10, ay), "EPSG:32633"),
+            (b, Affine(10, 0, bx, 0, -10, by), "EPSG:32634"),
+        ],
+        out_dtype="uint8",
+        out_nodata=0,
+    )
+
+    assert set(np.unique(merged)) >= {1, 2}
+    assert str(crs) in ("EPSG:32633", "EPSG:32634")
