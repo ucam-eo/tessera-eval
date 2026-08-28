@@ -75,6 +75,8 @@ _proxy_session = requests.Session()
 
 FLUSH_PAD = 18 * 1024  # pad NDJSON lines to force Waitress flush
 
+ZARR_CACHE_MAX_BYTES = 20 * 1024**3  # bound the on-disk zarr chunk cache
+
 
 def _get_cache_dir():
     """Return the cache directory, creating it if needed."""
@@ -97,7 +99,10 @@ def _get_zarr():
         try:
             from geotessera.store import GeoTesseraZarr
 
-            inst = GeoTesseraZarr(cache_dir=str(_get_cache_dir() / "zarr"))
+            inst = GeoTesseraZarr(
+                cache_dir=str(_get_cache_dir() / "zarr"),
+                cache_max_size=ZARR_CACHE_MAX_BYTES,
+            )
             if getattr(inst, "years", None):
                 logger.info("GeoTesseraZarr available: %s", inst.url)
                 _zarr_instance = inst

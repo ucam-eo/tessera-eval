@@ -40,6 +40,9 @@ def test_get_zarr_returns_instance_and_caches_it(monkeypatch):
     second = srv._get_zarr()
     assert first is second is not None
     assert len(calls) == 1
+    assert calls[0].get("cache_max_size", 0) > 0, (
+        "the on-disk chunk cache must be bounded for a long-lived server"
+    )
 
 
 def test_get_zarr_returns_none_when_store_cannot_open(monkeypatch):
