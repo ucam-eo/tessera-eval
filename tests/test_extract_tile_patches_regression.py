@@ -51,7 +51,7 @@ def fake_tile(monkeypatch):
     # rasterize/gather_spatial_features only care about the pixel<->coord
     # mapping, not what CRS it nominally represents.
     transform = Affine(0.001, 0, 16.6, 0, -0.001, 48.35)
-    monkeypatch.setattr(srv, "get_zarr", lambda: None)  # force the NPY fallback path
+    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     return tile_emb, transform
 
 

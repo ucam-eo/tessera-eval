@@ -88,9 +88,9 @@ class _FakeZarr:
 
 def _client(monkeypatch, get_zarr, probe=None):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "get_zarr", get_zarr)
+    monkeypatch.setattr(srv, "_get_zarr", get_zarr)
     if probe is not None:
-        monkeypatch.setattr(srv, "probe_zarr_coverage", probe)
+        monkeypatch.setattr(srv, "_probe_zarr_coverage", probe)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
 

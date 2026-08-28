@@ -134,13 +134,13 @@ the training/predict functions raise `RuntimeError`.
 
 ---
 
-## GeoTessera zarr access — moved out
+## GeoTessera zarr access
 
-The cached zarr handle and region reads (`get_zarr`, `probe_zarr_coverage`,
-`read_region_chunked`) now live in the standalone
-[`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils) package
-(`pip install "tessera-zarr-utils[geotessera]"`), so they can be used without the
-eval/ML stack. The `tee-compute` server depends on it; see that package's README.
+The compute server uses geotessera's own `GeoTesseraZarr` interface
+(geotessera >= 0.10.1) directly as a fast path. It opens the store once per
+process, probes coverage with a single pixel before each region read, and
+falls back to NPY tiles whenever the store is unavailable or lacks the
+requested region or year. There is no separate zarr module or package.
 
 ---
 

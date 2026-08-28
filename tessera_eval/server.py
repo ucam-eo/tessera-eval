@@ -64,6 +64,7 @@ _tile_cache = {
 _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
 _geotessera_instance = None  # cached to avoid 10-30s registry init per run
+_zarr_instance = None  # cached GeoTesseraZarr handle; False = tried and failed
 _cancel_flag = None  # threading.Event, set when user cancels
 # Shared across every proxy() call so the TCP+TLS connection to _hosted_url is
 # kept alive and reused (requests' connection-pooling adapter), instead of a
@@ -82,6 +83,50 @@ def _get_cache_dir():
         _tile_disk_cache_dir = Path.home() / ".cache" / "tessera-eval"
     _tile_disk_cache_dir.mkdir(parents=True, exist_ok=True)
     return _tile_disk_cache_dir
+
+
+def _get_zarr():
+    """Return a cached GeoTesseraZarr handle, or None when zarr is unavailable.
+
+    The store is opened once per process and the outcome is cached, failure
+    included; callers fall back to the NPY tile path on None. Chunk reads
+    are cached on disk alongside the NPY tile cache.
+    """
+    global _zarr_instance
+    if _zarr_instance is None:
+        try:
+            from geotessera.store import GeoTesseraZarr
+
+            inst = GeoTesseraZarr(cache_dir=str(_get_cache_dir() / "zarr"))
+            if getattr(inst, "years", None):
+                logger.info("GeoTesseraZarr available: %s", inst.url)
+                _zarr_instance = inst
+            else:
+                logger.info("Zarr store has no tiles; using NPY tiles")
+                _zarr_instance = False
+        except Exception as e:
+            logger.info("Zarr store unavailable (%s); using NPY tiles", e)
+            _zarr_instance = False
+    return _zarr_instance or None
+
+
+def _probe_zarr_coverage(gtz, bounds, year):
+    """True when the zarr store has a valid embedding for *year* at the
+    centre of *bounds* (west, south, east, north).
+
+    geotessera's single-pixel probe distinguishes genuine coverage from
+    water and from areas not yet produced; anything but a valid embedding
+    sends the caller to the NPY tile path.
+    """
+    try:
+        if year not in getattr(gtz, "years", []):
+            return False
+        cx = (bounds[0] + bounds[2]) / 2
+        cy = (bounds[1] + bounds[3]) / 2
+        _vec, status = gtz.probe(cx, cy, year)
+        return status == "valid"
+    except Exception:
+        return False
 
 
 def _result_cache_path(field, year, gdf_hash, sampling="equal"):
@@ -116,9 +161,6 @@ def _load_cached_result(field, year, gdf, sampling="equal"):
         except Exception:
             path.unlink(missing_ok=True)
     return None
-
-
-from tessera_zarr_utils import get_zarr, probe_zarr_coverage
 
 
 def _sample_points_within_budget(rows_gdf, budget, rng):
@@ -221,8 +263,8 @@ def _extract_tile_patches(
 
     # Try zarr — but verify coverage with a single-pixel probe first,
     # since the zarr store only has 2025 for some regions.
-    gtz = get_zarr()
-    use_zarr = gtz is not None and probe_zarr_coverage(gtz, bounds, year)
+    gtz = _get_zarr()
+    use_zarr = gtz is not None and _probe_zarr_coverage(gtz, bounds, year)
     if logger:
         logger.info(
             "Using %s for tile reads", "zarr (fast)" if use_zarr else "NPY tiles with local cache"
@@ -2454,8 +2496,8 @@ def create_map():
             bbox_lonlat = (west, south, east, north)
 
             # Probe zarr coverage
-            gtz = get_zarr()
-            use_zarr = gtz is not None and probe_zarr_coverage(gtz, bbox_lonlat, map_year)
+            gtz = _get_zarr()
+            use_zarr = gtz is not None and _probe_zarr_coverage(gtz, bbox_lonlat, map_year)
 
             yield (
                 json.dumps(
