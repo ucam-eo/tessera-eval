@@ -232,7 +232,15 @@ def load_embeddings_for_shapefile_vq(
     The shapefile's bounding box is split into ``<= max_km`` chunks because the VQ
     bolt-on caps the bbox per request; chunks the polygons don't touch are skipped
     without a fetch, and chunks the bolt-on has no coverage for are skipped with a
-    warning. Class IDs are consistent across chunks (one shared ``LabelEncoder``).
+    warning. Chunking always happens in lon/lat degrees, whatever CRS the
+    shapefile or ``target_crs`` use. Class IDs are consistent across chunks (one
+    shared ``LabelEncoder``).
+
+    Note that the client returns mosaics resampled onto ``target_crs`` rather
+    than the embeddings' native UTM grid, so accuracy measured through this
+    loader includes that resampling as well as the VQ reconstruction. Keep that
+    in mind when comparing against the raw-tile loader, which stays on the
+    native grid.
 
     Args:
         gdf: GeoDataFrame with geometry + the ``field`` column (any CRS).
@@ -261,7 +269,7 @@ def load_embeddings_for_shapefile_vq(
 
     from tessera_eval.rasterize import rasterize_shapefile
 
-    gdf4326 = gdf if _is_4326(gdf.crs) else gdf.to_crs(target_crs)
+    gdf4326 = gdf if _is_4326(gdf.crs) else gdf.to_crs("EPSG:4326")
     west, south, east, north = (float(v) for v in gdf4326.total_bounds)
 
     # Chunk side in degrees, kept under max_km on both axes (lon shrinks with lat).
@@ -298,7 +306,7 @@ def load_embeddings_for_shapefile_vq(
         if sub.empty:
             continue
         try:
-            mosaic, transform, _crs = client.fetch_mosaic_for_region(
+            mosaic, transform, mosaic_crs = client.fetch_mosaic_for_region(
                 cb, year=year, target_crs=target_crs
             )
         except Exception as exc:  # no VQ coverage / server error for this chunk
@@ -308,7 +316,8 @@ def load_embeddings_for_shapefile_vq(
             continue
 
         h, w = mosaic.shape[:2]
-        class_raster = rasterize_shapefile(sub, field, transform, w, h, label_encoder=le)
+        sub_proj = sub.to_crs(mosaic_crs or target_crs)
+        class_raster = rasterize_shapefile(sub_proj, field, transform, w, h, label_encoder=le)
         labelled = class_raster > 0
         if not labelled.any():
             continue

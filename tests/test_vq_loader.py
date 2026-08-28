@@ -84,3 +84,28 @@ def test_vq_loader_no_coverage_raises():
     client = FakeClient(fail=True)
     with pytest.raises(ValueError):
         load_embeddings_for_shapefile_vq(gdf, "cls", 2024, client)
+
+
+class _RecordingClient(FakeClient):
+    """Records every requested bbox, then reports no coverage so the loader
+    never tries to rasterize against a mosaic this fake didn't build."""
+
+    def fetch_mosaic_for_region(self, bbox, year=2024, target_crs="EPSG:4326"):
+        self.calls.append(tuple(bbox))
+        raise RuntimeError("no coverage")
+
+
+def test_vq_loader_chunks_in_degrees_for_any_target_crs():
+    """Chunking must always happen in lon/lat degrees. With a projected
+    target_crs, the shapefile used to be reprojected into it before the
+    degree-based chunk arithmetic ran, so chunk bounds came out in metres."""
+    gdf = _gdf((0.01, 50.01, 0.03, 50.03)).to_crs("EPSG:27700")
+    client = _RecordingClient()
+    with pytest.raises(ValueError):
+        load_embeddings_for_shapefile_vq(
+            gdf, "cls", 2024, client, target_crs="EPSG:3857", max_km=100000
+        )
+    assert client.calls
+    assert all(abs(c[0]) <= 360 and abs(c[1]) <= 90 for c in client.calls), (
+        f"chunk bboxes are not lon/lat degrees: {client.calls[:3]}"
+    )
