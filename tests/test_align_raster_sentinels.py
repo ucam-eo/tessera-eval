@@ -98,3 +98,26 @@ def test_destination_outside_raster_returns_all_nan(tmp_path):
     )
 
     assert np.isnan(aligned).all()
+
+
+def test_destination_barely_overlapping_the_padding_returns_all_nan(tmp_path):
+    """A destination grid just outside the raster, but within the window's
+    two-pixel interpolation margin, used to round to a zero-width read and
+    crash inside reproject instead of returning all-NaN."""
+    data = np.full((8, 8), 10.0, dtype=np.float32)
+    src_transform = Affine(0.001, 0, 0.0, 0, -0.001, 1.0)
+    path = tmp_path / "ref.tif"
+    _write_raster(path, data, src_transform)
+
+    just_west = Affine(0.001, 0, -0.0057, 0, -0.001, 1.0)
+    aligned = align_raster_to_grid(
+        str(path),
+        just_west,
+        "EPSG:4326",
+        width=4,
+        height=4,
+        resampling="bilinear",
+        nodata_values=[SENTINEL],
+    )
+
+    assert np.isnan(aligned).all()

@@ -178,6 +178,8 @@ def _read_window_with_sentinels_masked(src, band, transform, crs, width, height,
     except rasterio.errors.WindowError:
         return None, None
     window = window.round_offsets().round_lengths()
+    if window.width < 1 or window.height < 1:
+        return None, None
 
     data = src.read(band, window=window, masked=True).astype(np.float64).filled(np.nan)
     for v in nodata_values:
