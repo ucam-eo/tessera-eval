@@ -24,6 +24,8 @@ import numpy as np
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
+from tessera_eval.classify import SPATIAL_MODELS
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -1777,7 +1779,7 @@ def run_large_area():
                         + "\n"
                     )
                     continue
-            if bn in ("spatial_mlp", "spatial_mlp_5x5"):
+            if bn in SPATIAL_MODELS:
                 if has_fixed_test_set:
                     yield (
                         json.dumps(
@@ -2087,7 +2089,7 @@ def train_models():
                             + "\n"
                         )
                         continue
-                elif _bn in ("spatial_mlp", "spatial_mlp_5x5") and not is_classification:
+                elif _bn in SPATIAL_MODELS and not is_classification:
                     # No regressor variant exists for spatial-context models yet.
                     yield (
                         json.dumps(
@@ -2353,7 +2355,7 @@ def create_map():
     import re as _re
 
     base_name = _re.sub(r"_v\d+$", "", classifier_name)
-    unsupported = ("spatial_mlp", "spatial_mlp_5x5", "unet")
+    unsupported = SPATIAL_MODELS + ("unet",)
     if base_name in unsupported:
         return jsonify(
             {

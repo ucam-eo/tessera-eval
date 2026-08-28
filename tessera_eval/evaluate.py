@@ -18,6 +18,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
 from tessera_eval.classify import (
+    SPATIAL_MODELS,
     _strip_variant_suffix,
     augment_spatial,
     make_classifier,
@@ -215,11 +216,7 @@ def run_learning_curve(
         # models cannot be evaluated against it. They used to fall back to a
         # random split of their own training pixels, quietly reporting
         # optimistic scores next to the honestly held-out ones.
-        unsupported = [
-            n
-            for n in classifier_names
-            if _strip_variant_suffix(n) in ("spatial_mlp", "spatial_mlp_5x5")
-        ]
+        unsupported = [n for n in classifier_names if _strip_variant_suffix(n) in SPATIAL_MODELS]
         if unsupported:
             logger.warning(
                 "Skipping %s: spatial models are not supported with a separate test set",
