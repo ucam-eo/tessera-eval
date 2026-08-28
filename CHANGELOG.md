@@ -33,6 +33,10 @@ All notable changes to this project are documented here. The format is based on
   degree-based chunk arithmetic.
 
 ### Changed
+- Map GeoTIFFs are now georeferenced in the embeddings' native UTM CRS
+  (the majority zone when an area spans more than one) instead of always
+  EPSG:4326. Any reader that honours the file's own CRS is unaffected;
+  the `map_ready` event now carries a `crs` field so consumers can tell.
 - The compute server now uses geotessera's own `GeoTesseraZarr` interface
   directly, and the zarr fast path is enabled again — the external
   `tessera-zarr-utils` dependency (whose pinned release disabled zarr

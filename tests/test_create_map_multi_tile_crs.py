@@ -138,6 +138,10 @@ def test_npy_path_predicts_on_native_grids_and_merges_across_zones(npy_client):
     events = _run(npy_client)
     ready = next(e for e in events if e["event"] == "map_ready")
     assert ready["width"] > 0 and ready["height"] > 0
+    assert ready["crs"].startswith("EPSG:326"), (
+        "map_ready must report the output CRS now that maps are written on "
+        "native UTM grids rather than always EPSG:4326"
+    )
 
 
 def test_zarr_path_merges_chunks_from_different_utm_zones(zarr_client):

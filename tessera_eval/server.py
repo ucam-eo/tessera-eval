@@ -2727,6 +2727,7 @@ def create_map():
                             "download_url": f"/api/evaluation/download-map/{map_name}",
                             "width": out_arr.shape[1],
                             "height": out_arr.shape[0],
+                            "crs": str(out_crs),
                             "n_classes": len(class_names),
                             "train_year": train_year,
                             "map_year": map_year,
