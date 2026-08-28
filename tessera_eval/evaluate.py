@@ -701,7 +701,10 @@ def evaluate(
     """Run evaluation and collect all results (non-streaming).
 
     Convenience wrapper around run_learning_curve that collects all events
-    and returns a Results object.
+    and returns a Results object. run_learning_curve works in percentages
+    of the labelled data, so the requested sizes are converted, capped at
+    80% (the largest training share a random split can use), and
+    deduplicated -- sizes at or above 80% of the data all map to that cap.
 
     Args:
         vectors: float32 array, shape (N, dim)
@@ -726,6 +729,9 @@ def evaluate(
         if not training_sizes or training_sizes[-1] < max_train:
             training_sizes.append(max_train)
 
+    n_samples = len(labels)
+    training_pcts = sorted({min(80.0, 100.0 * s / n_samples) for s in training_sizes if s > 0})
+
     progress_events = []
     confusion_matrices = {}
 
@@ -733,7 +739,7 @@ def evaluate(
         vectors,
         labels,
         classifiers,
-        training_sizes,
+        training_pcts,
         repeats,
         classifier_params,
         spatial_vectors,
@@ -761,7 +767,7 @@ class Results:
         lines = [f"{'Size':>8}  " + "  ".join(f"{n:>12}" for n in self.classifiers)]
         lines.append("-" * len(lines[0]))
         for event in self.progress:
-            cols = [f"{event['size']:>8}"]
+            cols = [f"{event['pixel_train_count']:>8}"]
             for name in self.classifiers:
                 s = event["classifiers"].get(name, {})
                 cols.append(f"  {s.get('mean_f1', 0):.3f} ± {s.get('std_f1', 0):.3f}")
