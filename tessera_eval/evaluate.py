@@ -210,6 +210,30 @@ def run_learning_curve(
     # In this mode, vectors/labels are the train-only pool.
     spatial_split = test_vectors is not None and test_labels is not None
 
+    if spatial_split:
+        # No neighbourhood features exist for the fixed test set, so these
+        # models cannot be evaluated against it. They used to fall back to a
+        # random split of their own training pixels, quietly reporting
+        # optimistic scores next to the honestly held-out ones.
+        unsupported = [
+            n
+            for n in classifier_names
+            if _strip_variant_suffix(n) in ("spatial_mlp", "spatial_mlp_5x5")
+        ]
+        if unsupported:
+            logger.warning(
+                "Skipping %s: spatial models are not supported with a separate test set",
+                ", ".join(unsupported),
+            )
+            yield {
+                "type": "classifier_status",
+                "message": (
+                    ", ".join(unsupported)
+                    + " skipped — spatial models are not supported with a separate test set"
+                ),
+            }
+            classifier_names = [n for n in classifier_names if n not in unsupported]
+
     n_samples = len(labels)
 
     # n_classes / per-class indices / confusion matrices only make sense for
@@ -376,13 +400,6 @@ def run_learning_curve(
                         X_tr, y_tr_aug = augment_spatial(
                             X_tr, y_train_sp, window=3, dim=vectors.shape[1]
                         )
-                    elif spatial_split:
-                        # Spatial split: no test_idx, use fixed test set
-                        X_tr, X_te = spatial_vectors[train_idx], X_test
-                        X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train, window=3, dim=vectors.shape[1]
-                        )
-                        y_test = test_labels
                     else:
                         X_tr, X_te = spatial_vectors[train_idx], spatial_vectors[test_idx]
                         X_tr, y_tr_aug = augment_spatial(
@@ -406,12 +423,6 @@ def run_learning_curve(
                         X_tr, y_tr_aug = augment_spatial(
                             X_tr, y_train_sp, window=5, dim=vectors.shape[1]
                         )
-                    elif spatial_split:
-                        X_tr, X_te = sp_vecs[train_idx], X_test
-                        X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train, window=5, dim=vectors.shape[1]
-                        )
-                        y_test = test_labels
                     else:
                         X_tr, X_te = sp_vecs[train_idx], sp_vecs[test_idx]
                         X_tr, y_tr_aug = augment_spatial(

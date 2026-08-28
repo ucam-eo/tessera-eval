@@ -826,9 +826,18 @@ def run_large_area():
     def _base_name(name):
         return _re.sub(r"_v\d+$", "", name)
 
+    # A fixed test set (spatial bboxes, or a different test year) has no
+    # neighbourhood features, so spatial models are skipped for such runs
+    # and their (expensive) feature extraction is not worth doing.
+    has_fixed_test_set = bool(train_bboxes or test_bboxes) or test_year != train_year
+
     # Determine which spatial features are needed (check base names)
-    needs_spatial_3x3 = any(_base_name(n) == "spatial_mlp" for n in model_names)
-    needs_spatial_5x5 = any(_base_name(n) == "spatial_mlp_5x5" for n in model_names)
+    needs_spatial_3x3 = (
+        any(_base_name(n) == "spatial_mlp" for n in model_names) and not has_fixed_test_set
+    )
+    needs_spatial_5x5 = (
+        any(_base_name(n) == "spatial_mlp_5x5" for n in model_names) and not has_fixed_test_set
+    )
     needs_unet = any(_base_name(n) == "unet" for n in model_names)
 
     def stream():
@@ -869,7 +878,7 @@ def run_large_area():
         # sample-point coordinates (to re-fetch the test role at test_year)
         # that spatial bbox splitting needs, so it must force the same
         # reload-if-missing / skip-disk-cache-shortcut behavior below.
-        has_spatial_bboxes = bool(train_bboxes or test_bboxes) or test_year != train_year
+        has_spatial_bboxes = has_fixed_test_set
         if _tile_cache["key"] == cache_key and _tile_cache["vectors"] is not None:
             vectors = _tile_cache["vectors"]
             labels = _tile_cache["labels"]
@@ -1722,6 +1731,20 @@ def run_large_area():
                     )
                     continue
             if bn in ("spatial_mlp", "spatial_mlp_5x5"):
+                if has_fixed_test_set:
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "status",
+                                "message": (
+                                    f"{name} skipped — spatial models are not supported "
+                                    "with a separate test region or test year"
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
+                    continue
                 if (bn == "spatial_mlp" and spatial_3x3 is None) or (
                     bn == "spatial_mlp_5x5" and spatial_5x5 is None
                 ):

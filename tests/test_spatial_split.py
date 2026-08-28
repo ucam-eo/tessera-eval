@@ -131,3 +131,35 @@ def test_spatial_split_test_set_is_fixed(spatial_split_data):
     # With well-separated data, both should be decent
     assert f1_10 > 0.3
     assert f1_80 > 0.3
+
+
+def test_spatial_models_are_skipped_with_a_fixed_test_set(spatial_split_data):
+    """spatial_mlp has no neighbourhood features for a fixed test set, so it
+    used to fall back to a random split of its own training pixels --
+    reporting optimistic scores next to honestly held-out ones.  It must be
+    skipped instead, with a status message saying so."""
+    train_vectors = spatial_split_data["train_vectors"]
+    spatial_vectors = np.repeat(train_vectors, 9, axis=1)
+
+    events = list(
+        run_learning_curve(
+            train_vectors,
+            spatial_split_data["train_labels"],
+            classifier_names=["nn", "spatial_mlp"],
+            training_pcts=[50],
+            repeats=1,
+            spatial_vectors=spatial_vectors,
+            spatial_labels=spatial_split_data["train_labels"],
+            test_vectors=spatial_split_data["test_vectors"],
+            test_labels=spatial_split_data["test_labels"],
+        )
+    )
+
+    progress_events = [e for e in events if e["type"] == "progress"]
+    assert progress_events
+    for ev in progress_events:
+        assert "nn" in ev["classifiers"]
+        assert "spatial_mlp" not in ev["classifiers"]
+
+    statuses = " ".join(e.get("message", "") for e in events if e["type"] == "classifier_status")
+    assert "spatial_mlp" in statuses and "skipped" in statuses
