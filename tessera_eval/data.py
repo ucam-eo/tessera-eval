@@ -316,7 +316,9 @@ def load_embeddings_for_shapefile_vq(
             continue
 
         h, w = mosaic.shape[:2]
-        sub_proj = sub.to_crs(mosaic_crs or target_crs)
+        # A shapefile with no CRS is treated as already lon/lat (see
+        # _is_4326); naive geometries cannot be reprojected.
+        sub_proj = sub if sub.crs is None else sub.to_crs(mosaic_crs or target_crs)
         class_raster = rasterize_shapefile(sub_proj, field, transform, w, h, label_encoder=le)
         labelled = class_raster > 0
         if not labelled.any():

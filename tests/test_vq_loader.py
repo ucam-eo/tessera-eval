@@ -109,3 +109,16 @@ def test_vq_loader_chunks_in_degrees_for_any_target_crs():
     assert all(abs(c[0]) <= 360 and abs(c[1]) <= 90 for c in client.calls), (
         f"chunk bboxes are not lon/lat degrees: {client.calls[:3]}"
     )
+
+
+def test_vq_loader_accepts_a_shapefile_with_no_crs():
+    """A shapefile missing its .prj (crs=None) is treated as already
+    lon/lat, matching _is_4326; reprojecting naive geometries would raise."""
+    gdf = _gdf((0.01, 50.01, 0.03, 50.03))
+    gdf = gdf.set_crs(None, allow_override=True)
+    client = FakeClient(value=3.0, bands=8)
+    vectors, labels, class_names, _stats = load_embeddings_for_shapefile_vq(
+        gdf, "cls", 2024, client
+    )
+    assert vectors.shape[0] > 0
+    assert np.allclose(vectors, 3.0)
