@@ -2515,13 +2515,18 @@ def create_map():
             chunk_results = []  # list of (predicted_2d, transform, crs)
 
             if use_zarr:
-                # Split bbox into 0.1 deg chunks to manage memory
+                # Split bbox into 0.1 deg chunks to manage memory. Chunks
+                # additionally break at UTM zone edges (6-degree multiples):
+                # the store serves a zone-straddling bbox from the centre
+                # zone alone, silently clipping at the edge, which would
+                # leave a nodata strip along the boundary.
                 CHUNK_SIZE = 0.1
                 chunk_lons = []
                 lon = west
                 while lon < east:
-                    chunk_lons.append((lon, min(lon + CHUNK_SIZE, east)))
-                    lon += CHUNK_SIZE
+                    zone_edge = (np.floor(lon / 6.0) + 1) * 6.0
+                    chunk_lons.append((lon, min(lon + CHUNK_SIZE, zone_edge, east)))
+                    lon = chunk_lons[-1][1]
                 chunk_lats = []
                 lat = south
                 while lat < north:

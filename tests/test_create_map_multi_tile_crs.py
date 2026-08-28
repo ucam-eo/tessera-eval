@@ -165,3 +165,28 @@ def test_merge_prediction_rasters_handles_mixed_crs():
 
     assert set(np.unique(merged)) >= {1, 2}
     assert str(crs) in ("EPSG:32633", "EPSG:32634")
+
+
+class _ZoneStrictZarr(_FakeZarr):
+    """Refuses zone-straddling requests.  The real store serves such a bbox
+    from the centre zone alone, silently clipping at the boundary -- so any
+    straddling chunk means a strip of the map would quietly go missing."""
+
+    def read_region(self, bbox, year):
+        lon0, _lat0, lon1, _lat1 = bbox
+        assert int((lon0 + 180.0) // 6.0) == int((lon1 - 1e-9 + 180.0) // 6.0), (
+            f"chunk {bbox} straddles a UTM zone boundary"
+        )
+        return super().read_region(bbox, year)
+
+
+def test_zarr_chunks_never_straddle_a_zone_boundary(monkeypatch):
+    zarr = _ZoneStrictZarr()
+    client = _client(monkeypatch, get_zarr=lambda: zarr, probe=lambda *a, **k: True)
+    body = {"classifier": "rf", "map_bboxes": [[48.2, 17.93, 48.3, 18.25]]}
+    resp = client.post("/api/evaluation/create-map", json=body)
+    events = [json.loads(line) for line in resp.text.strip().splitlines()]
+
+    failed = [e for e in events if "failed" in e.get("message", "")]
+    assert not failed, f"zone-straddling chunk requests: {failed}"
+    assert any(e["event"] == "map_ready" for e in events)
