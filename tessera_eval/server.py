@@ -2652,7 +2652,7 @@ def create_map():
                     crs=out_crs,
                     transform=out_transform,
                     nodata=out_nodata,
-                    compress="lz4",
+                    compress="deflate",
                 ) as dst:
                     dst.write(out_arr, 1)
                     # Store class names as tags (classification) -- empty for
