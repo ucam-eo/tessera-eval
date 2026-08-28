@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `create_map` now predicts on the embeddings' native UTM grids and
+  reprojects only the resulting prediction rasters (nearest-neighbour)
+  when a map area spans more than one UTM zone. The NPY fallback used to
+  fetch each chunk already reprojected to lon/lat, resampling every
+  embedding vector before the model saw it; the zarr path failed with
+  "CRS mismatch with source" on areas crossing a zone boundary.
+- Extra sentinel nodata values (e.g. MS-NFI's 32766/32767) are removed
+  from reference rasters *before* resampling. Bilinear resampling used to
+  blend a sentinel with its neighbours first, producing large in-between
+  values that survived as apparently valid regression targets.
+- Spatial MLP models are skipped, with a status message, when the test
+  set is a separate region or year. They used to fall back to a random
+  split of their own training pixels and report optimistic scores next to
+  honestly held-out ones.
+- `evaluate()` converts its requested training sizes into percentages
+  instead of misreading them as percentages, and `Results.summary()` no
+  longer raises KeyError.
+- Map GeoTIFFs are compressed with DEFLATE. The previous `lz4` setting is
+  not a GeoTIFF compression method and GDAL silently wrote uncompressed
+  files.
+- `load_embeddings_for_shapefile_vq` chunks the shapefile's bounds in
+  lon/lat degrees regardless of the input CRS or `target_crs`; a
+  projected `target_crs` used to push metre coordinates through the
+  degree-based chunk arithmetic.
+
+### Changed
+- The compute server now uses geotessera's own `GeoTesseraZarr` interface
+  directly, and the zarr fast path is enabled again — the external
+  `tessera-zarr-utils` dependency (whose pinned release disabled zarr
+  entirely) is removed. geotessera 0.10.1 fixes the UTM-zone-boundary bug
+  and serves every published year, which is why the workaround package
+  existed.
+- The `geotessera` floor is now 0.10.1: older releases download from
+  retired hosting that is being shut down.
+
 ## [1.7.3]
 
 ### Changed
