@@ -194,3 +194,26 @@ def test_zarr_chunks_never_straddle_a_zone_boundary(monkeypatch):
     failed = [e for e in events if "failed" in e.get("message", "")]
     assert not failed, f"zone-straddling chunk requests: {failed}"
     assert any(e["event"] == "map_ready" for e in events)
+
+
+def test_registry_failure_yields_an_error_event_not_a_dead_stream(monkeypatch):
+    class _BrokenRegistry:
+        def load_blocks_for_region(self, bbox, year):
+            raise RuntimeError("registry unavailable")
+
+    class _BrokenGeoTessera(_FakeGeoTessera):
+        def __init__(self, embeddings_dir=None):
+            self.registry = _BrokenRegistry()
+
+    client = _client(monkeypatch, get_zarr=lambda: None)
+    monkeypatch.setattr("geotessera.GeoTessera", _BrokenGeoTessera)
+    monkeypatch.setattr(srv, "_geotessera_instance", None)
+
+    resp = client.post(
+        "/api/evaluation/create-map",
+        json={"classifier": "rf", "map_bboxes": [MAP_BBOX]},
+    )
+    events = [json.loads(line) for line in resp.text.strip().splitlines()]
+    assert any(e.get("event") == "error" for e in events), (
+        "a registry failure must surface as an error event, not truncate the stream"
+    )

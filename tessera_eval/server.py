@@ -2592,7 +2592,20 @@ def create_map():
             else:
                 # NPY fallback: one tile at a time, on each tile's own
                 # native UTM grid, cropped to the map area.
-                tiles = list(gt.registry.load_blocks_for_region(bbox_lonlat, map_year))
+                try:
+                    tiles = list(gt.registry.load_blocks_for_region(bbox_lonlat, map_year))
+                except Exception as e:
+                    logger.warning("Tile listing failed for map area %d: %s", bbox_idx + 1, e)
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "message": f"Could not list tiles for map area {bbox_idx + 1}: {e}",
+                            }
+                        )
+                        + "\n"
+                    )
+                    continue
                 total_tiles = len(tiles)
                 yield (
                     json.dumps(
