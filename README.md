@@ -23,10 +23,9 @@ It handles the unglamorous-but-fiddly parts end to end:
   your own machine while pulling tiles/UI from a hosted service.
 
 > The library core (`data`, `rasterize`, `classify`, `evaluate`) is pure NumPy /
-> scikit-learn / rasterio and has no web-framework or hosting dependency. GeoTessera
-> zarr access lives in the separate
-> [`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils) package
-> (used by the compute server).
+> scikit-learn / rasterio and has no web-framework or hosting dependency. The
+> compute server reads zarr embeddings through geotessera's own `GeoTesseraZarr`
+> interface, falling back to NPY tiles when the store lacks coverage.
 
 ## Install
 
@@ -196,9 +195,10 @@ Run any command with `--help` for a list of all possible arguments.
 | `tessera_eval.server` | `tee-compute`: local Flask compute server, proxies data/UI to a hosted TEE. |
 | `tessera_eval.cli` | `tessera-eval` command-line interface: `load`, `kfold`, `learning-curve`. |
 
-GeoTessera zarr access (`get_zarr`, `probe_zarr_coverage`, `read_region_chunked`) now
-lives in [`tessera-zarr-utils`](https://github.com/ucam-eo/tessera-zarr-utils); the
-compute server depends on it.
+The compute server reads zarr embeddings directly through geotessera's
+`GeoTesseraZarr` interface as a fast path, probing coverage first and falling
+back to NPY tiles whenever the store is unavailable or lacks the requested
+region or year.
 
 Available models: `nn`, `rf`, `mlp`, `spatial_mlp`, `spatial_mlp_5x5`, `xgboost`
 (if installed), `unet` (if torch installed); regressors `nn_reg`, `rf_reg`,

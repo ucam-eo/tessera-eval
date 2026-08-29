@@ -740,7 +740,11 @@ def learning_curve(
     ):
         if event["type"] == "progress":
             for name in model_list:
-                m = event["classifiers"][name]
+                # A model can be dropped by the engine (e.g. spatial models
+                # with a fixed test set) and then has no entry to print.
+                m = event["classifiers"].get(name)
+                if m is None:
+                    continue
                 if task == "regression":
                     print(
                         f"  {event['pct']:>3}% [{name}] R² {m['mean_r2']:.3f} | "

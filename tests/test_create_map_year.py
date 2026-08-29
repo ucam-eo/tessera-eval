@@ -55,22 +55,17 @@ class _FakeGeoTessera:
 
         return gen()
 
-    def fetch_mosaic_for_region(
-        self, bbox, year=2024, target_crs="EPSG:4326", auto_download=True, progress_callback=None
-    ):
-        # create_map()'s NPY fallback calls this directly now, not
-        # fetch_embeddings/registry.load_blocks_for_region -- seen_years
-        # tracking moves here to match the path actually exercised.
-        self.seen_years.append(year)
-        emb = np.full((16, 16, EMBED_DIM), float(year), dtype=np.float32)
-        transform = Affine(0.001, 0, 16.6, 0, -0.001, 48.25)
-        return emb, transform, target_crs
+    def fetch_mosaic_for_region(self, *args, **kwargs):
+        raise AssertionError(
+            "create_map must not use fetch_mosaic_for_region: it reprojects "
+            "embeddings before prediction"
+        )
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "get_zarr", lambda: None)  # force the NPY fallback path
+    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
 

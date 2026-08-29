@@ -7,6 +7,11 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 
+# Models that train on precomputed neighbourhood features rather than plain
+# per-pixel vectors. The single source of truth for every "is this a spatial
+# model" decision (feature extraction, fixed-test-set skips, map support).
+SPATIAL_MODELS = ("spatial_mlp", "spatial_mlp_5x5")
+
 
 def _strip_variant_suffix(name):
     """Strip hyperparameter variant suffix (e.g., 'mlp_v2' -> 'mlp').
@@ -88,7 +93,7 @@ def make_classifier(name, params=None):
             max_iter=int(p.get("max_iter", 200)),
             random_state=42,
         )
-    elif base_name in ("spatial_mlp", "spatial_mlp_5x5"):
+    elif base_name in SPATIAL_MODELS:
         default_layers = "256,128" if base_name == "spatial_mlp" else "512,256"
         default_iter = 300 if base_name == "spatial_mlp" else 400
         layers_str = p.get("hidden_layers", default_layers)
@@ -272,7 +277,7 @@ def make_regressor(name, params=None):
             max_iter=int(p.get("max_iter", 200)),
             random_state=42,
         )
-    elif base_name in ("spatial_mlp", "spatial_mlp_5x5"):
+    elif base_name in SPATIAL_MODELS:
         # Deliberately no "_reg" suffix, unlike every other regressor here --
         # "spatial" describes which precomputed feature array (3x3 or 5x5
         # neighbourhood-augmented embeddings) this trains on, which is

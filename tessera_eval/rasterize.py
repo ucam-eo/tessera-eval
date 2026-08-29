@@ -119,18 +119,69 @@ def align_raster_to_grid(
 
     aligned = np.full((height, width), np.nan, dtype=np.float64)
     with rasterio.open(raster_path) as src:
-        reproject(
-            source=rasterio.band(src, band),
-            destination=aligned,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            src_nodata=src.nodata,
-            dst_transform=transform,
-            dst_crs=crs,
-            dst_nodata=np.nan,
-            resampling=resampling_enum,
-        )
-    for v in nodata_values:
-        aligned[aligned == v] = np.nan
+        if nodata_values:
+            # Sentinels must become nodata before resampling: bilinear would
+            # otherwise blend them into neighbouring pixels, producing large
+            # in-between values that no longer match the sentinel exactly.
+            source, src_transform = _read_window_with_sentinels_masked(
+                src, band, transform, crs, width, height, nodata_values
+            )
+            if source is None:
+                return aligned
+            reproject(
+                source=source,
+                destination=aligned,
+                src_transform=src_transform,
+                src_crs=src.crs,
+                src_nodata=np.nan,
+                dst_transform=transform,
+                dst_crs=crs,
+                dst_nodata=np.nan,
+                resampling=resampling_enum,
+            )
+        else:
+            reproject(
+                source=rasterio.band(src, band),
+                destination=aligned,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                src_nodata=src.nodata,
+                dst_transform=transform,
+                dst_crs=crs,
+                dst_nodata=np.nan,
+                resampling=resampling_enum,
+            )
 
     return aligned
+
+
+def _read_window_with_sentinels_masked(src, band, transform, crs, width, height, nodata_values):
+    """Read the part of *src* covering the destination grid, with the
+    raster's declared nodata and the extra sentinel values converted to NaN.
+
+    Reading only the covering window (plus a small interpolation margin)
+    keeps memory bounded by the destination grid, not the source raster.
+    Returns (data, window_transform), or (None, None) when the destination
+    grid lies entirely outside the raster.
+    """
+    import rasterio
+    from rasterio.transform import array_bounds
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import Window, from_bounds
+
+    dst_bounds = array_bounds(height, width, transform)
+    src_bounds = transform_bounds(crs, src.crs, *dst_bounds)
+    window = from_bounds(*src_bounds, transform=src.transform)
+    window = Window(window.col_off - 2, window.row_off - 2, window.width + 4, window.height + 4)
+    try:
+        window = window.intersection(Window(0, 0, src.width, src.height))
+    except rasterio.errors.WindowError:
+        return None, None
+    window = window.round_offsets().round_lengths()
+    if window.width < 1 or window.height < 1:
+        return None, None
+
+    data = src.read(band, window=window, masked=True).astype(np.float64).filled(np.nan)
+    for v in nodata_values:
+        data[data == v] = np.nan
+    return data, src.window_transform(window)

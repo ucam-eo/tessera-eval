@@ -18,6 +18,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
 from tessera_eval.classify import (
+    SPATIAL_MODELS,
     _strip_variant_suffix,
     augment_spatial,
     make_classifier,
@@ -210,6 +211,26 @@ def run_learning_curve(
     # In this mode, vectors/labels are the train-only pool.
     spatial_split = test_vectors is not None and test_labels is not None
 
+    if spatial_split:
+        # No neighbourhood features exist for the fixed test set, so these
+        # models cannot be evaluated against it. They used to fall back to a
+        # random split of their own training pixels, quietly reporting
+        # optimistic scores next to the honestly held-out ones.
+        unsupported = [n for n in classifier_names if _strip_variant_suffix(n) in SPATIAL_MODELS]
+        if unsupported:
+            logger.warning(
+                "Skipping %s: spatial models are not supported with a separate test set",
+                ", ".join(unsupported),
+            )
+            yield {
+                "type": "classifier_status",
+                "message": (
+                    ", ".join(unsupported)
+                    + " skipped — spatial models are not supported with a separate test set"
+                ),
+            }
+            classifier_names = [n for n in classifier_names if n not in unsupported]
+
     n_samples = len(labels)
 
     # n_classes / per-class indices / confusion matrices only make sense for
@@ -376,13 +397,6 @@ def run_learning_curve(
                         X_tr, y_tr_aug = augment_spatial(
                             X_tr, y_train_sp, window=3, dim=vectors.shape[1]
                         )
-                    elif spatial_split:
-                        # Spatial split: no test_idx, use fixed test set
-                        X_tr, X_te = spatial_vectors[train_idx], X_test
-                        X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train, window=3, dim=vectors.shape[1]
-                        )
-                        y_test = test_labels
                     else:
                         X_tr, X_te = spatial_vectors[train_idx], spatial_vectors[test_idx]
                         X_tr, y_tr_aug = augment_spatial(
@@ -406,12 +420,6 @@ def run_learning_curve(
                         X_tr, y_tr_aug = augment_spatial(
                             X_tr, y_train_sp, window=5, dim=vectors.shape[1]
                         )
-                    elif spatial_split:
-                        X_tr, X_te = sp_vecs[train_idx], X_test
-                        X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train, window=5, dim=vectors.shape[1]
-                        )
-                        y_test = test_labels
                     else:
                         X_tr, X_te = sp_vecs[train_idx], sp_vecs[test_idx]
                         X_tr, y_tr_aug = augment_spatial(
@@ -701,7 +709,10 @@ def evaluate(
     """Run evaluation and collect all results (non-streaming).
 
     Convenience wrapper around run_learning_curve that collects all events
-    and returns a Results object.
+    and returns a Results object. run_learning_curve works in percentages
+    of the labelled data, so the requested sizes are converted, capped at
+    80% (the largest training share a random split can use), and
+    deduplicated -- sizes at or above 80% of the data all map to that cap.
 
     Args:
         vectors: float32 array, shape (N, dim)
@@ -726,6 +737,9 @@ def evaluate(
         if not training_sizes or training_sizes[-1] < max_train:
             training_sizes.append(max_train)
 
+    n_samples = len(labels)
+    training_pcts = sorted({min(80.0, 100.0 * s / n_samples) for s in training_sizes if s > 0})
+
     progress_events = []
     confusion_matrices = {}
 
@@ -733,7 +747,7 @@ def evaluate(
         vectors,
         labels,
         classifiers,
-        training_sizes,
+        training_pcts,
         repeats,
         classifier_params,
         spatial_vectors,
@@ -761,7 +775,7 @@ class Results:
         lines = [f"{'Size':>8}  " + "  ".join(f"{n:>12}" for n in self.classifiers)]
         lines.append("-" * len(lines[0]))
         for event in self.progress:
-            cols = [f"{event['size']:>8}"]
+            cols = [f"{event['pixel_train_count']:>8}"]
             for name in self.classifiers:
                 s = event["classifiers"].get(name, {})
                 cols.append(f"  {s.get('mean_f1', 0):.3f} ± {s.get('std_f1', 0):.3f}")

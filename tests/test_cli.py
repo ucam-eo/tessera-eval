@@ -443,3 +443,23 @@ class TestTestYear:
         )
         assert result.exit_code != 0
         assert "requires --test-data" in result.output
+
+
+class TestLearningCurveDroppedModels:
+    def test_progress_lines_tolerate_models_dropped_by_the_engine(
+        self, classification_npz, monkeypatch
+    ):
+        """run_learning_curve drops models it cannot evaluate (e.g. spatial
+        models with a fixed test set) from its progress events; the CLI must
+        print the models that ran rather than crash on the missing key."""
+
+        def _stub(*args, **kwargs):
+            yield {"type": "classifier_status", "message": "spatial_mlp skipped"}
+            yield {"type": "progress", "pct": 10, "classifiers": {"rf": {"mean_f1": 0.9}}}
+
+        monkeypatch.setattr("tessera_eval.cli.run_learning_curve", _stub)
+        result = runner.invoke(
+            app, ["learning-curve", "--models", "rf,spatial_mlp", "--training-pcts", "10"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "rf" in result.output

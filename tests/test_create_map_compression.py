@@ -1,0 +1,78 @@
+"""Generated map GeoTIFFs must actually be compressed.
+
+The GeoTIFF was written with compress="lz4", which is not a compression
+method GeoTIFF supports.  GDAL ignores the unknown value without an error,
+so every map was silently written uncompressed.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+
+import numpy as np
+import pytest
+import rasterio
+from affine import Affine
+
+import tessera_eval.server as srv
+
+EMBED_DIM = 8
+
+
+class _FakeRegistry:
+    def load_blocks_for_region(self, bbox, year):
+        return [(year, 16.62, 48.22)]
+
+
+class _FakeGeoTessera:
+    def __init__(self, embeddings_dir=None):
+        self.registry = _FakeRegistry()
+
+    def fetch_embeddings(self, tiles):
+        def gen():
+            for yr, _lon, _lat in tiles:
+                emb = np.full((16, 16, EMBED_DIM), float(yr), dtype=np.float32)
+                transform = Affine(0.001, 0, 16.6, 0, -0.001, 48.25)
+                yield (None, None, None, emb, "EPSG:4326", transform)
+
+        return gen()
+
+
+@pytest.fixture
+def client(monkeypatch):
+    srv.app.config["TESTING"] = True
+    monkeypatch.setattr(srv, "_get_zarr", lambda: None)
+    monkeypatch.setattr(srv, "_geotessera_instance", None)
+    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+
+    rng = np.random.RandomState(0)
+    n = 50
+    vectors = rng.rand(n, EMBED_DIM).astype(np.float32)
+    labels = rng.randint(0, 2, size=n).astype(np.int32)
+    monkeypatch.setattr(
+        srv,
+        "_tile_cache",
+        {
+            "key": ("habitat", 2024, 2024, "equal"),
+            "vectors": vectors,
+            "labels": labels,
+            "class_names": ["grass", "water"],
+            "_model_params": {},
+        },
+    )
+    monkeypatch.setattr(srv, "_generated_maps", {})
+    return srv.app.test_client()
+
+
+def test_map_geotiff_is_written_with_real_compression(client):
+    body = {"classifier": "rf", "map_bboxes": [[48.2, 16.6, 48.25, 16.65]]}
+    resp = client.post("/api/evaluation/create-map", json=body)
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.text.strip().splitlines()]
+    ready = next(e for e in events if e["event"] == "map_ready")
+
+    download = client.get(ready["download_url"])
+    assert download.status_code == 200
+    with rasterio.open(io.BytesIO(download.data)) as ds:
+        assert ds.compression is not None, "map GeoTIFF was written uncompressed"

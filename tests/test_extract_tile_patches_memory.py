@@ -46,7 +46,7 @@ def test_extract_tile_patches_copies_out_of_the_source_tile(monkeypatch):
     """Every patch in unet_patches must be a standalone array (base is None),
     not a view still anchored to the full per-tile embedding array -- even for
     an all-finite patch (the no-NaN branch is exactly what used to leak)."""
-    monkeypatch.setattr("tessera_eval.server.get_zarr", lambda: None)  # force NPY path
+    monkeypatch.setattr("tessera_eval.server._get_zarr", lambda: None)  # force NPY path
 
     tile_size_px, dim = 300, 8
     tlon, tlat, year = 10.05, 45.05, 2024

@@ -24,6 +24,8 @@ import numpy as np
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
+from tessera_eval.classify import SPATIAL_MODELS
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -64,6 +66,7 @@ _tile_cache = {
 _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
 _geotessera_instance = None  # cached to avoid 10-30s registry init per run
+_zarr_instance = None  # cached GeoTesseraZarr handle; False = tried and failed
 _cancel_flag = None  # threading.Event, set when user cancels
 # Shared across every proxy() call so the TCP+TLS connection to _hosted_url is
 # kept alive and reused (requests' connection-pooling adapter), instead of a
@@ -74,6 +77,8 @@ _proxy_session = requests.Session()
 
 FLUSH_PAD = 18 * 1024  # pad NDJSON lines to force Waitress flush
 
+ZARR_CACHE_MAX_BYTES = 20 * 1024**3  # bound the on-disk zarr chunk cache
+
 
 def _get_cache_dir():
     """Return the cache directory, creating it if needed."""
@@ -82,6 +87,53 @@ def _get_cache_dir():
         _tile_disk_cache_dir = Path.home() / ".cache" / "tessera-eval"
     _tile_disk_cache_dir.mkdir(parents=True, exist_ok=True)
     return _tile_disk_cache_dir
+
+
+def _get_zarr():
+    """Return a cached GeoTesseraZarr handle, or None when zarr is unavailable.
+
+    The store is opened once per process and the outcome is cached, failure
+    included; callers fall back to the NPY tile path on None. Chunk reads
+    are cached on disk alongside the NPY tile cache.
+    """
+    global _zarr_instance
+    if _zarr_instance is None:
+        try:
+            from geotessera.store import GeoTesseraZarr
+
+            inst = GeoTesseraZarr(
+                cache_dir=str(_get_cache_dir() / "zarr"),
+                cache_max_size=ZARR_CACHE_MAX_BYTES,
+            )
+            if getattr(inst, "years", None):
+                logger.info("GeoTesseraZarr available: %s", inst.url)
+                _zarr_instance = inst
+            else:
+                logger.info("Zarr store has no tiles; using NPY tiles")
+                _zarr_instance = False
+        except Exception as e:
+            logger.info("Zarr store unavailable (%s); using NPY tiles", e)
+            _zarr_instance = False
+    return _zarr_instance or None
+
+
+def _probe_zarr_coverage(gtz, bounds, year):
+    """True when the zarr store has a valid embedding for *year* at the
+    centre of *bounds* (west, south, east, north).
+
+    geotessera's single-pixel probe distinguishes genuine coverage from
+    water and from areas not yet produced; anything but a valid embedding
+    sends the caller to the NPY tile path.
+    """
+    try:
+        if year not in getattr(gtz, "years", []):
+            return False
+        cx = (bounds[0] + bounds[2]) / 2
+        cy = (bounds[1] + bounds[3]) / 2
+        _vec, status = gtz.probe(cx, cy, year)
+        return status == "valid"
+    except Exception:
+        return False
 
 
 def _result_cache_path(field, year, gdf_hash, sampling="equal"):
@@ -116,9 +168,6 @@ def _load_cached_result(field, year, gdf, sampling="equal"):
         except Exception:
             path.unlink(missing_ok=True)
     return None
-
-
-from tessera_zarr_utils import get_zarr, probe_zarr_coverage
 
 
 def _sample_points_within_budget(rows_gdf, budget, rng):
@@ -221,8 +270,8 @@ def _extract_tile_patches(
 
     # Try zarr — but verify coverage with a single-pixel probe first,
     # since the zarr store only has 2025 for some regions.
-    gtz = get_zarr()
-    use_zarr = gtz is not None and probe_zarr_coverage(gtz, bounds, year)
+    gtz = _get_zarr()
+    use_zarr = gtz is not None and _probe_zarr_coverage(gtz, bounds, year)
     if logger:
         logger.info(
             "Using %s for tile reads", "zarr (fast)" if use_zarr else "NPY tiles with local cache"
@@ -826,9 +875,18 @@ def run_large_area():
     def _base_name(name):
         return _re.sub(r"_v\d+$", "", name)
 
+    # A fixed test set (spatial bboxes, or a different test year) has no
+    # neighbourhood features, so spatial models are skipped for such runs
+    # and their (expensive) feature extraction is not worth doing.
+    has_fixed_test_set = bool(train_bboxes or test_bboxes) or test_year != train_year
+
     # Determine which spatial features are needed (check base names)
-    needs_spatial_3x3 = any(_base_name(n) == "spatial_mlp" for n in model_names)
-    needs_spatial_5x5 = any(_base_name(n) == "spatial_mlp_5x5" for n in model_names)
+    needs_spatial_3x3 = (
+        any(_base_name(n) == "spatial_mlp" for n in model_names) and not has_fixed_test_set
+    )
+    needs_spatial_5x5 = (
+        any(_base_name(n) == "spatial_mlp_5x5" for n in model_names) and not has_fixed_test_set
+    )
     needs_unet = any(_base_name(n) == "unet" for n in model_names)
 
     def stream():
@@ -869,7 +927,7 @@ def run_large_area():
         # sample-point coordinates (to re-fetch the test role at test_year)
         # that spatial bbox splitting needs, so it must force the same
         # reload-if-missing / skip-disk-cache-shortcut behavior below.
-        has_spatial_bboxes = bool(train_bboxes or test_bboxes) or test_year != train_year
+        has_spatial_bboxes = has_fixed_test_set
         if _tile_cache["key"] == cache_key and _tile_cache["vectors"] is not None:
             vectors = _tile_cache["vectors"]
             labels = _tile_cache["labels"]
@@ -1721,7 +1779,21 @@ def run_large_area():
                         + "\n"
                     )
                     continue
-            if bn in ("spatial_mlp", "spatial_mlp_5x5"):
+            if bn in SPATIAL_MODELS:
+                if has_fixed_test_set:
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "status",
+                                "message": (
+                                    f"{name} skipped — spatial models are not supported "
+                                    "with a separate test region or test year"
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
+                    continue
                 if (bn == "spatial_mlp" and spatial_3x3 is None) or (
                     bn == "spatial_mlp_5x5" and spatial_5x5 is None
                 ):
@@ -2017,7 +2089,7 @@ def train_models():
                             + "\n"
                         )
                         continue
-                elif _bn in ("spatial_mlp", "spatial_mlp_5x5") and not is_classification:
+                elif _bn in SPATIAL_MODELS and not is_classification:
                     # No regressor variant exists for spatial-context models yet.
                     yield (
                         json.dumps(
@@ -2098,6 +2170,132 @@ def download_model(name):
     return send_file(path, as_attachment=True, download_name=f"{name}_model{ext}")
 
 
+def _predict_raster(clf, emb, is_classification):
+    """Predict every pixel of an (H, W, C) embedding block.
+
+    Returns a 2D raster: 1-based class IDs with 0 as nodata for
+    classification, or real values with NaN as nodata for regression.
+    """
+    h, w, c = emb.shape
+    flat = emb.reshape(-1, c)
+    nan_mask = np.isnan(flat).any(axis=1)
+    if is_classification:
+        predictions = np.zeros(flat.shape[0], dtype=np.uint8)
+    else:
+        predictions = np.full(flat.shape[0], np.nan, dtype=np.float32)
+    if (~nan_mask).sum() > 0:
+        preds = clf.predict(flat[~nan_mask].astype(np.float32))
+        if is_classification:
+            predictions[~nan_mask] = preds.astype(np.uint8) + 1
+        else:
+            predictions[~nan_mask] = preds.astype(np.float32)
+    return predictions.reshape(h, w)
+
+
+def _crop_tile_to_bbox(emb, transform, crs, bbox):
+    """Crop an (H, W, C) tile, on its native grid, to the part inside a
+    lon/lat bounding box (west, south, east, north).
+
+    Returns (cropped, transform), or (None, None) when the tile lies
+    entirely outside the box.
+    """
+    import rasterio.errors
+    import rasterio.windows
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import Window, from_bounds
+
+    h, w = emb.shape[:2]
+    west, south, east, north = bbox
+    bounds = transform_bounds("EPSG:4326", crs, west, south, east, north)
+    window = from_bounds(*bounds, transform=transform)
+    try:
+        window = window.intersection(Window(0, 0, w, h))
+    except rasterio.errors.WindowError:
+        return None, None
+    r0 = max(0, int(window.row_off))
+    c0 = max(0, int(window.col_off))
+    r1 = min(h, int(np.ceil(window.row_off + window.height)))
+    c1 = min(w, int(np.ceil(window.col_off + window.width)))
+    if r1 <= r0 or c1 <= c0:
+        return None, None
+    cropped_window = Window(c0, r0, c1 - c0, r1 - r0)
+    return emb[r0:r1, c0:c1], rasterio.windows.transform(cropped_window, transform)
+
+
+def _reproject_prediction(arr, transform, crs, dst_crs, nodata):
+    """Reproject one 2D prediction raster onto dst_crs.
+
+    Nearest-neighbour resampling only: class IDs must not be blended, and
+    regression values should stay actual model outputs rather than
+    invented in-between values.
+    """
+    from rasterio.transform import array_bounds
+    from rasterio.warp import Resampling, calculate_default_transform, reproject
+
+    h, w = arr.shape
+    dst_transform, dst_w, dst_h = calculate_default_transform(
+        crs, dst_crs, w, h, *array_bounds(h, w, transform)
+    )
+    out = np.full((dst_h, dst_w), nodata, dtype=arr.dtype)
+    reproject(
+        source=arr,
+        destination=out,
+        src_transform=transform,
+        src_crs=crs,
+        src_nodata=nodata,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        dst_nodata=nodata,
+        resampling=Resampling.nearest,
+    )
+    return out, dst_transform
+
+
+def _merge_prediction_rasters(rasters, out_dtype, out_nodata):
+    """Merge per-block prediction rasters into one (array, transform, crs).
+
+    Blocks arrive on the native grid they were predicted on, so a map area
+    spanning more than one UTM zone yields blocks in different CRSs.
+    Blocks in a minority CRS are reprojected -- predictions only, never
+    embeddings -- onto the most common CRS before merging.
+    """
+    from collections import Counter
+
+    import rasterio.io
+    from rasterio.merge import merge as _rasterio_merge
+
+    if len(rasters) == 1:
+        return rasters[0]
+
+    counts = Counter(str(crs) for _, _, crs in rasters)
+    target_str = counts.most_common(1)[0][0]
+    target_crs = next(crs for _, _, crs in rasters if str(crs) == target_str)
+
+    datasets = []
+    try:
+        for arr, transform, crs in rasters:
+            if str(crs) != target_str:
+                arr, transform = _reproject_prediction(arr, transform, crs, target_crs, out_nodata)
+            memfile = rasterio.io.MemoryFile()
+            ds = memfile.open(
+                driver="GTiff",
+                height=arr.shape[0],
+                width=arr.shape[1],
+                count=1,
+                dtype=out_dtype,
+                crs=target_crs,
+                transform=transform,
+                nodata=out_nodata,
+            )
+            ds.write(arr.astype(out_dtype), 1)
+            datasets.append(ds)
+        mosaic, out_transform = _rasterio_merge(datasets, nodata=out_nodata)
+    finally:
+        for ds in datasets:
+            ds.close()
+    return mosaic[0], out_transform, target_crs
+
+
 @app.route("/api/evaluation/create-map", methods=["POST"])
 def create_map():
     """Train classifier on all cached data, predict every pixel in map bboxes, produce GeoTIFF.
@@ -2157,7 +2355,7 @@ def create_map():
     import re as _re
 
     base_name = _re.sub(r"_v\d+$", "", classifier_name)
-    unsupported = ("spatial_mlp", "spatial_mlp_5x5", "unet")
+    unsupported = SPATIAL_MODELS + ("unet",)
     if base_name in unsupported:
         return jsonify(
             {
@@ -2302,35 +2500,11 @@ def create_map():
                 + "\n"
             )
 
-            # Split bbox into 0.1 deg chunks to manage memory
-            CHUNK_SIZE = 0.1
-            chunk_lons = []
-            lon = west
-            while lon < east:
-                chunk_lons.append((lon, min(lon + CHUNK_SIZE, east)))
-                lon += CHUNK_SIZE
-            chunk_lats = []
-            lat = south
-            while lat < north:
-                chunk_lats.append((lat, min(lat + CHUNK_SIZE, north)))
-                lat += CHUNK_SIZE
-
-            total_chunks = len(chunk_lons) * len(chunk_lats)
-            yield (
-                json.dumps(
-                    {
-                        "event": "status",
-                        "message": f"Map area {bbox_idx + 1}: {total_chunks} chunks ({len(chunk_lons)} x {len(chunk_lats)})",
-                    }
-                )
-                + "\n"
-            )
+            bbox_lonlat = (west, south, east, north)
 
             # Probe zarr coverage
-            gtz = get_zarr()
-            use_zarr = gtz is not None and probe_zarr_coverage(
-                gtz, (west, south, east, north), map_year
-            )
+            gtz = _get_zarr()
+            use_zarr = gtz is not None and _probe_zarr_coverage(gtz, bbox_lonlat, map_year)
 
             yield (
                 json.dumps(
@@ -2342,98 +2516,148 @@ def create_map():
                 + "\n"
             )
 
-            # We'll collect chunk arrays and merge at the end.
-            # To build the final GeoTIFF, we need to know the CRS and resolution.
-            # We get this from the first chunk that returns data.
-            chunk_results = []  # list of (predicted_2d, transform, crs, chunk_bbox)
-            chunk_counter = 0
+            # Embeddings are predicted on whatever native grid they arrive
+            # on; only the resulting prediction rasters are reprojected, at
+            # merge time, if the area spans more than one UTM zone.
+            chunk_results = []  # list of (predicted_2d, transform, crs)
 
-            for lon_start, lon_end in chunk_lons:
-                for lat_start, lat_end in chunk_lats:
+            if use_zarr:
+                # Split bbox into 0.1 deg chunks to manage memory. Chunks
+                # additionally break at UTM zone edges (6-degree multiples):
+                # the store serves a zone-straddling bbox from the centre
+                # zone alone, silently clipping at the edge, which would
+                # leave a nodata strip along the boundary.
+                CHUNK_SIZE = 0.1
+                chunk_lons = []
+                lon = west
+                while lon < east:
+                    zone_edge = (np.floor(lon / 6.0) + 1) * 6.0
+                    chunk_lons.append((lon, min(lon + CHUNK_SIZE, zone_edge, east)))
+                    lon = chunk_lons[-1][1]
+                chunk_lats = []
+                lat = south
+                while lat < north:
+                    chunk_lats.append((lat, min(lat + CHUNK_SIZE, north)))
+                    lat += CHUNK_SIZE
+
+                total_chunks = len(chunk_lons) * len(chunk_lats)
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": f"Map area {bbox_idx + 1}: {total_chunks} chunks ({len(chunk_lons)} x {len(chunk_lats)})",
+                        }
+                    )
+                    + "\n"
+                )
+                chunk_counter = 0
+
+                for lon_start, lon_end in chunk_lons:
+                    for lat_start, lat_end in chunk_lats:
+                        if _cancelled():
+                            yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
+                            return
+
+                        chunk_counter += 1
+                        yield (
+                            json.dumps(
+                                {
+                                    "event": "map_progress",
+                                    "bbox_idx": bbox_idx,
+                                    "chunk": chunk_counter,
+                                    "total_chunks": total_chunks,
+                                    "message": f"Predicting chunk {chunk_counter}/{total_chunks}",
+                                }
+                            )
+                            + "\n"
+                        )
+
+                        chunk_bbox = (lon_start, lat_start, lon_end, lat_end)
+                        try:
+                            emb, transform, crs = gtz.read_region(chunk_bbox, map_year)
+                            if emb is None or emb.size == 0:
+                                continue
+                            predicted_2d = _predict_raster(clf, emb, is_classification)
+                            chunk_results.append((predicted_2d, transform, crs))
+                        except Exception as e:
+                            logger.warning("Chunk %d failed: %s", chunk_counter, e)
+                            yield (
+                                json.dumps(
+                                    {
+                                        "event": "status",
+                                        "message": f"Chunk {chunk_counter} failed: {e}",
+                                    }
+                                )
+                                + "\n"
+                            )
+                            continue
+            else:
+                # NPY fallback: one tile at a time, on each tile's own
+                # native UTM grid, cropped to the map area.
+                try:
+                    tiles = list(gt.registry.load_blocks_for_region(bbox_lonlat, map_year))
+                except Exception as e:
+                    logger.warning("Tile listing failed for map area %d: %s", bbox_idx + 1, e)
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "message": f"Could not list tiles for map area {bbox_idx + 1}: {e}",
+                            }
+                        )
+                        + "\n"
+                    )
+                    continue
+                total_tiles = len(tiles)
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": f"Map area {bbox_idx + 1}: {total_tiles} tiles",
+                        }
+                    )
+                    + "\n"
+                )
+                tiles_gen = gt.fetch_embeddings(tiles)
+
+                for t_idx in range(total_tiles):
                     if _cancelled():
                         yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
                         return
 
-                    chunk_counter += 1
                     yield (
                         json.dumps(
                             {
                                 "event": "map_progress",
                                 "bbox_idx": bbox_idx,
-                                "chunk": chunk_counter,
-                                "total_chunks": total_chunks,
-                                "message": f"Predicting chunk {chunk_counter}/{total_chunks}",
+                                "chunk": t_idx + 1,
+                                "total_chunks": total_tiles,
+                                "message": f"Predicting tile {t_idx + 1}/{total_tiles}",
                             }
                         )
                         + "\n"
                     )
 
-                    chunk_bbox = (lon_start, lat_start, lon_end, lat_end)
-
                     try:
-                        if use_zarr:
-                            emb, transform, crs = gtz.read_region(chunk_bbox, map_year)
-                        else:
-                            # Fall back to NPY: fetch_mosaic_for_region handles
-                            # multi-tile merging *and* reprojection to a common
-                            # CRS internally -- confirmed necessary live (Louis
-                            # Driver): a chunk_bbox spanning multiple embedding
-                            # tiles can span multiple UTM zones (each tile's
-                            # native CRS), and the previous code here only
-                            # grabbed the *first* tile via next(tile_gen),
-                            # silently dropping the rest of the chunk, while
-                            # leaving different chunks in genuinely different
-                            # per-tile CRSs -- rasterio.merge.merge() then
-                            # raised "CRS mismatch with source" trying to
-                            # combine chunk_results at the end (only for
-                            # larger areas with enough chunks/tiles to hit a
-                            # zone boundary; small areas usually stayed within
-                            # one zone, which is why this wasn't caught
-                            # earlier). ValueError ("no tiles found") from an
-                            # empty chunk is handled by the except below, same
-                            # as any other per-chunk failure.
-                            emb, transform, crs = gt.fetch_mosaic_for_region(
-                                chunk_bbox, year=map_year, target_crs="EPSG:4326"
-                            )
-                            emb = emb.astype(np.float32)
-
-                        if emb is None or emb.size == 0:
+                        _, _, _, emb, crs, transform = next(tiles_gen)
+                        cropped, crop_transform = _crop_tile_to_bbox(
+                            emb, transform, crs, bbox_lonlat
+                        )
+                        if cropped is None:
                             continue
-
-                        h, w, c = emb.shape
-                        # Flatten to (N, 128), predict, reshape
-                        flat = emb.reshape(-1, c)
-
-                        # Identify valid (non-NaN) pixels
-                        nan_mask = np.isnan(flat).any(axis=1)
-                        if is_classification:
-                            predictions = np.zeros(flat.shape[0], dtype=np.uint8)
-                        else:
-                            # Real continuous values -- uint8 would truncate
-                            # them and collide 0-as-nodata with 0 as a real
-                            # height. NaN is the nodata sentinel instead.
-                            predictions = np.full(flat.shape[0], np.nan, dtype=np.float32)
-
-                        if (~nan_mask).sum() > 0:
-                            valid_flat = flat[~nan_mask].astype(np.float32)
-                            preds = clf.predict(valid_flat)
-                            if is_classification:
-                                # Class labels are 0-based from LabelEncoder.
-                                # Store as 1-based (0 = nodata).
-                                predictions[~nan_mask] = preds.astype(np.uint8) + 1
-                            else:
-                                predictions[~nan_mask] = preds.astype(np.float32)
-
-                        predicted_2d = predictions.reshape(h, w)
-                        chunk_results.append((predicted_2d, transform, crs, chunk_bbox))
-
+                        predicted_2d = _predict_raster(
+                            clf, np.asarray(cropped, dtype=np.float32), is_classification
+                        )
+                        chunk_results.append((predicted_2d, crop_transform, crs))
+                    except StopIteration:
+                        break
                     except Exception as e:
-                        logger.warning("Chunk %d failed: %s", chunk_counter, e)
+                        logger.warning("Tile %d failed: %s", t_idx + 1, e)
                         yield (
                             json.dumps(
                                 {
                                     "event": "status",
-                                    "message": f"Chunk {chunk_counter} failed: {e}",
+                                    "message": f"Tile {t_idx + 1} failed: {e}",
                                 }
                             )
                             + "\n"
@@ -2465,8 +2689,6 @@ def create_map():
 
             try:
                 import rasterio
-                import rasterio.io
-                from rasterio.merge import merge as _rasterio_merge
 
                 # Classification: 1-based class IDs, 0 = nodata, fits uint8.
                 # Regression: real continuous values (e.g. heights), NaN =
@@ -2474,36 +2696,9 @@ def create_map():
                 out_dtype = "uint8" if is_classification else "float32"
                 out_nodata = 0 if is_classification else np.nan
 
-                if len(chunk_results) == 1:
-                    # Single chunk — write directly
-                    predicted_2d, transform, crs, _ = chunk_results[0]
-                    out_arr = predicted_2d
-                    out_transform = transform
-                    out_crs = crs
-                else:
-                    # Multiple chunks — merge using rasterio in-memory datasets
-                    datasets = []
-                    for predicted_2d, transform, crs, _ in chunk_results:
-                        memfile = rasterio.io.MemoryFile()
-                        ds = memfile.open(
-                            driver="GTiff",
-                            height=predicted_2d.shape[0],
-                            width=predicted_2d.shape[1],
-                            count=1,
-                            dtype=out_dtype,
-                            crs=crs,
-                            transform=transform,
-                            nodata=out_nodata,
-                        )
-                        ds.write(predicted_2d, 1)
-                        datasets.append(ds)
-
-                    mosaic, out_transform = _rasterio_merge(datasets, nodata=out_nodata)
-                    out_arr = mosaic[0]
-                    out_crs = chunk_results[0][2]
-
-                    for ds in datasets:
-                        ds.close()
+                out_arr, out_transform, out_crs = _merge_prediction_rasters(
+                    chunk_results, out_dtype, out_nodata
+                )
 
                 # Write final GeoTIFF. run_id makes this URL unique per
                 # create_map() call -- see the comment where it's generated.
@@ -2524,7 +2719,7 @@ def create_map():
                     crs=out_crs,
                     transform=out_transform,
                     nodata=out_nodata,
-                    compress="lz4",
+                    compress="deflate",
                 ) as dst:
                     dst.write(out_arr, 1)
                     # Store class names as tags (classification) -- empty for
@@ -2552,6 +2747,7 @@ def create_map():
                             "download_url": f"/api/evaluation/download-map/{map_name}",
                             "width": out_arr.shape[1],
                             "height": out_arr.shape[0],
+                            "crs": str(out_crs),
                             "n_classes": len(class_names),
                             "train_year": train_year,
                             "map_year": map_year,
