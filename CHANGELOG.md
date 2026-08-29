@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.0]
+
 ### Fixed
 - `create_map` now predicts on the embeddings' native UTM grids and
   reprojects only the resulting prediction rasters (nearest-neighbour)
