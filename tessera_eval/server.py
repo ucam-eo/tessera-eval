@@ -2171,11 +2171,17 @@ def download_model(name):
     return send_file(path, as_attachment=True, download_name=f"{name}_model{ext}")
 
 
-def _predict_raster(clf, emb, is_classification):
+def _predict_raster(clf, emb, is_classification, clip_range=None):
     """Predict every pixel of an (H, W, C) embedding block.
 
     Returns a 2D raster: 1-based class IDs with 0 as nodata for
     classification, or real values with NaN as nodata for regression.
+
+    clip_range: optional (lo, hi) for regression. MLP/XGBoost regressors can
+    extrapolate well past the training targets' span (negative heights,
+    impossible biomass) on embeddings unlike anything they were trained on;
+    a dense map of those is misleading, so clamp predictions to the observed
+    range. None (the default) leaves predictions untouched.
     """
     h, w, c = emb.shape
     flat = emb.reshape(-1, c)
@@ -2189,7 +2195,10 @@ def _predict_raster(clf, emb, is_classification):
         if is_classification:
             predictions[~nan_mask] = preds.astype(np.uint8) + 1
         else:
-            predictions[~nan_mask] = preds.astype(np.float32)
+            preds = preds.astype(np.float32)
+            if clip_range is not None:
+                preds = np.clip(preds, clip_range[0], clip_range[1])
+            predictions[~nan_mask] = preds
     return predictions.reshape(h, w)
 
 
@@ -2402,6 +2411,26 @@ def create_map():
             )
             return
 
+        # Regression maps are clamped to the training targets' span -- see
+        # _predict_raster's docstring. Recorded in the GeoTIFF tags and
+        # surfaced to the UI so a clamped map isn't mistaken for the model
+        # genuinely predicting flat values at the extremes.
+        reg_clip = None
+        if not is_classification:
+            reg_clip = (float(np.min(labels)), float(np.max(labels)))
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            f"Regression output clamped to the training range "
+                            f"[{reg_clip[0]:.4g}, {reg_clip[1]:.4g}]"
+                        ),
+                    }
+                )
+                + "\n"
+            )
+
         yield (
             json.dumps(
                 {"event": "status", "message": "Classifier trained. Predicting map areas..."}
@@ -2578,7 +2607,9 @@ def create_map():
                             emb, transform, crs = gtz.read_region(chunk_bbox, map_year)
                             if emb is None or emb.size == 0:
                                 continue
-                            predicted_2d = _predict_raster(clf, emb, is_classification)
+                            predicted_2d = _predict_raster(
+                                clf, emb, is_classification, clip_range=reg_clip
+                            )
                             chunk_results.append((predicted_2d, transform, crs))
                         except Exception as e:
                             logger.warning("Chunk %d failed: %s", chunk_counter, e)
@@ -2647,7 +2678,10 @@ def create_map():
                         if cropped is None:
                             continue
                         predicted_2d = _predict_raster(
-                            clf, np.asarray(cropped, dtype=np.float32), is_classification
+                            clf,
+                            np.asarray(cropped, dtype=np.float32),
+                            is_classification,
+                            clip_range=reg_clip,
                         )
                         chunk_results.append((predicted_2d, crop_transform, crs))
                     except StopIteration:
@@ -2732,6 +2766,9 @@ def create_map():
                     tags["map_year"] = str(map_year)
                     if not is_classification:
                         tags["field"] = cache["key"][0] if cache.get("key") else ""
+                        if reg_clip is not None:
+                            tags["clamp_min"] = repr(reg_clip[0])
+                            tags["clamp_max"] = repr(reg_clip[1])
                     dst.update_tags(**tags)
 
                 _generated_maps[map_name] = tmp.name

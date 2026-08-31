@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.1]
+
+### Changed
+- Regression `create_map` output is now clamped to the training targets'
+  observed span `[min, max]`. MLP/XGBoost regressors extrapolate freely
+  (negative heights, impossible biomass) on embeddings unlike their
+  training set, and a dense raster of those extremes is misleading. The
+  clamp range is emitted as a status message and written to the GeoTIFF
+  as `clamp_min` / `clamp_max` tags. kNN/RF are unaffected (they can't
+  extrapolate). Scoring is *not* clamped.
+- `run_learning_curve` regression results now carry `oor_frac` (fraction
+  of the largest-percentage test predictions falling outside the training
+  span) and `train_range` `[min, max]` per model, for the UI to surface.
+  Predicted values and R²/RMSE/MAE are untouched.
+
 ## [1.8.0]
 
 ### Fixed

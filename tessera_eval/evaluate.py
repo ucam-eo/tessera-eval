@@ -254,6 +254,12 @@ def run_learning_curve(
         # _MAX_SCATTER_POINTS below) so a 100K+ pixel evaluation doesn't
         # blow up the SSE payload.
         scatter_accum = {name: {"y_true": [], "y_pred": []} for name in classifier_names}
+        # Fraction of test predictions falling outside the training targets'
+        # full span -- a plain honesty signal (RF/kNN can't do it, MLP/XGBoost
+        # can). Reported at the largest pct; never used to alter a score.
+        _y_full_lo = float(np.min(labels)) if len(labels) else 0.0
+        _y_full_hi = float(np.max(labels)) if len(labels) else 0.0
+        oor_accum = {name: [] for name in classifier_names}
 
     # Detect U-Net classifiers (use base name for type checks)
     has_unet = (
@@ -470,6 +476,12 @@ def run_learning_curve(
                         reg_scores[name]["r2"].append(m["r2"])
                         reg_scores[name]["rmse"].append(m["rmse"])
                         reg_scores[name]["mae"].append(m["mae"])
+                        yp = np.asarray(y_pred)
+                        oor_accum[name].append(
+                            float(np.mean((yp < _y_full_lo) | (yp > _y_full_hi)))
+                            if yp.size
+                            else 0.0
+                        )
                         if is_largest:
                             sc_true, sc_pred = _subsample_for_scatter(
                                 np.asarray(y_test), np.asarray(y_pred), rng
@@ -580,6 +592,14 @@ def run_learning_curve(
                                         reg_scores[unet_name]["r2"].append(m["r2"])
                                         reg_scores[unet_name]["rmse"].append(m["rmse"])
                                         reg_scores[unet_name]["mae"].append(m["mae"])
+                                        _ypu = np.asarray(y_pred)
+                                        oor_accum.setdefault(unet_name, []).append(
+                                            float(
+                                                np.mean((_ypu < _y_full_lo) | (_ypu > _y_full_hi))
+                                            )
+                                            if _ypu.size
+                                            else 0.0
+                                        )
                                         if is_largest:
                                             sc_true, sc_pred = _subsample_for_scatter(
                                                 y_true, y_pred, rng
@@ -639,6 +659,13 @@ def run_learning_curve(
                 }
                 if is_largest and scatter_accum.get(name, {}).get("y_true"):
                     pct_results[name]["scatter"] = scatter_accum[name]
+                if is_largest:
+                    oor = oor_accum.get(name, [])
+                    pct_results[name]["oor_frac"] = round(float(np.mean(oor)), 4) if oor else 0.0
+                    pct_results[name]["train_range"] = [
+                        round(_y_full_lo, 4),
+                        round(_y_full_hi, 4),
+                    ]
             if is_largest:
                 largest_pct_results = pct_results
 
