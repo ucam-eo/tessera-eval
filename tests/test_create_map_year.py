@@ -124,3 +124,25 @@ def test_map_year_override_fetches_the_requested_year_not_training_year(client, 
 
     status_messages = " ".join(e.get("message", "") for e in events if e["event"] == "status")
     assert "2025" in status_messages and "2018" in status_messages
+
+
+def test_map_ready_carries_an_in_browser_preview(client, monkeypatch):
+    """map_ready includes a lat/lon PNG + legend for the viewer to overlay
+    (feature 5). The GeoTIFF download is unaffected."""
+    fake = _FakeGeoTessera()
+    monkeypatch.setattr("geotessera.GeoTessera", lambda embeddings_dir=None: fake)
+
+    events = _run(client)
+    ready = next(e for e in events if e["event"] == "map_ready")
+
+    preview = ready["preview"]
+    assert preview is not None
+    assert preview["png"].startswith("data:image/png;base64,")
+    assert preview["is_classification"] is True
+    (south, west), (north, east) = preview["bounds"]
+    assert south < north and west < east
+    # class_names from the tile cache flow into the legend labels
+    labels = {item["label"] for item in preview["legend"]}
+    assert labels <= {"grass", "water"} and labels
+    # the .tif is still downloadable
+    assert ready["download_url"].endswith(ready["name"])

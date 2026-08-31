@@ -79,6 +79,36 @@ FLUSH_PAD = 18 * 1024  # pad NDJSON lines to force Waitress flush
 
 ZARR_CACHE_MAX_BYTES = 20 * 1024**3  # bound the on-disk zarr chunk cache
 
+# In-browser map preview (create_map): a small lat/lon PNG + legend the
+# viewer drops on the map as an L.imageOverlay, so a map can be eyeballed
+# without downloading the GeoTIFF and opening it in QGIS. The GeoTIFF is
+# still the real deliverable -- the preview is best-effort and its failure
+# never blocks a map.
+_PREVIEW_MAX_PX = 1024
+_CLASS_PREVIEW_PALETTE = (
+    "#e6194b",
+    "#3cb44b",
+    "#ffe119",
+    "#4363d8",
+    "#f58231",
+    "#911eb4",
+    "#46f0f0",
+    "#f032e6",
+    "#bcf60c",
+    "#fab1c0",
+    "#008080",
+    "#e6beff",
+    "#9a6324",
+    "#c8b900",
+    "#800000",
+    "#aaffc3",
+    "#808000",
+    "#ffd8b1",
+    "#000075",
+    "#808080",
+)
+_REG_PREVIEW_RAMP = ("#2b4abd", "#26b25c", "#ffe119", "#e63c3c")
+
 
 def _get_cache_dir():
     """Return the cache directory, creating it if needed."""
@@ -2306,6 +2336,106 @@ def _merge_prediction_rasters(rasters, out_dtype, out_nodata):
     return mosaic[0], out_transform, target_crs
 
 
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _render_map_preview(arr, transform, crs, is_classification, class_names, reg_clip):
+    """Best-effort lat/lon PNG preview of a prediction raster, plus a legend.
+
+    The viewer drops this on the map as an L.imageOverlay so a map can be
+    checked at a glance without downloading the GeoTIFF. Returns a dict
+    ({"png": data-URL, "bounds": [[s,w],[n,e]], "legend": ..., ...}) or
+    None -- any failure here is swallowed, the GeoTIFF is the real output.
+    """
+    try:
+        import base64
+
+        from rasterio.io import MemoryFile
+        from rasterio.transform import array_bounds
+        from rasterio.transform import from_bounds as _from_bounds
+        from rasterio.warp import Resampling, reproject, transform_bounds
+
+        h, w = arr.shape
+        left, bottom, right, top = array_bounds(h, w, transform)
+        west, south, east, north = transform_bounds(crs, "EPSG:4326", left, bottom, right, top)
+        span_x, span_y = east - west, north - south
+        if not (span_x > 0 and span_y > 0):
+            return None
+
+        if span_x >= span_y:
+            dst_w = min(_PREVIEW_MAX_PX, w)
+            dst_h = max(1, round(dst_w * span_y / span_x))
+        else:
+            dst_h = min(_PREVIEW_MAX_PX, h)
+            dst_w = max(1, round(dst_h * span_x / span_y))
+
+        dst_transform = _from_bounds(west, south, east, north, dst_w, dst_h)
+        src_nodata = 0 if is_classification else float("nan")
+        dst = np.full((dst_h, dst_w), src_nodata, dtype=arr.dtype)
+        reproject(
+            source=arr,
+            destination=dst,
+            src_transform=transform,
+            src_crs=crs,
+            src_nodata=src_nodata,
+            dst_transform=dst_transform,
+            dst_crs="EPSG:4326",
+            dst_nodata=src_nodata,
+            resampling=Resampling.nearest,
+        )
+
+        rgba = np.zeros((dst_h, dst_w, 4), dtype=np.uint8)
+        if is_classification:
+            legend = []
+            for cid in (int(v) for v in np.unique(dst)):
+                if cid == 0:
+                    continue
+                hexc = _CLASS_PREVIEW_PALETTE[(cid - 1) % len(_CLASS_PREVIEW_PALETTE)]
+                r, g, b = _hex_to_rgb(hexc)
+                rgba[dst == cid] = (r, g, b, 255)
+                label = class_names[cid - 1] if 0 <= cid - 1 < len(class_names) else f"Class {cid}"
+                legend.append({"value": cid, "label": label, "color": hexc})
+        else:
+            finite = np.isfinite(dst)
+            if reg_clip is not None:
+                lo, hi = reg_clip
+            elif finite.any():
+                lo, hi = float(np.nanmin(dst)), float(np.nanmax(dst))
+            else:
+                lo, hi = 0.0, 1.0
+            span = (hi - lo) or 1.0
+            t = np.clip((np.nan_to_num(dst, nan=lo) - lo) / span, 0.0, 1.0)
+            stops = np.array([_hex_to_rgb(c) for c in _REG_PREVIEW_RAMP], dtype=np.float64)
+            pos = np.linspace(0.0, 1.0, len(stops))
+            for c in range(3):
+                rgba[..., c] = np.interp(t, pos, stops[:, c]).astype(np.uint8)
+            rgba[..., 3] = np.where(finite, 255, 0).astype(np.uint8)
+            legend = {"min": round(lo, 4), "max": round(hi, 4), "ramp": list(_REG_PREVIEW_RAMP)}
+
+        import warnings
+
+        import rasterio.errors
+
+        with MemoryFile() as mf, warnings.catch_warnings():
+            # A plain RGBA PNG has no geotransform -- that's the point here.
+            warnings.simplefilter("ignore", rasterio.errors.NotGeoreferencedWarning)
+            with mf.open(driver="PNG", width=dst_w, height=dst_h, count=4, dtype="uint8") as dpng:
+                dpng.write(np.transpose(rgba, (2, 0, 1)))
+            png_bytes = mf.read()
+
+        return {
+            "png": "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii"),
+            "bounds": [[south, west], [north, east]],
+            "legend": legend,
+            "is_classification": is_classification,
+        }
+    except Exception as exc:  # preview is optional -- never break map generation
+        logger.warning("map preview render failed (non-fatal): %s", exc)
+        return None
+
+
 @app.route("/api/evaluation/create-map", methods=["POST"])
 def create_map():
     """Train classifier on all cached data, predict every pixel in map bboxes, produce GeoTIFF.
@@ -2776,6 +2906,10 @@ def create_map():
                     "GeoTIFF written: %s (%d x %d)", tmp.name, out_arr.shape[1], out_arr.shape[0]
                 )
 
+                preview = _render_map_preview(
+                    out_arr, out_transform, out_crs, is_classification, class_names, reg_clip
+                )
+
                 yield (
                     json.dumps(
                         {
@@ -2789,6 +2923,7 @@ def create_map():
                             "n_classes": len(class_names),
                             "train_year": train_year,
                             "map_year": map_year,
+                            "preview": preview,
                         }
                     )
                     + "\n"

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.2]
+
+### Added
+- `create_map`'s `map_ready` event carries a `preview`: a small EPSG:4326
+  PNG of the prediction raster (`data:` URL, nearest-neighbour, capped at
+  1024 px), its `bounds` as `[[south, west], [north, east]]`, and a
+  `legend` (per-class name/colour for classification, `min`/`max`/`ramp`
+  for regression). Lets the viewer show a map as an image overlay without
+  the GeoTIFF round-trip. Best-effort -- `preview` is `null` if rendering
+  fails, and the GeoTIFF is unaffected.
+
 ## [1.8.1]
 
 ### Changed
