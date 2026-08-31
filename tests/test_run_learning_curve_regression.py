@@ -273,3 +273,67 @@ def test_scatter_points_are_capped_for_a_large_test_set(monkeypatch):
     aggregate = next(e for e in events if e["type"] == "aggregate")
     scatter = aggregate["models"]["rf_reg"]["scatter"]
     assert len(scatter["y_true"]) == 10
+
+
+# --- Out-of-range prediction flag (bug 8, Louis Driver) -------------------
+#
+# Regression pct_results carry oor_frac (fraction of largest-pct test
+# predictions beyond the training targets' full span) and train_range
+# [min, max], for the UI's "Outside range" column. Nothing about the
+# scores or predictions is altered by this.
+
+
+def test_regression_reports_oor_frac_and_train_range_on_largest_pct():
+    vectors, labels = _regression_data()
+    events = _run(vectors, labels, ["nn_reg", "rf_reg"], task="regression", training_pcts=(50, 80))
+
+    lo = round(float(np.min(labels)), 4)
+    hi = round(float(np.max(labels)), 4)
+
+    progress = sorted((e for e in events if e["type"] == "progress"), key=lambda e: e["pct"])
+    smallest, largest = progress[0], progress[-1]
+
+    for name in ("nn_reg", "rf_reg"):
+        # Present only at the largest percentage (the "final" result).
+        assert "oor_frac" not in smallest["classifiers"][name]
+        m = largest["classifiers"][name]
+        assert m["train_range"] == [lo, hi]
+        # RF / kNN average stored targets -- they cannot predict outside the
+        # training span, so this is a deterministic 0.0, not just "small".
+        assert m["oor_frac"] == 0.0
+
+    aggregate = next(e for e in events if e["type"] == "aggregate")
+    assert aggregate["models"]["rf_reg"]["oor_frac"] == 0.0
+    assert aggregate["models"]["rf_reg"]["train_range"] == [lo, hi]
+
+
+def test_oor_frac_catches_a_model_that_extrapolates(monkeypatch):
+    """A regressor whose predictions all land above the training span must
+    report oor_frac == 1.0 -- and its R2/RMSE/MAE are still computed from
+    the raw (unclamped) predictions."""
+    import sklearn.neighbors
+
+    real_predict = sklearn.neighbors.KNeighborsRegressor.predict
+
+    def _shifted_predict(self, X):
+        return real_predict(self, X) + 1e6  # far above any real target
+
+    monkeypatch.setattr(sklearn.neighbors.KNeighborsRegressor, "predict", _shifted_predict)
+
+    vectors, labels = _regression_data()
+    events = _run(vectors, labels, ["nn_reg"], task="regression", training_pcts=(80,))
+
+    aggregate = next(e for e in events if e["type"] == "aggregate")
+    m = aggregate["models"]["nn_reg"]
+    assert m["oor_frac"] == 1.0
+    # Scores are NOT clamped -- a wildly shifted prediction tanks R2.
+    assert m["mean_r2"] < 0.0
+
+
+def test_classification_has_no_oor_fields():
+    vectors, labels = _classification_data()
+    events = _run(vectors, labels, ["nn", "rf"], task="classification")
+    for e in (x for x in events if x["type"] == "progress"):
+        for name in ("nn", "rf"):
+            assert "oor_frac" not in e["classifiers"][name]
+            assert "train_range" not in e["classifiers"][name]

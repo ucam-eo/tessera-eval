@@ -167,3 +167,78 @@ def test_predictions_are_not_forced_into_a_class_taxonomy(client):
     valid = arr[~np.isnan(arr)]
     n_unique = len(np.unique(valid))
     assert n_unique > 5, "predictions collapsed to a handful of class-like values"
+
+
+# --- Regression map clamp (bug 8, Louis Driver) --------------------------
+
+
+class _OutOfRangeRegressor:
+    """Ignores its input and predicts values far outside any plausible
+    training range -- half absurdly high, half absurdly low -- so a test
+    can see the clamp pin them to the training band's edges."""
+
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X):
+        n = X.shape[0]
+        out = np.full(n, 1e6, dtype=np.float64)
+        out[1::2] = -1e6
+        return out
+
+
+def test_regression_map_is_clamped_to_the_training_target_range(client, monkeypatch):
+    import tessera_eval.classify as _clf
+
+    monkeypatch.setattr(_clf, "make_regressor", lambda *a, **k: _OutOfRangeRegressor())
+
+    events = _run(client, classifier="rf")
+    ready = next(e for e in events if e["event"] == "map_ready")
+
+    # The stream tells the user the map was clamped, and to what.
+    msgs = " ".join(e.get("message", "") for e in events)
+    assert "clamp" in msgs.lower()
+
+    resp = client.get(ready["download_url"])
+    with rasterio.open(io.BytesIO(resp.data)) as ds:
+        arr = ds.read(1)
+        tags = ds.tags()
+
+    valid = arr[~np.isnan(arr)]
+    assert valid.size > 0
+
+    # _tile_cache labels are rng.uniform(0, 42) -> clamp band ~[0, 42].
+    lo, hi = float(np.min(valid)), float(np.max(valid))
+    assert lo >= 0.0
+    assert hi <= 42.0
+    # Both extremes were hit (predictor emitted +/-1e6 alternately), so the
+    # clamp is genuinely active, not just coincidentally in-range.
+    assert hi > 30.0
+    assert lo < 12.0
+
+    assert "clamp_min" in tags and "clamp_max" in tags
+    assert 0.0 <= float(tags["clamp_min"]) < float(tags["clamp_max"]) <= 42.0
+
+
+def test_classification_map_has_no_clamp_tags(client):
+    """The clamp is regression-only -- a classification map must not grow
+    clamp_min/clamp_max tags."""
+    from tessera_eval import server as _srv
+
+    cache = dict(_srv._tile_cache)
+    cache["_is_classification"] = True
+    cache["labels"] = np.array([0, 1, 2] * 66 + [0, 1], dtype=np.int32)
+    cache["class_names"] = ["a", "b", "c"]
+    cache["key"] = ("landcover", 2025, 2025, "equal")
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_srv, "_tile_cache", cache)
+        events = _run(client, classifier="rf")
+    ready = next(e for e in events if e["event"] == "map_ready")
+    resp = client.get(ready["download_url"])
+    with rasterio.open(io.BytesIO(resp.data)) as ds:
+        tags = ds.tags()
+    assert "clamp_min" not in tags
+    assert "clamp_max" not in tags
