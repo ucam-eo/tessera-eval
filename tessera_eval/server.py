@@ -238,8 +238,9 @@ def _extract_tile_patches(
 ):
     """Extract pixel-aligned 2D patches and optionally point samples from tiles.
 
-    Uses zarr read_region() when available (~0.2s/patch vs ~15s/tile via NPY).
-    Falls back to gt.fetch_embeddings() for NPY tile downloads.
+    Uses zarr read_region() when available (roughly an order of magnitude
+    faster on a cold cache than pulling whole NPY tiles), falling back to
+    gt.fetch_embeddings() for NPY tile downloads.
 
     is_classification=False (regression): patches carry real continuous
     target values (via rasterize_shapefile_continuous, NaN = unlabelled)
