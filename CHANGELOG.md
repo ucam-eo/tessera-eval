@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.3]
+
+### Changed
+- kNN classifier and regressor now run their neighbour query with
+  `n_jobs=-1`. The search is brute-force in 128-d, so a full-map predict
+  is millions of independent distance scans; using all cores is a large,
+  free speedup on `create_map` with kNN selected.
+
 ## [1.8.2]
 
 ### Added

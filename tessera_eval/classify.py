@@ -54,10 +54,16 @@ def make_classifier(name, params=None):
     base_name = _strip_variant_suffix(name)
     p = params or {}
     if base_name == "nn":
+        # n_jobs=-1: the neighbour query is brute-force in 128-d (no tree
+        # helps at that dimensionality), so a full-map predict is millions
+        # of independent distance scans -- parallelising it across cores is
+        # a large, free speedup. Louis Driver: "producing maps using kNN is
+        # very slow".
         return KNeighborsClassifier(
             n_neighbors=int(p.get("n_neighbors", 5)),
             weights=p.get("weights", "uniform"),
             metric="euclidean",
+            n_jobs=-1,
         )
     elif base_name == "rf":
         max_depth = p.get("max_depth")
@@ -244,6 +250,7 @@ def make_regressor(name, params=None):
             n_neighbors=int(p.get("n_neighbors", 5)),
             weights=p.get("weights", "uniform"),
             metric="euclidean",
+            n_jobs=-1,  # brute-force 128-d query; parallelise it (see make_classifier)
         )
     elif base_name == "rf_reg":
         max_depth = p.get("max_depth")
