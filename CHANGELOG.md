@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.5]
+
+### Added
+- `run-large-area` accepts `eval_mode: "kfold"` (with `kfold_k`, default 5,
+  clamped to 2..20) alongside the default `"learning_curve"`. k-fold CV was
+  previously CLI-only (`tessera-eval kfold`); this wires `run_kfold_cv` into
+  the streaming endpoint so the Validation panel can run it. It
+  cross-validates over all labelled pixels (no train/test bboxes, no
+  learning curve) with pixel models only -- spatial MLP and U-Net are
+  dropped before feature extraction, with a per-model status message. The
+  `start` event carries `mode` and `k`; evaluation emits `fold_result`
+  (per fold), `aggregate` (mean +/- std across folds), and, for
+  classification, `confusion_matrices` (summed over folds).
+
 ## [1.8.4]
 
 ### Added

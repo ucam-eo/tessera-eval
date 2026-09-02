@@ -889,6 +889,11 @@ def run_large_area():
     max_patches = int(body.get("max_patches", 500))
     train_bboxes = body.get("train_bboxes", [])
     test_bboxes = body.get("test_bboxes", [])
+    # "learning_curve" (default) or "kfold". k-fold cross-validates over all
+    # labelled pixels (no train/test bboxes, no learning curve, pixel models
+    # only) -- run_kfold_cv, previously CLI-only.
+    eval_mode = body.get("eval_mode", "learning_curve")
+    kfold_k = max(2, min(20, int(body.get("kfold_k", 5))))
 
     if not field_name:
         return jsonify({"error": "field is required"}), 400
@@ -946,6 +951,16 @@ def run_large_area():
 
     def _base_name(name):
         return _re.sub(r"_v\d+$", "", name)
+
+    # k-fold CV cross-validates over the pixel-embedding matrix directly --
+    # run_kfold_cv has no neighbourhood/patch path -- so drop spatial MLP
+    # and U-Net now, before their (expensive) feature extraction is set up.
+    # The stream reports what was dropped once it starts.
+    kfold_dropped = []
+    if eval_mode == "kfold":
+        _pixel = [n for n in model_names if _base_name(n) not in (*SPATIAL_MODELS, "unet")]
+        kfold_dropped = [n for n in model_names if n not in _pixel]
+        model_names = _pixel
 
     # A fixed test set (spatial bboxes, or a different test year) has no
     # neighbourhood features, so spatial models are skipped for such runs
@@ -1921,6 +1936,8 @@ def run_large_area():
             "stats": stats,
             "train_year": train_year,
             "test_year": test_year,
+            "mode": eval_mode,
+            "k": kfold_k,
         }
         if has_spatial_split:
             start_event["spatial_split"] = True
@@ -1955,12 +1972,83 @@ def run_large_area():
             lc_kwargs["test_vectors"] = year_split_test_vectors
             lc_kwargs["test_labels"] = year_split_test_labels
 
-        for event in run_learning_curve(
-            vectors,
-            labels,
-            active_models,
-            training_pcts,
-            **lc_kwargs,
+        if eval_mode == "kfold":
+            # k-fold CV over all labelled pixels. No learning curve, no
+            # train/test bboxes; pixel models only (run_kfold_cv has no
+            # neighbourhood/patch path -- spatial MLP / U-Net were already
+            # dropped from model_names above). Emits fold_result / aggregate
+            # / confusion_matrices, which the frontend already understands.
+            from tessera_eval.evaluate import run_kfold_cv
+
+            for _n in kfold_dropped:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": (
+                                f"{_n} skipped — k-fold CV supports pixel models "
+                                "only (k-NN, RF, XGBoost, MLP)"
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+            if not active_models:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": "k-fold CV needs at least one pixel model (k-NN, RF, XGBoost, MLP).",
+                        }
+                    )
+                    + "\n"
+                )
+                return
+            for event in run_kfold_cv(
+                vectors,
+                labels,
+                active_models,
+                k=kfold_k,
+                task=task,
+                model_params=model_params,
+                max_training_samples=max_train,
+            ):
+                if _cancelled():
+                    logger.info("Evaluation cancelled during k-fold CV")
+                    yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
+                    return
+                et = event["type"]
+                if et == "fold_result":
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "fold_result",
+                                "fold": event["fold"],
+                                "total_folds": kfold_k,
+                                "models": event["models"],
+                            }
+                        )
+                        + "\n"
+                    )
+                elif et == "aggregate":
+                    yield json.dumps({"event": "aggregate", "models": event["models"]}) + "\n"
+                elif et == "confusion_matrices":
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "confusion_matrices",
+                                "confusion_matrices": event["confusion_matrices"],
+                            }
+                        )
+                        + "\n"
+                    )
+                elif et == "heartbeat":
+                    yield json.dumps({"event": "heartbeat"}) + "\n"
+
+        for event in (
+            run_learning_curve(vectors, labels, active_models, training_pcts, **lc_kwargs)
+            if eval_mode != "kfold"
+            else ()
         ):
             if _cancelled():
                 logger.info("Evaluation cancelled during learning curve")
