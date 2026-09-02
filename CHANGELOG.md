@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.6]
+
+### Changed
+- One random seed now keys every draw in an evaluation or map run, and it
+  is settable. `run-large-area` and `create-map` accept a `seed` field
+  (default 42); `learning-curve` gains `--seed` (`kfold` already had it).
+  The seed threads through sample-point selection, tile-fetch order,
+  learning-curve resampling, k-fold splits, and every estimator's own
+  `random_state` (RF / XGBoost / MLP, and the U-Net's augmentation,
+  DataLoader shuffle, and weight init via `torch.manual_seed`).
+  `make_classifier` / `make_regressor` take a `seed=` argument instead of
+  a hardcoded `random_state=42`; `run_learning_curve` takes `seed=`
+  (its per-repeat RNGs are now `seed + repeat`, so the default-42 run's
+  numbers shift from the old `RandomState(0..n)` sequence). The seed is
+  cached with the run so Download Models and Create Map reuse it, and it
+  is echoed on the `start` event.
+
 ## [1.8.5]
 
 ### Added

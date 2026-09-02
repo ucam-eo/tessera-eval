@@ -293,7 +293,7 @@ if _HAS_TORCH:
 # ---------------------------------------------------------------------------
 
 
-def train_unet_on_patches(patches, n_classes, params=None, progress_callback=None):
+def train_unet_on_patches(patches, n_classes, params=None, progress_callback=None, seed=42):
     """Train a TinyUNet on extracted embedding/label patches.
 
     Args:
@@ -323,6 +323,11 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
     base_filters = int(p.get("base_filters", 64))
     batch_size = int(p.get("batch_size", 4))
 
+    # One seed drives augmentation noise, DataLoader shuffle, and model
+    # weight init -- so a whole run reproduces from the CLI --seed / the web
+    # request's seed.
+    torch.manual_seed(seed)
+
     # Filter patches to consistent shape and stack with augmentation
     # Find the most common patch shape
     shapes = [(p[0].shape, p[1].shape) for p in patches]
@@ -348,7 +353,7 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
     # Augmentation: 8 geometric variants × 3 noise levels = 24× per patch
     # Geometric: 4 rotations × 2 flips = 8
     # Noise: original + 2 Gaussian noise variants per geometric transform
-    rng_aug = np.random.RandomState(42)
+    rng_aug = np.random.RandomState(seed)
     emb_list = []
     lbl_list = []
     for emb_patch, lbl_patch in filtered:
@@ -385,7 +390,12 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
     )
 
     dataset = TensorDataset(X, Y)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
 
     in_channels = X.shape[1]
     # n_classes+1 outputs: index 0 is the ignore/background class
@@ -425,7 +435,7 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
     return model
 
 
-def train_unet_regressor_on_patches(patches, params=None, progress_callback=None):
+def train_unet_regressor_on_patches(patches, params=None, progress_callback=None, seed=42):
     """Regression counterpart to train_unet_on_patches.
 
     Same TinyUNet architecture, augmentation, and training loop -- only two
@@ -459,6 +469,8 @@ def train_unet_regressor_on_patches(patches, params=None, progress_callback=None
     base_filters = int(p.get("base_filters", 64))
     batch_size = int(p.get("batch_size", 4))
 
+    torch.manual_seed(seed)  # augmentation, DataLoader shuffle, weight init
+
     shapes = [(p[0].shape, p[1].shape) for p in patches]
     target_emb_shape = max(
         set(s[0] for s in shapes), key=lambda s: sum(1 for x in shapes if x[0] == s)
@@ -482,7 +494,7 @@ def train_unet_regressor_on_patches(patches, params=None, progress_callback=None
     # Same augmentation as train_unet_on_patches -- rotation/flip preserve
     # NaN positions correctly; Gaussian noise is only ever added to the
     # embeddings, never the targets, so it can't turn a NaN into a number.
-    rng_aug = np.random.RandomState(42)
+    rng_aug = np.random.RandomState(seed)
     emb_list = []
     tgt_list = []
     for emb_patch, tgt_patch in filtered:
@@ -515,7 +527,12 @@ def train_unet_regressor_on_patches(patches, params=None, progress_callback=None
     )
 
     dataset = TensorDataset(X, Y)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
 
     in_channels = X.shape[1]
     model = TinyUNet(in_channels=in_channels, n_classes=1, depth=depth, base_filters=base_filters)

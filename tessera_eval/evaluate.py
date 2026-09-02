@@ -147,6 +147,7 @@ def run_learning_curve(
     test_vectors=None,
     test_labels=None,
     task="classification",
+    seed=42,
     **kwargs,
 ):
     """Generator that yields progress events after each training percentage.
@@ -280,7 +281,7 @@ def run_learning_curve(
 
     # Pre-subsample the fixed test set if too large (spatial split mode)
     if spatial_split and len(test_labels) > MAX_TEST:
-        rng_test = np.random.RandomState(42)
+        rng_test = np.random.RandomState(seed)
         test_subsample = rng_test.choice(len(test_labels), size=MAX_TEST, replace=False)
         test_vectors = test_vectors[test_subsample]
         test_labels = test_labels[test_subsample]
@@ -327,8 +328,8 @@ def run_learning_curve(
         else:
             n_repeats = repeats
 
-        for seed in range(n_repeats):
-            rng = np.random.RandomState(seed)
+        for repeat in range(n_repeats):
+            rng = np.random.RandomState(seed + repeat)
 
             if is_classification:
                 # Stratified pixel sampling (using pre-computed indices)
@@ -378,10 +379,10 @@ def run_learning_curve(
 
             # Pixel-based classifiers
             for clf_idx, name in enumerate(active_pixel):
-                if seed == 0:
+                if repeat == 0:
                     yield {
                         "type": "classifier_status",
-                        "message": f"Pct {pct}%: training {name} (repeat {seed + 1}/{n_repeats})...",
+                        "message": f"Pct {pct}%: training {name} (repeat {repeat + 1}/{n_repeats})...",
                     }
                 base_clf_name = _strip_variant_suffix(name)
                 if base_clf_name == "spatial_mlp" and spatial_vectors is not None:
@@ -447,7 +448,7 @@ def run_learning_curve(
                 # spatial_mlp/spatial_mlp_5x5 directly (see make_regressor's
                 # docstring for why that name has no "_reg" suffix).
                 if is_classification:
-                    clf = make_classifier(name, (classifier_params or {}).get(name, {}))
+                    clf = make_classifier(name, (classifier_params or {}).get(name, {}), seed=seed)
                     try:
                         y_pred = yield from _fit_predict_relabeled(
                             clf, X_tr, y_tr_aug, X_te, interval=_HEARTBEAT_INTERVAL_S
@@ -461,12 +462,12 @@ def run_learning_curve(
                             cm_accum[name] += cm
                     except Exception as exc:
                         logger.warning(
-                            "Classifier %s failed at pct %.1f seed %d: %s", name, pct, seed, exc
+                            "Classifier %s failed at pct %.1f repeat %d: %s", name, pct, repeat, exc
                         )
                         f1_scores[name].append(0.0)
                         f1w_scores[name].append(0.0)
                 else:
-                    reg = make_regressor(name, (classifier_params or {}).get(name, {}))
+                    reg = make_regressor(name, (classifier_params or {}).get(name, {}), seed=seed)
                     try:
                         yield from _fit_with_heartbeat(
                             lambda: reg.fit(X_tr, y_tr_aug), interval=_HEARTBEAT_INTERVAL_S
@@ -490,7 +491,7 @@ def run_learning_curve(
                             scatter_accum[name]["y_pred"] = sc_pred.tolist()
                     except Exception as exc:
                         logger.warning(
-                            "Regressor %s failed at pct %.1f seed %d: %s", name, pct, seed, exc
+                            "Regressor %s failed at pct %.1f repeat %d: %s", name, pct, repeat, exc
                         )
                         reg_scores[name]["r2"].append(0.0)
                         reg_scores[name]["rmse"].append(0.0)
@@ -499,7 +500,7 @@ def run_learning_curve(
             # U-Net: patch-based train/test split
             # Only run 1 repeat for U-Net (training is expensive, variance is dominated by SGD noise)
             unet_active = [n for n in active if _strip_variant_suffix(n) == "unet"]
-            if has_unet and unet_active and seed == 0:
+            if has_unet and unet_active and repeat == 0:
                 yield {"type": "classifier_status", "message": f"Pct {pct}%: training U-Net..."}
                 for unet_name in unet_active:
                     try:
@@ -531,14 +532,14 @@ def run_learning_curve(
                                 if is_classification:
                                     model = yield from _fit_with_heartbeat(
                                         lambda: train_unet_on_patches(
-                                            train_patches, n_classes, unet_params
+                                            train_patches, n_classes, unet_params, seed=seed
                                         ),
                                         interval=_HEARTBEAT_INTERVAL_S,
                                     )
                                 else:
                                     model = yield from _fit_with_heartbeat(
                                         lambda: train_unet_regressor_on_patches(
-                                            train_patches, unet_params
+                                            train_patches, unet_params, seed=seed
                                         ),
                                         interval=_HEARTBEAT_INTERVAL_S,
                                     )
@@ -622,7 +623,7 @@ def run_learning_curve(
                                 reg_scores[unet_name]["mae"].append(0.0)
                     except Exception as exc:
                         logger.warning(
-                            "U-Net %s failed at pct %.1f seed %d: %s", unet_name, pct, seed, exc
+                            "U-Net %s failed at pct %.1f repeat %d: %s", unet_name, pct, repeat, exc
                         )
                         if is_classification:
                             f1_scores.setdefault(unet_name, []).append(0.0)
@@ -899,9 +900,9 @@ def run_kfold_cv(
         for name in model_names:
             try:
                 if is_classification:
-                    model = make_classifier(name, (model_params or {}).get(name, {}))
+                    model = make_classifier(name, (model_params or {}).get(name, {}), seed=seed)
                 else:
-                    model = make_regressor(name, (model_params or {}).get(name, {}))
+                    model = make_regressor(name, (model_params or {}).get(name, {}), seed=seed)
 
                 if is_classification:
                     # Same xgboost contiguous-label requirement as

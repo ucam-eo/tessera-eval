@@ -295,6 +295,7 @@ def _extract_tile_patches(
     progress_cb=None,
     cancel_flag=None,
     is_classification=True,
+    seed=42,
 ):
     """Extract pixel-aligned 2D patches and optionally point samples from tiles.
 
@@ -324,7 +325,7 @@ def _extract_tile_patches(
     from tessera_eval.classify import gather_spatial_features_2d
     from tessera_eval.rasterize import rasterize_shapefile, rasterize_shapefile_continuous
 
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(seed)
 
     # Find tiles overlapping the shapefile
     bounds = gdf.total_bounds
@@ -894,6 +895,10 @@ def run_large_area():
     # only) -- run_kfold_cv, previously CLI-only.
     eval_mode = body.get("eval_mode", "learning_curve")
     kfold_k = max(2, min(20, int(body.get("kfold_k", 5))))
+    # One seed for the whole run: sample-point selection, tile-fetch order,
+    # learning-curve resampling / k-fold splits, and every estimator's own
+    # random_state (RF/XGBoost/MLP, U-Net). Settable from the UI / CLI.
+    seed = int(body.get("seed", 42))
 
     if not field_name:
         return jsonify({"error": "field is required"}), 400
@@ -1032,6 +1037,7 @@ def run_large_area():
             # reused (a run cut short before this generator's final event
             # may have left it stale or unset).
             _tile_cache["_is_classification"] = is_classification
+            _tile_cache["_seed"] = seed
 
             # See _cached_tiles_need_reload's docstring: setting vectors =
             # None alone (without also invalidating _tile_cache["key"]) used
@@ -1103,6 +1109,7 @@ def run_large_area():
                     # Commit the task type alongside the vectors it applies
                     # to -- see the identical key in the fetch path below.
                     "_is_classification": is_classification,
+                    "_seed": seed,
                 }
             )
 
@@ -1246,7 +1253,7 @@ def run_large_area():
                         equal_n = MAX_SAMPLE_PIXELS // n_classes
                         raw_alloc = {c: equal_n for c in range(n_classes)}
 
-                    sampling_rng = np.random.RandomState(42)
+                    sampling_rng = np.random.RandomState(seed)
                     for cls_idx in range(n_classes):
                         cls_gdf = valid_gdf[valid_gdf["_label_id"] == cls_idx]
                         if cls_gdf.empty:
@@ -1269,7 +1276,7 @@ def run_large_area():
                     # for regression rather than repurposed into something
                     # that doesn't map cleanly. One combined budget across
                     # every labelled row instead.
-                    sampling_rng = np.random.RandomState(42)
+                    sampling_rng = np.random.RandomState(seed)
                     try:
                         coords, row_idx = _sample_points_within_budget(
                             valid_gdf, MAX_SAMPLE_PIXELS, sampling_rng
@@ -1356,6 +1363,7 @@ def run_large_area():
                                 progress_cb=_tile_progress,
                                 cancel_flag=_cancel_flag,
                                 is_classification=is_classification,
+                                seed=seed,
                             )
                         except Exception as e:
                             tile_result[1] = e
@@ -1561,6 +1569,7 @@ def run_large_area():
                         # ran as classification. See
                         # test_map_task_type_persisted_early.
                         "_is_classification": is_classification,
+                        "_seed": seed,
                     }
                 )
                 _save_cached_result(
@@ -1938,6 +1947,7 @@ def run_large_area():
             "test_year": test_year,
             "mode": eval_mode,
             "k": kfold_k,
+            "seed": seed,
         }
         if has_spatial_split:
             start_event["spatial_split"] = True
@@ -1952,6 +1962,7 @@ def run_large_area():
         # Run learning curve (all classifiers including U-Net)
         lc_kwargs = dict(
             repeats=5,
+            seed=seed,
             classifier_params=model_params,
             spatial_vectors=spatial_3x3,
             spatial_vectors_5x5=spatial_5x5,
@@ -2012,6 +2023,7 @@ def run_large_area():
                 task=task,
                 model_params=model_params,
                 max_training_samples=max_train,
+                seed=seed,
             ):
                 if _cancelled():
                     logger.info("Evaluation cancelled during k-fold CV")
@@ -2120,8 +2132,10 @@ def run_large_area():
         _tile_cache["_unet_patches"] = unet_patches
         # train_models() (Download Models) runs in a later, separate request
         # with no body of its own -- it needs to know whether to dispatch to
-        # make_classifier or make_regressor, so stash it here.
+        # make_classifier or make_regressor, and with which seed, so stash
+        # both here.
         _tile_cache["_is_classification"] = is_classification
+        _tile_cache["_seed"] = seed
 
         _cancel_flag = None  # reset cancellation flag
         elapsed = time.time() - t0
@@ -2162,8 +2176,11 @@ def train_models():
     spatial_3x3 = cache.get("spatial_3x3")
     spatial_5x5 = cache.get("spatial_5x5")
     # No request body here (Download Models is a bare POST) -- rely on the
-    # cached task type, with a data-derived fallback.
+    # cached task type, with a data-derived fallback. Same for the seed:
+    # reuse whatever the evaluation run cached so the downloaded models
+    # match the scored ones.
     is_classification = _resolve_task(cache, None)
+    seed = int(cache.get("_seed", 42))
 
     if not active_models:
         return jsonify({"error": "No classifiers configured."}), 400
@@ -2284,7 +2301,7 @@ def train_models():
                     X_aug, y_aug = augment_spatial(
                         spatial_3x3, labels, window=3, dim=vectors.shape[1]
                     )
-                    clf = make_classifier(name, model_params.get(name, {}))
+                    clf = make_classifier(name, model_params.get(name, {}), seed=seed)
                     clf.fit(X_aug, y_aug)
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".joblib", prefix=f"{name}_model_", delete=False
@@ -2297,7 +2314,7 @@ def train_models():
                     X_aug, y_aug = augment_spatial(
                         spatial_5x5, labels, window=5, dim=vectors.shape[1]
                     )
-                    clf = make_classifier(name, model_params.get(name, {}))
+                    clf = make_classifier(name, model_params.get(name, {}), seed=seed)
                     clf.fit(X_aug, y_aug)
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".joblib", prefix=f"{name}_model_", delete=False
@@ -2306,9 +2323,9 @@ def train_models():
                     _trained_models[name] = tmp.name
                 else:
                     clf = (
-                        make_classifier(name, model_params.get(name, {}))
+                        make_classifier(name, model_params.get(name, {}), seed=seed)
                         if is_classification
-                        else make_regressor(name, model_params.get(name, {}))
+                        else make_regressor(name, model_params.get(name, {}), seed=seed)
                     )
                     clf.fit(vectors, labels)
                     tmp = tempfile.NamedTemporaryFile(
@@ -2621,6 +2638,9 @@ def create_map():
     class_names = cache.get("class_names", [])
     model_params = cache.get("_model_params", {})
     is_classification = _resolve_task(cache, body.get("task"))
+    # Explicit seed wins; otherwise reuse the evaluation run's cached seed so
+    # the map's model matches the one that was scored.
+    seed = int(body.get("seed", cache.get("_seed", 42)))
     # classifier_name is a plain UI name ("rf", "xgboost", ...) either way --
     # the frontend doesn't know about the "_reg" suffix convention. For
     # regression this was previously fed straight into make_classifier(),
@@ -2678,9 +2698,9 @@ def create_map():
             from tessera_eval.classify import make_classifier, make_regressor
 
             clf = (
-                make_classifier(model_key, model_params.get(model_key, {}))
+                make_classifier(model_key, model_params.get(model_key, {}), seed=seed)
                 if is_classification
-                else make_regressor(model_key, model_params.get(model_key, {}))
+                else make_regressor(model_key, model_params.get(model_key, {}), seed=seed)
             )
             clf.fit(vectors, labels)
         except Exception as e:

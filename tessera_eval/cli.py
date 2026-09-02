@@ -442,6 +442,9 @@ def learning_curve(
         "1,5,10,30,50,80", help="Comma-separated training percentages"
     ),
     repeats: int = typer.Option(5, help="Repeats per training percentage"),
+    seed: int = typer.Option(
+        42, help="Random seed for every draw in the run (resampling + estimator random_state)"
+    ),
     task: str = typer.Option(
         None,
         help="'classification' or 'regression' (default: auto-detected). "
@@ -737,6 +740,7 @@ def learning_curve(
         test_vectors=test_vectors,
         test_labels=test_labels,
         task=task,
+        seed=seed,
     ):
         if event["type"] == "progress":
             for name in model_list:

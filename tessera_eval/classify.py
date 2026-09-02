@@ -34,7 +34,7 @@ def available_classifiers():
     return names
 
 
-def make_classifier(name, params=None):
+def make_classifier(name, params=None, seed=42):
     """Create a classifier instance by name with optional hyperparameters.
 
     Args:
@@ -43,6 +43,9 @@ def make_classifier(name, params=None):
               May include a variant suffix (e.g., 'mlp_v2') which is
               stripped before lookup.
         params: Optional dict of hyperparameters
+        seed: Random seed for every estimator that takes one (RF, XGBoost,
+            MLP weight init). Threaded from the CLI --seed / the web
+            request so a whole run is reproducible from one number.
 
     Returns:
         scikit-learn compatible classifier (fit/predict interface)
@@ -73,7 +76,7 @@ def make_classifier(name, params=None):
             n_estimators=int(p.get("n_estimators", 100)),
             max_depth=max_depth,
             n_jobs=-1,
-            random_state=42,
+            random_state=seed,
         )
     elif base_name == "xgboost":
         from xgboost import XGBClassifier
@@ -83,7 +86,7 @@ def make_classifier(name, params=None):
             max_depth=int(p.get("max_depth", 6)),
             learning_rate=float(p.get("learning_rate", 0.3)),
             n_jobs=-1,
-            random_state=42,
+            random_state=seed,
             use_label_encoder=False,
             eval_metric="mlogloss",
             verbosity=0,
@@ -97,7 +100,7 @@ def make_classifier(name, params=None):
         return MLPClassifier(
             hidden_layer_sizes=hidden,
             max_iter=int(p.get("max_iter", 200)),
-            random_state=42,
+            random_state=seed,
         )
     elif base_name in SPATIAL_MODELS:
         default_layers = "256,128" if base_name == "spatial_mlp" else "512,256"
@@ -110,7 +113,7 @@ def make_classifier(name, params=None):
         return MLPClassifier(
             hidden_layer_sizes=hidden,
             max_iter=int(p.get("max_iter", default_iter)),
-            random_state=42,
+            random_state=seed,
         )
     else:
         raise ValueError(f"Unknown classifier: {name}")
@@ -227,7 +230,7 @@ def available_regressors():
     return names
 
 
-def make_regressor(name, params=None):
+def make_regressor(name, params=None, seed=42):
     """Create a regressor instance by name with optional hyperparameters.
 
     Args:
@@ -235,6 +238,8 @@ def make_regressor(name, params=None):
               May include a variant suffix (e.g., 'rf_reg_v2') which is
               stripped before lookup.
         params: Optional dict of hyperparameters
+        seed: Random seed for every estimator that takes one (RF, XGBoost,
+            MLP weight init).
 
     Returns:
         scikit-learn compatible regressor (fit/predict interface)
@@ -260,7 +265,7 @@ def make_regressor(name, params=None):
             n_estimators=int(p.get("n_estimators", 100)),
             max_depth=max_depth,
             n_jobs=-1,
-            random_state=42,
+            random_state=seed,
         )
     elif base_name == "xgboost_reg":
         from xgboost import XGBRegressor
@@ -270,7 +275,7 @@ def make_regressor(name, params=None):
             max_depth=int(p.get("max_depth", 6)),
             learning_rate=float(p.get("learning_rate", 0.3)),
             n_jobs=-1,
-            random_state=42,
+            random_state=seed,
             verbosity=0,
         )
     elif base_name == "mlp_reg":
@@ -282,7 +287,7 @@ def make_regressor(name, params=None):
         return MLPRegressor(
             hidden_layer_sizes=hidden,
             max_iter=int(p.get("max_iter", 200)),
-            random_state=42,
+            random_state=seed,
         )
     elif base_name in SPATIAL_MODELS:
         # Deliberately no "_reg" suffix, unlike every other regressor here --
@@ -304,7 +309,7 @@ def make_regressor(name, params=None):
         return MLPRegressor(
             hidden_layer_sizes=hidden,
             max_iter=int(p.get("max_iter", default_iter)),
-            random_state=42,
+            random_state=seed,
         )
     else:
         raise ValueError(f"Unknown regressor: {name}")
