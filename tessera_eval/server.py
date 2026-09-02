@@ -47,6 +47,36 @@ def _add_cors(response):
 # suffixed names.
 _CLF_TO_REG = {"nn": "nn_reg", "rf": "rf_reg", "mlp": "mlp_reg", "xgboost": "xgboost_reg"}
 
+
+def _resolve_task(cache, task_override=None):
+    """Decide classification vs regression for a map / final-model request.
+
+    Precedence:
+      1. An explicit "classification"/"regression" from the request body --
+         the user forcing a task (e.g. a coarsely-binned continuous field
+         they want mapped as regression). Anything else (None, "auto") is
+         ignored here; task auto-detection happens once, in run_large_area.
+      2. The task the evaluation run committed to the tile cache next to the
+         vectors it applies to.
+      3. A data-derived fallback: regression runs leave class_names empty,
+         classification runs populate it from the LabelEncoder.
+
+    (2) used to be a bare cache.get("_is_classification", True). That key was
+    only written at the very end of run_large_area's response stream, so an
+    evaluation cut short before its final event -- a client disconnect or
+    cancel mid-run -- left it unset and every downstream map silently ran as
+    classification: a classifier fit on continuous targets, uint8 output
+    snapped onto the training values, class-palette preview. run_large_area
+    now writes the key with the vectors; this fallback covers older cache
+    entries and the no-key edge.
+    """
+    if task_override in ("classification", "regression"):
+        return task_override == "classification"
+    if cache.get("_is_classification") is not None:
+        return bool(cache["_is_classification"])
+    return bool(cache.get("class_names"))
+
+
 # ── State (single-user, one process) ──
 
 _uploaded_shapefiles = []  # list of (filename, gdf) tuples
@@ -787,6 +817,17 @@ def upload_shapefile():
     )
 
 
+@app.route("/api/evaluation/list-shapefiles", methods=["GET"])
+def list_shapefiles():
+    """Names + feature counts of the shapefiles currently merged into the
+    ground-truth set. Uploads accumulate (multi-shapefile merge, by design);
+    the viewer shows this on entering Validation so an earlier upload that's
+    still in the set is visible rather than a surprise."""
+    return jsonify(
+        {"files": [{"name": name, "features": int(len(gdf))} for name, gdf in _uploaded_shapefiles]}
+    )
+
+
 @app.route("/api/evaluation/clear-shapefiles", methods=["POST"])
 def clear_shapefiles():
     """Clear all uploaded shapefiles."""
@@ -972,6 +1013,10 @@ def run_large_area():
             logger.info(
                 "In-memory cache hit for %s/%s (%d pixels)", field_name, train_year, len(labels)
             )
+            # Keep the cached task type in step with the vectors being
+            # reused (a run cut short before this generator's final event
+            # may have left it stale or unset).
+            _tile_cache["_is_classification"] = is_classification
 
             # See _cached_tiles_need_reload's docstring: setting vectors =
             # None alone (without also invalidating _tile_cache["key"]) used
@@ -1040,6 +1085,9 @@ def run_large_area():
                     "spatial_3x3": None,
                     "spatial_5x5": None,
                     "unet_patches": [],
+                    # Commit the task type alongside the vectors it applies
+                    # to -- see the identical key in the fetch path below.
+                    "_is_classification": is_classification,
                 }
             )
 
@@ -1488,6 +1536,16 @@ def run_large_area():
                         "unet_patches": [],
                         "sample_points": sample_points,
                         "valid_mask": valid_mask,
+                        # Commit the task type alongside the vectors it
+                        # applies to, so create_map()/train_models() can
+                        # trust it even when this stream is cut short before
+                        # its final event (client disconnect, cancel). The
+                        # sole previous write was at the very end of this
+                        # generator -- an interrupted regression run then
+                        # left _is_classification unset and the map silently
+                        # ran as classification. See
+                        # test_map_task_type_persisted_early.
+                        "_is_classification": is_classification,
                     }
                 )
                 _save_cached_result(
@@ -2015,9 +2073,9 @@ def train_models():
     unet_patches = cache.get("_unet_patches", [])
     spatial_3x3 = cache.get("spatial_3x3")
     spatial_5x5 = cache.get("spatial_5x5")
-    # Older cache entries (from before this key existed) default to
-    # classification -- the only task this endpoint supported at the time.
-    is_classification = cache.get("_is_classification", True)
+    # No request body here (Download Models is a bare POST) -- rely on the
+    # cached task type, with a data-derived fallback.
+    is_classification = _resolve_task(cache, None)
 
     if not active_models:
         return jsonify({"error": "No classifiers configured."}), 400
@@ -2474,9 +2532,7 @@ def create_map():
     labels = cache["labels"]
     class_names = cache.get("class_names", [])
     model_params = cache.get("_model_params", {})
-    # Older cache entries (from before this key existed) default to
-    # classification -- the only task this endpoint supported at the time.
-    is_classification = cache.get("_is_classification", True)
+    is_classification = _resolve_task(cache, body.get("task"))
     # classifier_name is a plain UI name ("rf", "xgboost", ...) either way --
     # the frontend doesn't know about the "_reg" suffix convention. For
     # regression this was previously fed straight into make_classifier(),
@@ -2516,11 +2572,15 @@ def create_map():
 
         t0 = time.time()
 
+        _task_label = "classification" if is_classification else "regression"
         yield (
             json.dumps(
                 {
                     "event": "status",
-                    "message": f"Training {classifier_name} on all {len(vectors):,} labels...",
+                    "message": (
+                        f"Training {classifier_name} ({_task_label}) on all "
+                        f"{len(vectors):,} labels..."
+                    ),
                 }
             )
             + "\n"
@@ -2920,6 +2980,10 @@ def create_map():
                             "width": out_arr.shape[1],
                             "height": out_arr.shape[0],
                             "crs": str(out_crs),
+                            # The task this map was actually generated as, so
+                            # the viewer can show it and a mismatch with the
+                            # evaluation run is visible rather than silent.
+                            "task": "classification" if is_classification else "regression",
                             "n_classes": len(class_names),
                             "train_year": train_year,
                             "map_year": map_year,

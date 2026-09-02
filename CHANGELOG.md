@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.4]
+
+### Added
+- `GET /api/evaluation/list-shapefiles` returns the names and feature
+  counts of the shapefiles currently in the merged ground-truth set.
+  Uploads accumulate (multi-shapefile merge), so the viewer shows this
+  list on entering Validation -- an earlier upload still in the set is
+  then visible rather than a surprise.
+
+### Fixed
+- `create_map` and `train_models` no longer silently fall back to
+  classification. Both read the task type only from a tile-cache flag that
+  `run_large_area` used to write once, at the very end of its response
+  stream -- so an evaluation cut short before that final event (a client
+  disconnect / throttled tab mid-run, or a cancel) left the flag unset and
+  a regression map ran as classification: a classifier fit on the
+  continuous targets, `uint8` predictions snapped onto the label values,
+  and a discrete class palette in the preview. Confirmed live (Louis
+  Driver): a tree-height map came out quantised to `1, 3, ... 65` despite
+  the evaluation reporting R².
+  - `run_large_area` now commits `_is_classification` to the tile cache
+    *with* the vectors it applies to (both cache-population paths), so it
+    is set before any training and survives an interrupted stream.
+  - Task resolution is centralised in `_resolve_task()`: an explicit
+    `task` in the request wins, then the cached flag, then a data-derived
+    fallback (regression runs leave `class_names` empty) -- never a blind
+    default to classification.
+  - `create_map` accepts a `task` request field (the caller passes the
+    task its evaluation ran as) and its `map_ready` event now reports the
+    `task` the map was generated as, so a mismatch with the evaluation run
+    is visible rather than silent.
+
 ## [1.8.3]
 
 ### Changed
