@@ -30,16 +30,20 @@ def test_lists_each_uploaded_file_with_its_feature_count(client, monkeypatch):
     monkeypatch.setattr(
         srv, "_uploaded_shapefiles", [("austria.zip", _gdf(3)), ("snowdon.zip", _gdf(1))]
     )
+    monkeypatch.setattr(srv, "_test_shapefiles", [("austria_2020.zip", _gdf(2))])
     resp = client.get("/api/evaluation/list-shapefiles")
     assert resp.status_code == 200
-    assert resp.get_json()["files"] == [
+    body = resp.get_json()
+    assert body["files"] == [
         {"name": "austria.zip", "features": 3},
         {"name": "snowdon.zip", "features": 1},
     ]
+    assert body["test_files"] == [{"name": "austria_2020.zip", "features": 2}]
 
 
 def test_empty_when_nothing_uploaded(client, monkeypatch):
     monkeypatch.setattr(srv, "_uploaded_shapefiles", [])
+    monkeypatch.setattr(srv, "_test_shapefiles", [])
     resp = client.get("/api/evaluation/list-shapefiles")
     assert resp.status_code == 200
-    assert resp.get_json() == {"files": []}
+    assert resp.get_json() == {"files": [], "test_files": []}

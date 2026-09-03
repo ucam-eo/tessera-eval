@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.7]
+
+### Added
+- `run-large-area` accepts a **separate held-out test shapefile**. Upload
+  one shapefile as the training ground truth and a different one (via
+  `POST /api/evaluation/upload-shapefile` with `role=test`) as the test
+  set; the evaluation samples the test file at `test_year` and uses it as
+  the fixed test set. When a test file is present, any drawn train/test
+  rectangles are ignored, and spatial models are skipped (a fixed test
+  region has no neighbourhood features), same as the other fixed-test-set
+  paths. Classification requires the test file's classes to be a subset of
+  the training classes. Combined with the existing train/test years, this
+  is what lets a repeat survey be evaluated for between-year transfer with
+  real surface change in the data (Louis Driver). k-fold ignores it (it
+  makes its own folds) with a status note. The `start` event carries
+  `file_split: true` with `train_count` / `test_count`.
+- `POST /api/evaluation/upload-shapefile` takes a `role` form field
+  (`"train"` default / `"test"`); `GET /api/evaluation/list-shapefiles`
+  now returns `test_files` alongside `files`; `POST
+  /api/evaluation/clear-shapefiles` takes `{"role": "train"|"test"|"all"}`
+  (default `"all"`).
+
 ## [1.8.6]
 
 ### Changed

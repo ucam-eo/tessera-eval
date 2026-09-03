@@ -79,8 +79,10 @@ def _resolve_task(cache, task_override=None):
 
 # ── State (single-user, one process) ──
 
-_uploaded_shapefiles = []  # list of (filename, gdf) tuples
+_uploaded_shapefiles = []  # list of (filename, gdf) tuples -- training ground truth
 _merged_gdf = None
+_test_shapefiles = []  # optional separate held-out test ground truth
+_test_merged_gdf = None
 _trained_models = {}  # classifier name → temp file path
 _generated_maps = {}  # map name → temp file path (GeoTIFF)
 _finish_classifiers = set()
@@ -692,19 +694,31 @@ def _padded(gen):
             yield chunk
 
 
-def _get_merged_gdf():
-    """Return merged GeoDataFrame from all uploaded shapefiles."""
-    global _merged_gdf
-    if _merged_gdf is not None:
-        return _merged_gdf
-    if not _uploaded_shapefiles:
+def _merge_shapefiles(shapefiles):
+    """Concat a list of (name, gdf) tuples into one GeoDataFrame, or None."""
+    if not shapefiles:
         return None
     import pandas as pd
 
-    _merged_gdf = gpd.GeoDataFrame(
-        pd.concat([g for _, g in _uploaded_shapefiles], ignore_index=True)
-    )
+    return gpd.GeoDataFrame(pd.concat([g for _, g in shapefiles], ignore_index=True))
+
+
+def _get_merged_gdf():
+    """Return merged GeoDataFrame from all uploaded (training) shapefiles."""
+    global _merged_gdf
+    if _merged_gdf is None:
+        _merged_gdf = _merge_shapefiles(_uploaded_shapefiles)
     return _merged_gdf
+
+
+def _get_test_merged_gdf():
+    """Return merged GeoDataFrame from the separate held-out test shapefiles,
+    or None if none uploaded. Used as a fixed test set by run_large_area --
+    lets a repeat survey be evaluated for between-year transfer (Louis Driver)."""
+    global _test_merged_gdf
+    if _test_merged_gdf is None:
+        _test_merged_gdf = _merge_shapefiles(_test_shapefiles)
+    return _test_merged_gdf
 
 
 # ── Local evaluation endpoints ──
@@ -712,8 +726,16 @@ def _get_merged_gdf():
 
 @app.route("/api/evaluation/upload-shapefile", methods=["POST"])
 def upload_shapefile():
-    """Accept a .zip containing .shp/.dbf/.shx/.prj, append to shapefile list."""
-    global _merged_gdf
+    """Accept a .zip containing .shp/.dbf/.shx/.prj, append to a shapefile list.
+
+    `role` form field: "train" (default) adds to the training ground truth;
+    "test" adds to the separate held-out test set (run_large_area then uses
+    it as a fixed test set and ignores any drawn train/test rectangles).
+    """
+    global _merged_gdf, _test_merged_gdf
+    role = (request.form.get("role") or "train").lower()
+    if role not in ("train", "test"):
+        return jsonify({"error": f"Unknown upload role '{role}'"}), 400
     uploaded = request.files.get("file")
     if not uploaded:
         return jsonify({"error": "No file uploaded"}), 400
@@ -755,18 +777,23 @@ def upload_shapefile():
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
-    _uploaded_shapefiles.append((uploaded.filename, gdf))
-    _merged_gdf = None  # invalidate merged GDF cache
+    if role == "test":
+        _test_shapefiles.append((uploaded.filename, gdf))
+        _test_merged_gdf = None
+    else:
+        _uploaded_shapefiles.append((uploaded.filename, gdf))
+        _merged_gdf = None  # invalidate merged GDF cache
     # Note: _tile_cache is NOT invalidated here — tiles don't depend on shapefile.
     # The cache key is (field, year) which naturally misses if field changes.
     logger.info(
-        "Uploaded '%s': %d features, %d fields",
+        "Uploaded '%s' (%s): %d features, %d fields",
         uploaded.filename,
+        role,
         len(gdf),
         len([c for c in gdf.columns if c != "geometry"]),
     )
 
-    merged = _get_merged_gdf()
+    merged = _get_test_merged_gdf() if role == "test" else _get_merged_gdf()
 
     # Build field info with non-null counts
     fields = []
@@ -810,9 +837,11 @@ def upload_shapefile():
 
     return jsonify(
         {
+            "role": role,
             "fields": fields,
             "geojson": geojson,
             "files": [f for f, _ in _uploaded_shapefiles],
+            "test_files": [f for f, _ in _test_shapefiles],
             "estimated_labelled_pixels": estimated_labelled_pixels,
         }
     )
@@ -820,22 +849,31 @@ def upload_shapefile():
 
 @app.route("/api/evaluation/list-shapefiles", methods=["GET"])
 def list_shapefiles():
-    """Names + feature counts of the shapefiles currently merged into the
-    ground-truth set. Uploads accumulate (multi-shapefile merge, by design);
-    the viewer shows this on entering Validation so an earlier upload that's
-    still in the set is visible rather than a surprise."""
+    """Names + feature counts of the shapefiles currently loaded, split by
+    role: `files` = training ground truth, `test_files` = the optional
+    separate held-out test set. Uploads accumulate (multi-shapefile merge);
+    the viewer shows both lists on entering Validation."""
     return jsonify(
-        {"files": [{"name": name, "features": int(len(gdf))} for name, gdf in _uploaded_shapefiles]}
+        {
+            "files": [{"name": n, "features": int(len(g))} for n, g in _uploaded_shapefiles],
+            "test_files": [{"name": n, "features": int(len(g))} for n, g in _test_shapefiles],
+        }
     )
 
 
 @app.route("/api/evaluation/clear-shapefiles", methods=["POST"])
 def clear_shapefiles():
-    """Clear all uploaded shapefiles."""
-    global _merged_gdf
-    _uploaded_shapefiles.clear()
-    _merged_gdf = None
-    return jsonify({"ok": True})
+    """Clear uploaded shapefiles. `role` in the JSON body: "train", "test",
+    or "all" (default) to clear both."""
+    global _merged_gdf, _test_merged_gdf
+    role = ((request.get_json(silent=True) or {}).get("role") or "all").lower()
+    if role in ("all", "train"):
+        _uploaded_shapefiles.clear()
+        _merged_gdf = None
+    if role in ("all", "test"):
+        _test_shapefiles.clear()
+        _test_merged_gdf = None
+    return jsonify({"ok": True, "role": role})
 
 
 @app.route("/api/evaluation/cancel", methods=["POST"])
@@ -910,6 +948,22 @@ def run_large_area():
     if field_name not in gdf.columns:
         return jsonify({"error": f"Field '{field_name}' not found in shapefile"}), 400
 
+    # Optional separate held-out test file. When present it is the fixed test
+    # set (sampled at test_year) and the drawn train/test rectangles are
+    # ignored -- lets a repeat survey be tested for between-year transfer
+    # with real surface change in the data (Louis Driver). k-fold makes its
+    # own folds, so a test file doesn't apply there.
+    test_field_name = body.get("test_field") or field_name
+    test_gdf = _get_test_merged_gdf()
+    has_test_file = test_gdf is not None and eval_mode != "kfold"
+    if has_test_file:
+        if test_field_name not in test_gdf.columns:
+            return jsonify(
+                {"error": f"Field '{test_field_name}' not found in the test shapefile"}
+            ), 400
+        train_bboxes = []
+        test_bboxes = []
+
     # Auto-detect task type
     from tessera_eval.evaluate import detect_field_type
 
@@ -970,7 +1024,9 @@ def run_large_area():
     # A fixed test set (spatial bboxes, or a different test year) has no
     # neighbourhood features, so spatial models are skipped for such runs
     # and their (expensive) feature extraction is not worth doing.
-    has_fixed_test_set = bool(train_bboxes or test_bboxes) or test_year != train_year
+    has_fixed_test_set = (
+        bool(train_bboxes or test_bboxes) or test_year != train_year or has_test_file
+    )
 
     # Determine which spatial features are needed (check base names)
     needs_spatial_3x3 = (
@@ -1705,7 +1761,7 @@ def run_large_area():
         #   - bboxes drawn: keep today's spatial train/test-region split, but
         #     embed the test region at test_year instead of train_year.
         year_split_test_vectors = year_split_test_labels = None
-        if test_year != train_year:
+        if test_year != train_year and not has_test_file:
             if all_sample_points is None or all_valid_mask is None:
                 # Shouldn't happen -- has_spatial_bboxes forces a fresh fetch
                 # (which always populates these) whenever years differ. Kept
@@ -1839,6 +1895,173 @@ def run_large_area():
             year_split_test_vectors = ty_vectors[ty_valid].astype(np.float32)
             year_split_test_labels = test_role_labels_pool[ty_valid]
 
+        # Separate held-out test file: sample it (at test_year) and use it as
+        # the fixed test set. Rectangles were already cleared above and the
+        # same-points year-split path skipped, so this is the only test set.
+        file_split_test_vectors = file_split_test_labels = None
+        if has_test_file:
+            valid_test_gdf = test_gdf.dropna(subset=[test_field_name]).copy()
+            if len(valid_test_gdf) == 0:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": f"Test file has no rows with a value in '{test_field_name}'",
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            tf_points = []
+            tf_labels = []
+            tf_rng = np.random.RandomState(seed + 1)
+            tf_budget = max_train if max_train else 200_000
+
+            if is_classification:
+                le_names = LabelEncoder().fit(np.array(class_names))
+                test_vals = valid_test_gdf[test_field_name].astype(str)
+                unknown = sorted(set(test_vals.unique()) - {str(c) for c in class_names})
+                if unknown:
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "message": (
+                                    "Test file has classes not present in the training data: "
+                                    + ", ".join(unknown[:10])
+                                    + (" …" if len(unknown) > 10 else "")
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
+                    return
+                classes_present = sorted(test_vals.unique())
+                per_class = max(50, tf_budget // max(1, len(classes_present)))
+                for cls in classes_present:
+                    cls_gdf = valid_test_gdf[test_vals == cls]
+                    try:
+                        coords, _ = _sample_points_within_budget(cls_gdf, per_class, tf_rng)
+                    except Exception as e:
+                        logger.warning("test-file sampling failed for class %s: %s", cls, e)
+                        continue
+                    if len(coords):
+                        cid = int(le_names.transform([cls])[0])
+                        tf_points.extend(coords.tolist())
+                        tf_labels.extend([cid] * len(coords))
+            else:
+                try:
+                    coords, ridx = _sample_points_within_budget(valid_test_gdf, tf_budget, tf_rng)
+                except Exception as e:
+                    yield (
+                        json.dumps({"event": "error", "message": f"Test-file sampling failed: {e}"})
+                        + "\n"
+                    )
+                    return
+                if len(coords):
+                    vals = valid_test_gdf.loc[ridx, test_field_name].to_numpy(dtype=np.float64)
+                    tf_points.extend(coords.tolist())
+                    tf_labels.extend(vals.tolist())
+
+            if not tf_points:
+                yield (
+                    json.dumps(
+                        {"event": "error", "message": "No usable points sampled from the test file"}
+                    )
+                    + "\n"
+                )
+                return
+
+            if _geotessera_instance is None:
+                tile_cache_dir = _get_cache_dir() / "tiles"
+                tile_cache_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                except Exception as e:
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "message": f"Could not initialize GeoTessera for the test file: {e}",
+                            }
+                        )
+                        + "\n"
+                    )
+                    return
+            gt = _geotessera_instance
+
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            f"Fetching test-file embeddings ({test_year}) for "
+                            f"{len(tf_points):,} points..."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+
+            tf_holder = [None, None]
+
+            def _fetch_test_file():
+                try:
+                    tf_holder[0] = gt.sample_embeddings_at_points(tf_points, year=test_year)
+                except Exception as e:
+                    tf_holder[1] = e
+
+            tf_thread = threading.Thread(target=_fetch_test_file, daemon=True)
+            tf_thread.start()
+            while tf_thread.is_alive():
+                if _cancelled():
+                    yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
+                    return
+                tf_thread.join(timeout=5)
+                if tf_thread.is_alive():
+                    yield json.dumps({"event": "heartbeat"}) + "\n"
+
+            if tf_holder[1] is not None:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": f"Test-file embedding fetch failed: {tf_holder[1]}",
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            tf_vecs = tf_holder[0]
+            tf_lbls = np.array(tf_labels)
+            tf_valid = ~np.isnan(tf_vecs).any(axis=1)
+            n_drop = int(len(tf_vecs) - tf_valid.sum())
+            if n_drop:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": f"Test file: {n_drop:,} points outside coverage, dropped",
+                        }
+                    )
+                    + "\n"
+                )
+            if tf_valid.sum() == 0:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": f"No valid test-file embeddings at year {test_year}",
+                        }
+                    )
+                    + "\n"
+                )
+                return
+            file_split_test_vectors = tf_vecs[tf_valid].astype(np.float32)
+            file_split_test_labels = tf_lbls[tf_valid]
+
         # Training percentages (% of labelled area)
         training_pcts = [1, 3, 5, 10, 20, 30, 50, 80]
         if max_train:
@@ -1957,6 +2180,10 @@ def run_large_area():
             start_event["year_split"] = True
             start_event["train_count"] = int(len(labels))
             start_event["test_count"] = int(len(year_split_test_labels))
+        if file_split_test_vectors is not None:
+            start_event["file_split"] = True
+            start_event["train_count"] = int(len(labels))
+            start_event["test_count"] = int(len(file_split_test_labels))
         yield json.dumps(start_event) + "\n"
 
         # Run learning curve (all classifiers including U-Net)
@@ -1982,6 +2209,12 @@ def run_large_area():
             # vectors must come from test_year, not train_year.
             lc_kwargs["test_vectors"] = year_split_test_vectors
             lc_kwargs["test_labels"] = year_split_test_labels
+        if file_split_test_vectors is not None:
+            # A separate test file is the strongest signal -- it cleared the
+            # bboxes and skipped the year-split path, so nothing above set
+            # these, but assign last to be explicit.
+            lc_kwargs["test_vectors"] = file_split_test_vectors
+            lc_kwargs["test_labels"] = file_split_test_labels
 
         if eval_mode == "kfold":
             # k-fold CV over all labelled pixels. No learning curve, no
@@ -1990,6 +2223,20 @@ def run_large_area():
             # dropped from model_names above). Emits fold_result / aggregate
             # / confusion_matrices, which the frontend already understands.
             from tessera_eval.evaluate import run_kfold_cv
+
+            if test_gdf is not None:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": (
+                                "Test file ignored — k-fold cross-validation makes its own "
+                                "folds. Switch to the learning curve to use it."
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
 
             for _n in kfold_dropped:
                 yield (
