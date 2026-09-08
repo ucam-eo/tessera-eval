@@ -107,6 +107,12 @@ def test_kfold_regression_folds_and_aggregate(client, monkeypatch):
     # No learning curve in k-fold mode.
     assert not [e for e in events if e["event"] == "progress" and "classifiers" in e]
 
+    # k-fold regression now emits a pooled predicted-vs-actual scatter
+    # (Louis Driver: was missing from both the viewer and the JSON).
+    for name in ("nn_reg", "rf_reg"):
+        sc = agg["models"][name].get("scatter")
+        assert sc and sc["y_true"] and len(sc["y_true"]) == len(sc["y_pred"])
+
 
 def test_kfold_classification_has_confusion_matrix(client, monkeypatch):
     monkeypatch.setattr(srv, "_get_merged_gdf", lambda: _classification_gdf())
@@ -188,6 +194,34 @@ def test_kfold_k_is_clamped(client, monkeypatch):
     start = next(e for e in events if e["event"] == "start")
     assert start["k"] == 20
     assert len([e for e in events if e["event"] == "fold_result"]) == 20
+
+
+def test_learning_curve_with_only_spatial_models_and_a_spatial_split_errors(client, monkeypatch):
+    # Spatial MLP can't run against a fixed test region, so with a spatial
+    # split and nothing else selected there is nothing to evaluate. This
+    # used to loop through the training percentages doing nothing and
+    # "complete" silently (Louis Driver); now it errors clearly.
+    monkeypatch.setattr(srv, "_get_merged_gdf", lambda: _classification_gdf())
+    body = dict(
+        field="species",
+        task="classification",
+        classifiers=["spatial_mlp"],
+        # south, west, north, east -- two non-overlapping regions that each
+        # hold some polygons, so the split itself succeeds.
+        train_bboxes=[[0, 0, 1.8, 1.8]],
+        test_bboxes=[[1.8, 1.8, 3.7, 3.7]],
+        sampling="equal",
+        max_training_samples=400,
+    )
+    resp = client.post("/api/evaluation/run-large-area", json=body)
+    assert resp.status_code == 200
+    evs = [json.loads(line) for line in resp.text.strip().splitlines()]
+    err = [e for e in evs if e.get("event") == "error"]
+    assert err, f"expected an error event, got: {[e.get('event') for e in evs]}"
+    assert "spatial" in err[0]["message"].lower()
+    # no learning-curve progress (those carry "classifiers") -- the run
+    # stopped instead of grinding through the percentages doing nothing
+    assert not [e for e in evs if e.get("event") == "progress" and "classifiers" in e]
 
 
 def test_default_mode_is_still_learning_curve(client, monkeypatch):

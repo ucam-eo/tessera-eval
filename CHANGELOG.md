@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.10.0]
+
+### Added
+- **k-fold regression now emits a predicted-vs-actual scatter.**
+  `run_kfold_cv` pools the held-out predictions across all folds (every
+  sampled point is a test point in exactly one fold), subsamples for
+  display, and attaches `{"scatter": {"y_true": [...], "y_pred": [...]}}`
+  to each model's entry in the `aggregate` event — the same shape
+  `run_learning_curve` emits, so the viewer's scatter plot and the CSV
+  export pick it up with no frontend change. Previously k-fold regression
+  runs had no scatter in the viewer or the results JSON (Louis Driver).
+- **`run_kfold_cv` logs per-fold progress** — a header line (k, task,
+  point count, models) and one `Fold i/k done in N.Ns — <scores>` line
+  per fold, matching `run_learning_curve`'s terminal output. Makes a
+  headless k-fold run followable (Louis Driver).
+
+### Fixed
+- **`run-large-area` learning-curve runs with no models left to evaluate
+  now return a clear error instead of silently "completing".** Selecting
+  only Spatial MLP / U-Net together with a spatial split (or a different
+  test year, or a separate test file) drops every model — a fixed test
+  set has no neighbourhood features — leaving nothing to run; the learning
+  curve then looped through the training percentages doing nothing and
+  finished with "0 classifiers" (Louis Driver). The k-fold branch already
+  guarded this; the learning-curve branch now does too, and names the
+  cause (spatial models + a fixed test set), pointing at the pixel models
+  or k-fold (which supports Spatial MLP).
+
 ## [1.9.0]
 
 ### Added

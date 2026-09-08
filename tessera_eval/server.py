@@ -2320,6 +2320,34 @@ def run_large_area():
                 elif et == "heartbeat":
                     yield json.dumps({"event": "heartbeat"}) + "\n"
 
+        # A learning-curve run with nothing left to evaluate (every selected
+        # model was dropped) otherwise loops through the training
+        # percentages doing nothing and "completes" silently -- confirmed
+        # live (Louis Driver): "0 classifiers", 0.0s per pct. The k-fold
+        # branch already guards this; do the same here, and name the usual
+        # cause (spatial models + a fixed test set).
+        if eval_mode != "kfold" and not active_models:
+            dropped_spatial = sorted(
+                {
+                    _base_name(n)
+                    for n in model_names
+                    if _base_name(n) in SPATIAL_MODELS or _base_name(n) == "unet"
+                }
+            )
+            if dropped_spatial and has_fixed_test_set:
+                msg = (
+                    "No models left to evaluate. Spatial MLP and U-Net can't run with a "
+                    "separate test region, a different test year, or a separate test file — "
+                    "they need a neighbourhood of pixels around every test point, which a "
+                    "fixed test set doesn't provide. Use a pixel model (k-NN, Random Forest, "
+                    "XGBoost, MLP), or switch to k-fold cross-validation, which now supports "
+                    "Spatial MLP."
+                )
+            else:
+                msg = "No models to evaluate — select at least one classifier."
+            yield json.dumps({"event": "error", "message": msg}) + "\n"
+            return
+
         for event in (
             run_learning_curve(vectors, labels, active_models, training_pcts, **lc_kwargs)
             if eval_mode != "kfold"

@@ -888,6 +888,8 @@ def run_kfold_cv(
         - {"type": "confusion_matrices", "confusion_matrices": {name: [[int]]}}
           (classification only)
     """
+    import time as _time
+
     warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
     warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
     from sklearn.exceptions import ConvergenceWarning
@@ -946,8 +948,23 @@ def run_kfold_cv(
 
     # Collect per-fold metrics for aggregation
     all_fold_metrics = {name: [] for name in run_names}
+    # Regression only: pooled held-out predicted-vs-actual points for a
+    # scatter plot. Every point is a test point in exactly one fold, so
+    # this is the whole sample predicted once -- a more complete scatter
+    # than the learning curve's single held-out split.
+    scatter_pool = {name: {"y_true": [], "y_pred": []} for name in run_names}
+
+    logger.info(
+        "K-fold CV: k=%d, %s, %d point%s, models=%s",
+        k,
+        task,
+        len(labels),
+        "s" if len(labels) != 1 else "",
+        ", ".join(run_names) or "(none)",
+    )
 
     for fold_idx in range(k):
+        _fold_t0 = _time.time()
         train_idx, test_idx = pix_folds[fold_idx]
         if max_training_samples and len(train_idx) > max_training_samples:
             rng = np.random.RandomState(seed + fold_idx)
@@ -1008,6 +1025,8 @@ def run_kfold_cv(
                         model.fit(X_tr, y_tr)
                     y_pred = model.predict(X_te)
                     metrics = regression_metrics(y_te, y_pred)
+                    scatter_pool[name]["y_true"].append(np.asarray(y_te, dtype=float))
+                    scatter_pool[name]["y_pred"].append(np.asarray(y_pred, dtype=float))
             except Exception as exc:
                 logger.warning("Model %s failed on fold %d: %s", name, fold_idx + 1, exc)
                 if is_classification:
@@ -1017,6 +1036,20 @@ def run_kfold_cv(
 
             fold_results[name] = metrics
             all_fold_metrics[name].append(metrics)
+
+        _score_str = ", ".join(
+            "{}={:.4f}".format(
+                nm, m.get("mean_f1", m.get("r2", 0.0)) if isinstance(m, dict) else 0.0
+            )
+            for nm, m in fold_results.items()
+        )
+        logger.info(
+            "  Fold %d/%d done in %.1fs — %s",
+            fold_idx + 1,
+            k,
+            _time.time() - _fold_t0,
+            _score_str,
+        )
 
         yield {"type": "fold_result", "fold": fold_idx + 1, "models": fold_results}
 
@@ -1045,6 +1078,20 @@ def run_kfold_cv(
                 "mean_mae": round(float(np.mean(maes)), 4),
                 "std_mae": round(float(np.std(maes)), 4),
             }
+            # Pooled held-out predicted-vs-actual, subsampled, for the
+            # frontend scatter plot (same {"scatter": {y_true, y_pred}}
+            # shape the learning curve emits).
+            yt = scatter_pool[name]["y_true"]
+            if yt:
+                all_true = np.concatenate(yt)
+                all_pred = np.concatenate(scatter_pool[name]["y_pred"])
+                sc_true, sc_pred = _subsample_for_scatter(
+                    all_true, all_pred, np.random.RandomState(seed)
+                )
+                aggregate[name]["scatter"] = {
+                    "y_true": sc_true.tolist(),
+                    "y_pred": sc_pred.tolist(),
+                }
 
     yield {"type": "aggregate", "models": aggregate}
 
