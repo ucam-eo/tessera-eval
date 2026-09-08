@@ -846,12 +846,26 @@ def run_kfold_cv(
     model_params=None,
     max_training_samples=None,
     seed=42,
+    spatial_vectors=None,
+    spatial_vectors_5x5=None,
+    spatial_labels=None,
+    dim=None,
 ):
     """Generator that yields per-fold and aggregate results for k-fold CV.
 
     Supports both classification and regression tasks. For classification,
     uses StratifiedKFold and computes F1 scores + confusion matrices.
     For regression, uses KFold and computes R², RMSE, MAE.
+
+    Pixel models (nn, rf, xgboost, mlp) cross-validate over ``vectors`` /
+    ``labels`` directly. Spatial MLP models (spatial_mlp, spatial_mlp_5x5)
+    cross-validate over their own neighbourhood-feature points
+    (``spatial_vectors`` / ``spatial_vectors_5x5`` with ``spatial_labels``),
+    which are a different -- generally larger -- set drawn from downloaded
+    tile crops, so they get their own k-fold split (seeded identically).
+    A spatial model whose features weren't supplied is silently skipped
+    (the server drops those upstream and reports it on the wire). U-Net is
+    not supported here -- it trains on image patches, not points.
 
     Args:
         vectors: float32 array, shape (N, dim)
@@ -862,6 +876,10 @@ def run_kfold_cv(
         model_params: Optional dict of {model_name: {param: value}}
         max_training_samples: Optional cap on training set size per fold
         seed: Random seed for reproducibility
+        spatial_vectors: Optional float32 array, shape (M, 9*dim), for spatial_mlp
+        spatial_vectors_5x5: Optional float32 array, shape (M, 25*dim), for spatial_mlp_5x5
+        spatial_labels: Optional labels aligned with the spatial vectors, shape (M,)
+        dim: Embedding dim (for augment_spatial reshape); inferred if omitted
 
     Yields:
         dict events:
@@ -878,17 +896,59 @@ def run_kfold_cv(
 
     is_classification = task == "classification"
 
+    def _base(n):
+        return _strip_variant_suffix(n)
+
+    # Keep only models we can actually run: pixel models always, a spatial
+    # model only if its neighbourhood features were supplied.
+    run_names = []
+    for name in model_names:
+        b = _base(name)
+        if b == "spatial_mlp":
+            if spatial_vectors is not None and spatial_labels is not None:
+                run_names.append(name)
+        elif b == "spatial_mlp_5x5":
+            if spatial_vectors_5x5 is not None and spatial_labels is not None:
+                run_names.append(name)
+        else:
+            run_names.append(name)
+
+    if dim is None:
+        if spatial_vectors is not None:
+            dim = spatial_vectors.shape[1] // 9
+        elif spatial_vectors_5x5 is not None:
+            dim = spatial_vectors_5x5.shape[1] // 25
+        elif vectors is not None:
+            dim = vectors.shape[1]
+
     if is_classification:
-        splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+        pix_splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+        sp_splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
         n_classes = len(np.unique(labels))
-        cm_accum = {name: np.zeros((n_classes, n_classes), dtype=np.int64) for name in model_names}
+        if spatial_labels is not None and len(spatial_labels):
+            # A spatial test fold could hold a class absent from the pixel
+            # points (or vice versa); size the CM for the union.
+            n_classes = max(n_classes, int(np.max(spatial_labels)) + 1)
+        cm_accum = {name: np.zeros((n_classes, n_classes), dtype=np.int64) for name in run_names}
     else:
-        splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
+        pix_splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
+        sp_splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
+
+    pix_folds = list(pix_splitter.split(vectors, labels))
+
+    # Spatial 3x3 and 5x5 features come from the same patches, so a single
+    # split over spatial_labels serves both.
+    need_spatial = any(_base(n) in SPATIAL_MODELS for n in run_names)
+    sp_folds = None
+    if need_spatial:
+        sp_ref = spatial_vectors if spatial_vectors is not None else spatial_vectors_5x5
+        sp_folds = list(sp_splitter.split(sp_ref, spatial_labels))
 
     # Collect per-fold metrics for aggregation
-    all_fold_metrics = {name: [] for name in model_names}
+    all_fold_metrics = {name: [] for name in run_names}
 
-    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(vectors, labels)):
+    for fold_idx in range(k):
+        train_idx, test_idx = pix_folds[fold_idx]
         if max_training_samples and len(train_idx) > max_training_samples:
             rng = np.random.RandomState(seed + fold_idx)
             train_idx = rng.choice(train_idx, size=max_training_samples, replace=False)
@@ -896,15 +956,32 @@ def run_kfold_cv(
         X_train, y_train = vectors[train_idx], labels[train_idx]
         X_test, y_test = vectors[test_idx], labels[test_idx]
 
+        sp_tr = sp_te = None
+        if sp_folds is not None:
+            sp_tr, sp_te = sp_folds[fold_idx]
+            if max_training_samples and len(sp_tr) > max_training_samples:
+                rng_sp = np.random.RandomState(seed + 1000 + fold_idx)
+                sp_tr = rng_sp.choice(sp_tr, size=max_training_samples, replace=False)
+
         fold_results = {}
-        for name in model_names:
+        for name in run_names:
+            b = _base(name)
             try:
-                if is_classification:
-                    model = make_classifier(name, (model_params or {}).get(name, {}), seed=seed)
+                if b == "spatial_mlp":
+                    X_tr, y_tr = augment_spatial(
+                        spatial_vectors[sp_tr], spatial_labels[sp_tr], window=3, dim=dim
+                    )
+                    X_te, y_te = spatial_vectors[sp_te], spatial_labels[sp_te]
+                elif b == "spatial_mlp_5x5":
+                    X_tr, y_tr = augment_spatial(
+                        spatial_vectors_5x5[sp_tr], spatial_labels[sp_tr], window=5, dim=dim
+                    )
+                    X_te, y_te = spatial_vectors_5x5[sp_te], spatial_labels[sp_te]
                 else:
-                    model = make_regressor(name, (model_params or {}).get(name, {}), seed=seed)
+                    X_tr, y_tr, X_te, y_te = X_train, y_train, X_test, y_test
 
                 if is_classification:
+                    model = make_classifier(name, (model_params or {}).get(name, {}), seed=seed)
                     # Same xgboost contiguous-label requirement as
                     # run_learning_curve -- see _fit_predict_relabeled's
                     # docstring. StratifiedKFold makes this less likely
@@ -912,24 +989,25 @@ def run_kfold_cv(
                     # preserve class proportions per fold), but a class
                     # with very few total samples can still end up absent
                     # from a training fold.
-                    y_pred = yield from _fit_predict_relabeled(model, X_train, y_train, X_test)
-                else:
-                    model.fit(X_train, y_train)
-                    y_pred = model.predict(X_test)
-
-                if is_classification:
+                    y_pred = yield from _fit_predict_relabeled(model, X_tr, y_tr, X_te)
                     metrics = {
                         "mean_f1": round(
-                            float(f1_score(y_test, y_pred, average="macro", zero_division=0)), 4
+                            float(f1_score(y_te, y_pred, average="macro", zero_division=0)), 4
                         ),
                         "mean_f1w": round(
-                            float(f1_score(y_test, y_pred, average="weighted", zero_division=0)), 4
+                            float(f1_score(y_te, y_pred, average="weighted", zero_division=0)), 4
                         ),
                     }
-                    cm = confusion_matrix(y_test, y_pred, labels=np.arange(n_classes))
+                    cm = confusion_matrix(y_te, y_pred, labels=np.arange(n_classes))
                     cm_accum[name] += cm
                 else:
-                    metrics = regression_metrics(y_test, y_pred)
+                    model = make_regressor(name, (model_params or {}).get(name, {}), seed=seed)
+                    if b in SPATIAL_MODELS:
+                        yield from _fit_with_heartbeat(lambda: model.fit(X_tr, y_tr))
+                    else:
+                        model.fit(X_tr, y_tr)
+                    y_pred = model.predict(X_te)
+                    metrics = regression_metrics(y_te, y_pred)
             except Exception as exc:
                 logger.warning("Model %s failed on fold %d: %s", name, fold_idx + 1, exc)
                 if is_classification:
@@ -944,7 +1022,7 @@ def run_kfold_cv(
 
     # Aggregate across folds
     aggregate = {}
-    for name in model_names:
+    for name in run_names:
         folds = all_fold_metrics[name]
         if is_classification:
             f1s = [f["mean_f1"] for f in folds]
@@ -973,7 +1051,7 @@ def run_kfold_cv(
     # Confusion matrices for classification
     if is_classification:
         confusion_matrices = {}
-        for name in model_names:
+        for name in run_names:
             if cm_accum[name].any():
                 confusion_matrices[name] = cm_accum[name].tolist()
         if confusion_matrices:

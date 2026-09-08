@@ -216,6 +216,133 @@ class TestRunKfoldRegression:
         assert len(cm_events) == 0
 
 
+# ── TestRunKfoldSpatial ──
+
+
+@pytest.fixture
+def spatial_classification_data():
+    """3 classes, 180 neighbourhood-feature points, dim=8.
+
+    Returns (spatial_3x3, spatial_5x5, spatial_labels) with 3x3 features
+    shape (180, 72) and 5x5 features shape (180, 200); labels are 0..2.
+    """
+    rng = np.random.RandomState(7)
+    dim = 8
+    n_per_class = 60
+    v3, v5, labels = [], [], []
+    for cls in range(3):
+        c3 = rng.randn(9 * dim) * 2
+        c5 = rng.randn(25 * dim) * 2
+        v3.append(c3 + rng.randn(n_per_class, 9 * dim) * 0.5)
+        v5.append(c5 + rng.randn(n_per_class, 25 * dim) * 0.5)
+        labels.extend([cls] * n_per_class)
+    return (
+        np.vstack(v3).astype(np.float32),
+        np.vstack(v5).astype(np.float32),
+        np.array(labels),
+    )
+
+
+class TestRunKfoldSpatial:
+    def _pixel_data(self):
+        rng = np.random.RandomState(1)
+        X = rng.randn(150, 8).astype(np.float32)
+        y = np.array([0, 1, 2] * 50)
+        return X, y
+
+    def test_spatial_mlp_3x3_folds_aggregate_and_cm(self, spatial_classification_data):
+        v3, v5, sp_labels = spatial_classification_data
+        px, py = self._pixel_data()
+        events = list(
+            run_kfold_cv(
+                px,
+                py,
+                ["rf", "spatial_mlp"],
+                k=3,
+                task="classification",
+                spatial_vectors=v3,
+                spatial_labels=sp_labels,
+                dim=8,
+            )
+        )
+        folds = [e for e in events if e["type"] == "fold_result"]
+        assert len(folds) == 3
+        assert all(set(f["models"]) == {"rf", "spatial_mlp"} for f in folds)
+        for f in folds:
+            assert 0 <= f["models"]["spatial_mlp"]["mean_f1"] <= 1
+        agg = [e for e in events if e["type"] == "aggregate"][0]
+        assert {"mean_f1", "std_f1"} <= set(agg["models"]["spatial_mlp"])
+        cm = [e for e in events if e["type"] == "confusion_matrices"][0]
+        assert "spatial_mlp" in cm["confusion_matrices"]
+        assert len(cm["confusion_matrices"]["spatial_mlp"]) == 3
+
+    def test_spatial_mlp_5x5_runs(self, spatial_classification_data):
+        v3, v5, sp_labels = spatial_classification_data
+        px, py = self._pixel_data()
+        events = list(
+            run_kfold_cv(
+                px,
+                py,
+                ["spatial_mlp_5x5"],
+                k=3,
+                task="classification",
+                spatial_vectors_5x5=v5,
+                spatial_labels=sp_labels,
+                dim=8,
+            )
+        )
+        folds = [e for e in events if e["type"] == "fold_result"]
+        assert len(folds) == 3
+        assert all("spatial_mlp_5x5" in f["models"] for f in folds)
+
+    def test_spatial_mlp_regression(self, spatial_classification_data):
+        v3, v5, _ = spatial_classification_data
+        rng = np.random.RandomState(3)
+        sp_targets = (v3[:, :8].sum(axis=1) + rng.randn(len(v3)) * 0.1).astype(np.float32)
+        px = rng.randn(150, 8).astype(np.float32)
+        py = (px.sum(axis=1)).astype(np.float32)
+        events = list(
+            run_kfold_cv(
+                px,
+                py,
+                ["spatial_mlp"],
+                k=3,
+                task="regression",
+                spatial_vectors=v3,
+                spatial_labels=sp_targets,
+                dim=8,
+            )
+        )
+        agg = [e for e in events if e["type"] == "aggregate"][0]
+        assert {"mean_r2", "mean_rmse", "mean_mae"} <= set(agg["models"]["spatial_mlp"])
+        assert not [e for e in events if e["type"] == "confusion_matrices"]
+
+    def test_missing_spatial_features_skips_model(self):
+        px, py = self._pixel_data()
+        events = list(
+            run_kfold_cv(
+                px, py, ["rf", "spatial_mlp"], k=3, task="classification"
+            )
+        )
+        folds = [e for e in events if e["type"] == "fold_result"]
+        assert all(set(f["models"]) == {"rf"} for f in folds)
+
+    def test_deterministic_across_runs(self, spatial_classification_data):
+        v3, v5, sp_labels = spatial_classification_data
+        px, py = self._pixel_data()
+        kw = dict(
+            k=3,
+            task="classification",
+            spatial_vectors=v3,
+            spatial_labels=sp_labels,
+            dim=8,
+            seed=99,
+        )
+        a = [e for e in run_kfold_cv(px, py, ["spatial_mlp"], **kw) if e["type"] == "aggregate"][0]
+        b = [e for e in run_kfold_cv(px, py, ["spatial_mlp"], **kw) if e["type"] == "aggregate"][0]
+        assert a["models"] == b["models"]
+
+
 # ── TestRegressionMetrics ──
 
 

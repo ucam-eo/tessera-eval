@@ -133,21 +133,46 @@ def test_kfold_classification_has_confusion_matrix(client, monkeypatch):
     assert "rf" in cm["confusion_matrices"]
 
 
-def test_kfold_skips_spatial_and_unet_models(client, monkeypatch):
+def test_kfold_runs_spatial_mlp_and_skips_unet(client, monkeypatch):
     monkeypatch.setattr(srv, "_get_merged_gdf", lambda: _classification_gdf())
+
+    def _fake_extract(gt, gdf, field_name, year, le, n_classes, **kw):
+        pts = kw.get("sample_points_lonlat") or []
+        n = len(pts)
+        rng = np.random.RandomState(0)
+        vectors = np.array([[p[0] - p[1]] for p in pts], dtype=np.float32) + rng.normal(
+            scale=0.05, size=(n, EMBED_DIM)
+        ).astype(np.float32)
+        M = 150
+        s3 = s5 = lbls = None
+        if kw.get("needs_spatial_3x3"):
+            lbls = np.array([0, 1, 2] * (M // 3))
+            s3 = (rng.normal(size=(M, 9 * EMBED_DIM)) + lbls[:, None] * 3.0).astype(np.float32)
+        if kw.get("needs_spatial_5x5"):
+            lbls = np.array([0, 1, 2] * (M // 3))
+            s5 = (rng.normal(size=(M, 25 * EMBED_DIM)) + lbls[:, None] * 3.0).astype(np.float32)
+        return ([], s3, s5, vectors, lbls, lbls)
+
+    monkeypatch.setattr(srv, "_extract_tile_patches", _fake_extract)
+
     events = _run(
         client,
         field="species",
         task="classification",
         eval_mode="kfold",
-        kfold_k=2,
+        kfold_k=3,
         classifiers=["rf", "spatial_mlp", "unet"],
     )
     msgs = " ".join(e.get("message", "") for e in events if e["event"] == "status")
-    assert "spatial_mlp skipped" in msgs
     assert "unet skipped" in msgs
     folds = [e for e in events if e["event"] == "fold_result"]
-    assert all(set(f["models"]) == {"rf"} for f in folds)
+    assert folds
+    assert all("spatial_mlp" in f["models"] for f in folds)
+    assert all("rf" in f["models"] for f in folds)
+    assert all("unet" not in f["models"] for f in folds)
+
+    agg = next(e for e in events if e["event"] == "aggregate")
+    assert {"mean_f1", "std_f1"} <= set(agg["models"]["spatial_mlp"])
 
 
 def test_kfold_k_is_clamped(client, monkeypatch):

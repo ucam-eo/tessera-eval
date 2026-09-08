@@ -1011,20 +1011,25 @@ def run_large_area():
     def _base_name(name):
         return _re.sub(r"_v\d+$", "", name)
 
-    # k-fold CV cross-validates over the pixel-embedding matrix directly --
-    # run_kfold_cv has no neighbourhood/patch path -- so drop spatial MLP
-    # and U-Net now, before their (expensive) feature extraction is set up.
-    # The stream reports what was dropped once it starts.
+    # k-fold CV cross-validates over point features directly. Pixel models
+    # use the embedding matrix; Spatial MLP models use their own
+    # neighbourhood-feature points (see run_kfold_cv). U-Net trains on image
+    # patches, not points, so it has no k-fold path -- drop it now, before
+    # its (expensive) patch extraction is set up. The stream reports what
+    # was dropped once it starts.
     kfold_dropped = []
     if eval_mode == "kfold":
-        _pixel = [n for n in model_names if _base_name(n) not in (*SPATIAL_MODELS, "unet")]
-        kfold_dropped = [n for n in model_names if n not in _pixel]
-        model_names = _pixel
+        _keep = [n for n in model_names if _base_name(n) != "unet"]
+        kfold_dropped = [n for n in model_names if n not in _keep]
+        model_names = _keep
 
     # A fixed test set (spatial bboxes, or a different test year) has no
     # neighbourhood features, so spatial models are skipped for such runs
-    # and their (expensive) feature extraction is not worth doing.
-    has_fixed_test_set = (
+    # and their (expensive) feature extraction is not worth doing. k-fold
+    # ignores bboxes / test year / test file entirely and makes its own
+    # folds, so none of that counts as a fixed test set for a k-fold run
+    # (spatial features are still extracted for Spatial MLP).
+    has_fixed_test_set = eval_mode != "kfold" and (
         bool(train_bboxes or test_bboxes) or test_year != train_year or has_test_file
     )
 
@@ -2217,11 +2222,13 @@ def run_large_area():
             lc_kwargs["test_labels"] = file_split_test_labels
 
         if eval_mode == "kfold":
-            # k-fold CV over all labelled pixels. No learning curve, no
-            # train/test bboxes; pixel models only (run_kfold_cv has no
-            # neighbourhood/patch path -- spatial MLP / U-Net were already
-            # dropped from model_names above). Emits fold_result / aggregate
-            # / confusion_matrices, which the frontend already understands.
+            # k-fold CV over point features. No learning curve, no
+            # train/test bboxes. Pixel models cross-validate over the
+            # embedding matrix; Spatial MLP models cross-validate over
+            # their own neighbourhood-feature points (run_kfold_cv handles
+            # the separate split + augmentation). U-Net was dropped from
+            # model_names above. Emits fold_result / aggregate /
+            # confusion_matrices, which the frontend already understands.
             from tessera_eval.evaluate import run_kfold_cv
 
             if test_gdf is not None:
@@ -2244,8 +2251,8 @@ def run_large_area():
                         {
                             "event": "status",
                             "message": (
-                                f"{_n} skipped — k-fold CV supports pixel models "
-                                "only (k-NN, RF, XGBoost, MLP)"
+                                f"{_n} skipped — k-fold CV can't use patch-based models; "
+                                "use the learning curve for U-Net"
                             ),
                         }
                     )
@@ -2256,7 +2263,10 @@ def run_large_area():
                     json.dumps(
                         {
                             "event": "error",
-                            "message": "k-fold CV needs at least one pixel model (k-NN, RF, XGBoost, MLP).",
+                            "message": (
+                                "k-fold CV needs at least one pixel model (k-NN, RF, "
+                                "XGBoost, MLP) or Spatial MLP."
+                            ),
                         }
                     )
                     + "\n"
@@ -2271,6 +2281,12 @@ def run_large_area():
                 model_params=model_params,
                 max_training_samples=max_train,
                 seed=seed,
+                spatial_vectors=spatial_3x3,
+                spatial_vectors_5x5=spatial_5x5,
+                spatial_labels=(
+                    spatial_labels_3x3 if spatial_labels_3x3 is not None else spatial_labels_5x5
+                ),
+                dim=(vectors.shape[1] if vectors is not None else None),
             ):
                 if _cancelled():
                     logger.info("Evaluation cancelled during k-fold CV")

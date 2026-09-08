@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.0]
+
+### Added
+- **k-fold cross-validation now supports the Spatial MLP models**
+  (`spatial_mlp` 3×3, `spatial_mlp_5x5` 5×5). `run_kfold_cv` takes optional
+  `spatial_vectors` / `spatial_vectors_5x5` / `spatial_labels` / `dim`
+  arguments: pixel models cross-validate over the embedding matrix as
+  before, while spatial models cross-validate over their own
+  neighbourhood-feature points (a separate, generally larger set drawn
+  from the downloaded tile crops) using an independent k-fold split seeded
+  identically. Training folds get the same 4× flip augmentation as the
+  learning curve. `run-large-area` with `eval_mode="kfold"` extracts the
+  spatial features (it no longer treats drawn rectangles / a differing
+  test year / a test file as a fixed test set, since k-fold ignores all of
+  those) and passes them through. Per-fold F1/R² tables, the mean ± std
+  aggregate, and the confusion matrices all include the spatial models.
+- U-Net remains unavailable in k-fold mode — it trains on 256×256 image
+  patches, not points, so there is no point-based fold split for it. It is
+  dropped from a k-fold run with a status note pointing at the learning
+  curve. The "needs at least one model" guard message now mentions Spatial
+  MLP.
+
 ## [1.8.7]
 
 ### Added
