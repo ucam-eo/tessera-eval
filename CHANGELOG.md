@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.0]
+
+### Added
+- **`create-map` takes a `clamp` flag** (default `true`, unchanged
+  behaviour). Set `clamp: false` in the request body to write the raw
+  regression predictions instead of clamping them to the training-target
+  span — useful for seeing where a model extrapolates. No effect on
+  classification maps. The `map_ready` event now carries `clamped`
+  (bool), the status line says whether the output was clamped, and
+  `clamp_min` / `clamp_max` GeoTIFF tags are written only when it was
+  (Louis Driver — wanted a toggle).
+
 ## [1.10.0]
 
 ### Added

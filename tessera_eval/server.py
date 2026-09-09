@@ -2914,6 +2914,11 @@ def create_map():
     # just applied as-is. Defaults to the training year (today's existing
     # behavior) when omitted.
     map_year_override = body.get("map_year")
+    # Regression maps are clamped to the training-target span by default
+    # (an MLP/XGBoost regressor can otherwise paint physically impossible
+    # values on land unlike its training data). Set clamp=false to write
+    # the raw predictions instead. No effect on classification maps.
+    clamp_regression = bool(body.get("clamp", True))
 
     if not map_bboxes:
         return jsonify(
@@ -3006,19 +3011,19 @@ def create_map():
         # genuinely predicting flat values at the extremes.
         reg_clip = None
         if not is_classification:
-            reg_clip = (float(np.min(labels)), float(np.max(labels)))
-            yield (
-                json.dumps(
-                    {
-                        "event": "status",
-                        "message": (
-                            f"Regression output clamped to the training range "
-                            f"[{reg_clip[0]:.4g}, {reg_clip[1]:.4g}]"
-                        ),
-                    }
+            if clamp_regression:
+                reg_clip = (float(np.min(labels)), float(np.max(labels)))
+                msg = (
+                    f"Regression output clamped to the training range "
+                    f"[{reg_clip[0]:.4g}, {reg_clip[1]:.4g}]"
                 )
-                + "\n"
-            )
+            else:
+                _lo, _hi = float(np.min(labels)), float(np.max(labels))
+                msg = (
+                    f"Regression output NOT clamped — raw predictions "
+                    f"(training range was [{_lo:.4g}, {_hi:.4g}])"
+                )
+            yield json.dumps({"event": "status", "message": msg}) + "\n"
 
         yield (
             json.dumps(
@@ -3386,6 +3391,7 @@ def create_map():
                             "n_classes": len(class_names),
                             "train_year": train_year,
                             "map_year": map_year,
+                            "clamped": reg_clip is not None,
                             "preview": preview,
                         }
                     )

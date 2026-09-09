@@ -220,6 +220,43 @@ def test_regression_map_is_clamped_to_the_training_target_range(client, monkeypa
     assert 0.0 <= float(tags["clamp_min"]) < float(tags["clamp_max"]) <= 42.0
 
 
+def test_clamp_false_writes_raw_predictions(client, monkeypatch):
+    """clamp=false in the request body: no clamp band, raw predictions
+    reach the raster, no clamp_min/clamp_max tags, and the status line
+    says the output was NOT clamped (Louis Driver — wanted a toggle)."""
+    import tessera_eval.classify as _clf
+
+    monkeypatch.setattr(_clf, "make_regressor", lambda *a, **k: _OutOfRangeRegressor())
+
+    events = _run(client, classifier="rf", clamp=False)
+    ready = next(e for e in events if e["event"] == "map_ready")
+    assert ready["clamped"] is False
+
+    msgs = " ".join(e.get("message", "") for e in events).lower()
+    assert "not clamped" in msgs
+
+    resp = client.get(ready["download_url"])
+    with rasterio.open(io.BytesIO(resp.data)) as ds:
+        arr = ds.read(1)
+        tags = ds.tags()
+
+    valid = arr[~np.isnan(arr)]
+    assert valid.size > 0
+    # _OutOfRangeRegressor emits +/-1e6 -> unclamped, the raster keeps them.
+    assert float(np.max(valid)) > 1e5
+    assert float(np.min(valid)) < -1e5
+    assert "clamp_min" not in tags and "clamp_max" not in tags
+
+
+def test_clamp_defaults_on_and_map_ready_reports_it(client, monkeypatch):
+    import tessera_eval.classify as _clf
+
+    monkeypatch.setattr(_clf, "make_regressor", lambda *a, **k: _OutOfRangeRegressor())
+    events = _run(client, classifier="rf")  # no clamp key -> default True
+    ready = next(e for e in events if e["event"] == "map_ready")
+    assert ready["clamped"] is True
+
+
 def test_classification_map_has_no_clamp_tags(client):
     """The clamp is regression-only -- a classification map must not grow
     clamp_min/clamp_max tags."""
