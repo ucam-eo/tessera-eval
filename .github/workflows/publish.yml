@@ -1,0 +1,53 @@
+name: Publish to PyPI
+
+# Publishes tessera-eval to PyPI when a GitHub Release is published.
+# Uses PyPI Trusted Publishing (OIDC) -- no API token is stored anywhere.
+#
+# One-time PyPI setup (needs a PyPI account that will own the project):
+#   1. https://pypi.org/manage/account/publishing/  -> "Add a pending publisher"
+#      PyPI project name : tessera-eval
+#      Owner             : ucam-eo
+#      Repository name    : tessera-eval
+#      Workflow filename  : publish.yml
+#      Environment name   : pypi
+#   2. In this repo: Settings -> Environments -> add an environment named "pypi"
+#      (optionally add required reviewers / branch restrictions).
+# After that, cutting a GitHub Release from a version tag publishes automatically.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Check metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
