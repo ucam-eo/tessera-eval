@@ -42,7 +42,10 @@ Optional extras: `geotessera` (fetch tiles), `xgboost` (gradient-boosted models)
 
 ## Quickstart
 
-Cross-validate a classifier on labelled polygons, pulling embeddings tile-by-tile:
+Cross-validate a classifier on labelled polygons, pulling embeddings tile-by-tile.
+This runs as-is against the bundled example
+([`examples/austria_crops.geojson`](examples/austria_crops.geojson) — 349 field
+parcels near Vienna labelled by crop type):
 
 ```python
 import geopandas as gpd
@@ -50,13 +53,16 @@ from geotessera import GeoTessera
 from tessera_eval import load_embeddings_for_shapefile, run_kfold_cv
 
 # 1. Labelled polygons (any CRS — reprojected internally) with a class column.
-gdf = gpd.read_file("habitats.geojson")
+#    (a repo checkout has this at examples/austria_crops.geojson)
+gdf = gpd.read_file(
+    "https://raw.githubusercontent.com/ucam-eo/tessera-eval/main/examples/austria_crops.geojson"
+)
 
 # 2. Pull a 128-d embedding for every pixel under the polygons (memory-bounded:
 #    one GeoTessera tile at a time, keeping only labelled pixels).
 gt = GeoTessera()
 vectors, labels, class_names, stats = load_embeddings_for_shapefile(
-    gdf, field="habitat", year=2024, gt_instance=gt
+    gdf, field="crop", year=2024, gt_instance=gt
 )
 print(f"{stats['total_pixels']:,} labelled pixels over {stats['n_classes']} classes")
 
@@ -66,6 +72,16 @@ for event in run_kfold_cv(vectors, labels, ["rf", "nn"], k=5):
         for name, m in event["models"].items():
             print(f"{name:>4}: macro-F1 {m['mean_f1']:.3f} ± {m['std_f1']:.3f}")
 ```
+
+For this window that prints roughly `rf: macro-F1 0.80 ± 0.00`, `nn: macro-F1
+0.76 ± 0.00` (10-way crop classification from embeddings alone).
+
+`run_kfold_cv` also does **regression** — pass `task="regression"` and the
+`_reg` model names (`rf_reg`, `nn_reg`, `xgboost_reg`, `mlp_reg`); the
+`aggregate` event then carries `mean_r2` / `mean_rmse` / `mean_mae` (± std) and a
+pooled predicted-vs-actual `scatter`. It also covers the **Spatial MLP** models
+(`spatial_mlp`, `spatial_mlp_5x5`) when you pass their neighbourhood features via
+`spatial_vectors=` / `spatial_labels=`.
 
 Already have a TEE vector directory on disk? Load it directly:
 
@@ -77,22 +93,18 @@ vectors, coords, metadata = load_tee_vectors("/path/to/vectors/aoi/2024")
 ```
 
 See the [tutorial](docs/tutorial.md) for the full workflow (labels → learning
-curve → confusion matrix → interpretation).
+curve → confusion matrix → interpretation), and
+[CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## Command-line interface
 
 The workflow covered in the [tutorial](docs/tutorial.md) can also be run through the command line.
 
-First, install the `geotessera` package needed for the `load` step below:
+First, install the extras the `load` step needs:
 
 ```
-pip install -e ".[geotessera]"
-```
-
-Optional installation for using xgboost:
-
-```
-pip install -e ".[xgboost]"
+pip install "tessera-eval[geotessera]"   # tile access
+pip install "tessera-eval[xgboost]"      # optional, for xgboost models
 ```
 
 Download the Tessera embeddings for your labelled ground truth, and save the result to a file (vectors.npz by default, change the name with argument `--output`). `--data` accepts either a shapefile/GeoJSON of labelled polygons or a GeoTIFF of an already-rasterized reference layer.
@@ -117,6 +129,10 @@ Run k-fold cross-validation and print accuracy per model.
 tessera-eval kfold --models rf,nn,mlp      # for classification
 tessera-eval kfold --models rf_reg,nn_reg  # for regression
 ```
+
+The CLI covers the pixel models (`nn`/`rf`/`xgboost`/`mlp` and their `_reg`
+variants). The Spatial MLP models in k-fold need the neighbourhood-feature
+extraction that only the web Validation panel wires up.
 
 Optional arguments:
 
@@ -182,6 +198,9 @@ Run any command with `--help` for a list of all possible arguments.
 - **[Tutorial](docs/tutorial.md)** — an end-to-end worked example.
 - **[Compute server](docs/compute-server.md)** — running `tee-compute` (local ML,
   hosted data).
+- **[`examples/`](examples/)** — a small runnable dataset (`austria_crops.geojson`)
+  and the quickstart snippet.
+- **[CHANGELOG.md](CHANGELOG.md)** — release notes.
 
 ## What's in the box
 
@@ -190,7 +209,7 @@ Run any command with `--help` for a list of all possible arguments.
 | `tessera_eval.data` | Load + dequantize embeddings (`load_tee_vectors`, `dequantize_int8`, `dequantize_uint8`, `load_embeddings_for_shapefile`, `load_embeddings_for_shapefile_vq`, `load_embeddings_for_raster`). |
 | `tessera_eval.rasterize` | Burn shapefile polygons onto a pixel grid with stable, 1-based class IDs|
 | `tessera_eval.classify` | Classifier/regressor factory + spatial neighbourhood features. |
-| `tessera_eval.evaluate` | Learning curves, k-fold CV, spatial split, metrics, field-type detection. |
+| `tessera_eval.evaluate` | Learning curves, k-fold CV (classification + regression, pixel + Spatial MLP), spatial / year / separate-file hold-out, metrics + predicted-vs-actual scatter, field-type detection. |
 | `tessera_eval.unet` | Optional PyTorch U-Net for sparse-label tile segmentation. |
 | `tessera_eval.server` | `tee-compute`: local Flask compute server, proxies data/UI to a hosted TEE. |
 | `tessera_eval.cli` | `tessera-eval` command-line interface: `load`, `kfold`, `learning-curve`. |
@@ -208,8 +227,9 @@ Available models: `nn`, `rf`, `mlp`, `spatial_mlp`, `spatial_mlp_5x5`, `xgboost`
 
 - **Class imbalance is expected and fine.** Macro-F1 is reported alongside
   weighted-F1 precisely so rare classes are visible.
-- **Determinism.** Estimators use `random_state=42`; evaluation takes an explicit
-  `seed`. Same inputs → same numbers.
+- **Determinism.** A single `seed` (default 42) threads through point sampling,
+  fold/resample splits, and every estimator's own `random_state`. Same inputs +
+  same seed → identical numbers.
 - **Spatial leakage.** For honest accuracy on contiguous habitats, prefer the
   spatial hold-out (`run_learning_curve(..., test_vectors=, test_labels=)`) over a
   random pixel split — neighbouring pixels are highly autocorrelated.
