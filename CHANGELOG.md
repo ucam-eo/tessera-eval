@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.1]
+
+### Changed
+- Docs only. README quickstart now runs verbatim against the bundled
+  `examples/austria_crops.geojson`; notes that `run_kfold_cv` covers
+  regression (R²/RMSE/MAE + pooled predicted-vs-actual scatter) and the
+  Spatial MLP models; CLI install lines use the PyPI package. First
+  release published to PyPI via the trusted-publishing workflow.
+
 ## [1.11.0]
 
 ### Added
