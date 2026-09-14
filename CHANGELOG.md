@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.3]
+
+### Fixed
+- **Download Models never actually produced a real Spatial MLP model.**
+  `_tile_cache["spatial_3x3"]`/`["spatial_5x5"]` are always written `None`
+  by design (that key means "same-request cache-hit", and spatial features
+  are deliberately always re-extracted fresh within a request rather than
+  trusted from a stale hit) — but `train_models()` read that same key, so
+  its spatial branches never ran. A "Download Models" click for
+  `spatial_mlp`/`spatial_mlp_5x5` silently fell through to the generic
+  branch and trained a plain, non-windowed `MLPClassifier` on the raw
+  pixel vectors, saved under the spatial name, no error at all — a
+  downloaded model that didn't match what the evaluation scored. Fixed by
+  stashing the run's real spatial features *and their own labels* under
+  new `_spatial_3x3`/`_spatial_5x5`/`_spatial_labels_3x3`/
+  `_spatial_labels_5x5` keys at the end of a successful run (mirroring the
+  pre-existing `_unet_patches` stash), and having `train_models()` read
+  those instead. Also fixes a related bug the dead code was hiding: the
+  spatial branches paired `spatial_3x3` (patch-derived, its own point
+  count) with the *pixel* `labels` array instead of `spatial_labels_3x3`
+  — now fixed, and a `train_models()` request for a spatial name whose
+  cached data is ever missing skips cleanly with a status message instead
+  of falling through to the generic branch.
+- **`augment_spatial` gains a `cap`** (default 50,000 rows, existing
+  callers unaffected below that) that subsamples before the 4x flip
+  expansion. `train_models()`'s two spatial call sites had no size bound
+  at all — the same shape of bug as 1.11.2's U-Net fix, just via
+  `MLPClassifier.fit()`'s eager array instead of `np.stack`. One shared
+  cap in `augment_spatial` itself protects every call site (8 across the
+  codebase) without each needing its own capping logic, and additionally
+  bounds the learning curve's own spatial branches at very large scale
+  (previously unbounded at pct=80%, now capped there too).
+
 ## [1.11.2]
 
 ### Fixed

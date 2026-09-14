@@ -94,6 +94,18 @@ _tile_cache = {
     "stats": None,
     "spatial_3x3": None,
     "spatial_5x5": None,
+    # Separate, underscore-prefixed stash of the *same* run's spatial
+    # features (points + their own labels) for train_models() ("Download
+    # Models"), a later request with no body of its own -- mirrors
+    # _unet_patches below. Unlike "spatial_3x3"/"spatial_5x5" above (which
+    # this module's own same-request cache-hit path always finds None and
+    # therefore always re-extracts fresh, deliberately never relying on a
+    # stale value -- see _cached_tiles_need_reload), these are written once,
+    # at the end of a successful run, purely for the next request to read.
+    "_spatial_3x3": None,
+    "_spatial_5x5": None,
+    "_spatial_labels_3x3": None,
+    "_spatial_labels_5x5": None,
 }
 _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
@@ -2421,6 +2433,17 @@ def run_large_area():
         _tile_cache["_active_models"] = active_models
         _tile_cache["_model_params"] = model_params
         _tile_cache["_unet_patches"] = unet_patches
+        # Same deferred-training stash, for Spatial MLP -- previously never
+        # written, so train_models() always saw spatial_3x3/spatial_5x5 as
+        # None (that key's same-request cache-hit meaning, not this one) and
+        # silently fell through to training a plain, non-windowed MLP on the
+        # raw pixel vectors under the "spatial_mlp" name instead. Confirmed
+        # live: no error, no crash -- just a downloaded model whose input
+        # width didn't match what the evaluation actually scored.
+        _tile_cache["_spatial_3x3"] = spatial_3x3
+        _tile_cache["_spatial_5x5"] = spatial_5x5
+        _tile_cache["_spatial_labels_3x3"] = spatial_labels_3x3
+        _tile_cache["_spatial_labels_5x5"] = spatial_labels_5x5
         # train_models() (Download Models) runs in a later, separate request
         # with no body of its own -- it needs to know whether to dispatch to
         # make_classifier or make_regressor, and with which seed, so stash
@@ -2464,8 +2487,14 @@ def train_models():
     active_models = cache.get("_active_models", [])
     model_params = cache.get("_model_params", {})
     unet_patches = cache.get("_unet_patches", [])
-    spatial_3x3 = cache.get("spatial_3x3")
-    spatial_5x5 = cache.get("spatial_5x5")
+    # Underscore-prefixed: the deferred-training stash written once at the
+    # end of a successful run_large_area, not "spatial_3x3"/"spatial_5x5"
+    # (that key's same-request cache-hit meaning is unrelated and always
+    # None here -- see _tile_cache's own comment).
+    spatial_3x3 = cache.get("_spatial_3x3")
+    spatial_5x5 = cache.get("_spatial_5x5")
+    spatial_labels_3x3 = cache.get("_spatial_labels_3x3")
+    spatial_labels_5x5 = cache.get("_spatial_labels_5x5")
     # No request body here (Download Models is a bare POST) -- rely on the
     # cached task type, with a data-derived fallback. Same for the seed:
     # reuse whatever the evaluation run cached so the downloaded models
@@ -2586,11 +2615,24 @@ def train_models():
                         + "\n"
                     )
                     continue
-                elif _bn == "spatial_mlp" and spatial_3x3 is not None:
+                elif (
+                    _bn == "spatial_mlp"
+                    and spatial_3x3 is not None
+                    and spatial_labels_3x3 is not None
+                ):
                     from tessera_eval.classify import augment_spatial
 
+                    # spatial_3x3 is patch-derived and has its own point
+                    # count/order, distinct from vectors/labels -- it must be
+                    # paired with spatial_labels_3x3, not the pixel labels
+                    # (mismatched lengths would silently tile the wrong
+                    # labels onto X_aug). augment_spatial's own default cap
+                    # bounds the memory this allocates -- see its docstring
+                    # and CHANGELOG; this used to pass the full, uncapped
+                    # cached set straight through and OOM the same way
+                    # U-Net's eager augmentation did.
                     X_aug, y_aug = augment_spatial(
-                        spatial_3x3, labels, window=3, dim=vectors.shape[1]
+                        spatial_3x3, spatial_labels_3x3, window=3, dim=vectors.shape[1], seed=seed
                     )
                     clf = make_classifier(name, model_params.get(name, {}), seed=seed)
                     clf.fit(X_aug, y_aug)
@@ -2599,11 +2641,15 @@ def train_models():
                     )
                     joblib.dump({"model": clf, "class_names": valid_class_names}, tmp.name)
                     _trained_models[name] = tmp.name
-                elif _bn == "spatial_mlp_5x5" and spatial_5x5 is not None:
+                elif (
+                    _bn == "spatial_mlp_5x5"
+                    and spatial_5x5 is not None
+                    and spatial_labels_5x5 is not None
+                ):
                     from tessera_eval.classify import augment_spatial
 
                     X_aug, y_aug = augment_spatial(
-                        spatial_5x5, labels, window=5, dim=vectors.shape[1]
+                        spatial_5x5, spatial_labels_5x5, window=5, dim=vectors.shape[1], seed=seed
                     )
                     clf = make_classifier(name, model_params.get(name, {}), seed=seed)
                     clf.fit(X_aug, y_aug)
@@ -2612,6 +2658,27 @@ def train_models():
                     )
                     joblib.dump({"model": clf, "class_names": valid_class_names}, tmp.name)
                     _trained_models[name] = tmp.name
+                elif _bn in SPATIAL_MODELS:
+                    # A spatial name reached here without matching either
+                    # branch above, so its neighbourhood features aren't
+                    # available (e.g. the evaluation used a spatial/year/file
+                    # split, which skips spatial feature extraction
+                    # entirely -- see run_large_area's has_fixed_test_set).
+                    # Must not fall through to the generic branch below: it
+                    # would silently train a plain, non-windowed MLP on the
+                    # raw pixel vectors and save it under this spatial name.
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "status",
+                                "message": f"{name} skipped — no spatial features available "
+                                "for this run (spatial models need a random split, not a "
+                                "fixed test region/year/file)",
+                            }
+                        )
+                        + "\n"
+                    )
+                    continue
                 else:
                     clf = (
                         make_classifier(name, model_params.get(name, {}), seed=seed)

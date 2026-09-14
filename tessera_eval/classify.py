@@ -193,18 +193,51 @@ def gather_spatial_features_2d(tile_emb, radius=1, mask=None):
     return windows.reshape(H, W, window * window * dim).astype(np.float32)
 
 
-def augment_spatial(X, y, window, dim):
+# augment_spatial's 4x expansion is materialized eagerly (scikit-learn's
+# .fit() needs the whole array up front, unlike PyTorch's lazily-batched
+# DataLoader -- see unet.py's _AugmentedPatches for that version of this
+# problem). A 5x5-window, 128-dim point is 12.8 KB; above this many input
+# points the augmented output starts costing real memory (50_000 points ->
+# 2.4 GB augmented; the default is chosen to stay well clear of a crash on
+# a typical machine). This is every augment_spatial call's *only* size
+# bound unless the caller does its own additional subsampling first (the
+# learning curve samples a pct-of-data slice; run_kfold_cv applies
+# max_training_samples) -- callers that don't (train_models(), which used
+# to pass its full, uncapped cached point set straight through) rely on
+# this default entirely. Confirmed live for the analogous U-Net path:
+# "Unable to allocate 74.5 GiB for an array with shape (2384, 128, 256,
+# 256)" (Moustafa Eweda) -- same eager-augmentation shape, different
+# function. See CHANGELOG.
+DEFAULT_AUGMENT_CAP = 50_000
+
+
+def augment_spatial(X, y, window, dim, cap=DEFAULT_AUGMENT_CAP, seed=42):
     """4x data augmentation via horizontal/vertical flips of spatial patches.
+
+    Subsamples X/y down to at most `cap` rows first (deterministic, seeded)
+    when X is larger than that, so the returned arrays never exceed
+    `min(len(X), cap) * 4` rows regardless of how large the caller's X is --
+    every call site gets this protection without needing its own capping
+    logic. Pass cap=None to disable it (the caller is asserting X is
+    already sized appropriately, e.g. a deliberately small test fixture).
 
     Args:
         X: float32 array, shape (N, window*window*dim)
-        y: int array, shape (N,)
+        y: array, shape (N,) -- int class labels or float regression targets
         window: Spatial window size (e.g., 3 or 5)
         dim: Embedding dimension (e.g., 128)
+        cap: Maximum input rows before augmenting (default DEFAULT_AUGMENT_CAP,
+            currently 50,000); None disables the cap.
+        seed: Subsampling seed, used only when len(X) > cap.
 
     Returns:
-        Tuple of (X_aug, y_aug) with 4x the samples
+        Tuple of (X_aug, y_aug) with 4x min(len(X), cap) samples
     """
+    if cap is not None and len(X) > cap:
+        rng = np.random.RandomState(seed)
+        idx = rng.choice(len(X), size=cap, replace=False)
+        X, y = X[idx], y[idx]
+
     n = len(X)
     patches = X.reshape(n, window, window, dim)
     augmented = [
