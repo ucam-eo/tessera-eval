@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.2]
+
+### Fixed
+- **U-Net final-model training (`train_models()` / "Download Models") could
+  OOM the whole compute server**, even when the learning curve for the same
+  run completed all its percentages fine. `train_unet_on_patches` /
+  `train_unet_regressor_on_patches` built their 16x data augmentation (4
+  rotations x {as-is, +noise} x {as-is, h-flipped}) as one eager `np.stack`
+  before training started: `len(patches) * 16 * dim * 256 * 256 * 4` bytes,
+  all at once. Confirmed live — "Unable to allocate 74.5 GiB for an array
+  with shape (2384, 128, 256, 256)" at the default 500-patch cap, "50.0 GiB"
+  at 100 patches (Moustafa Eweda). The learning curve survives because each
+  percentage step additionally caps itself at 20 patches internally; the
+  final-model path has no such cap and hands the whole cached patch set to
+  the same eagerly-augmenting function — so "Max spatial/U-Net patches"
+  looked like it wasn't being respected for that step, because for that
+  step it effectively wasn't.
+  Fixed by generating the 16 variants lazily, one `DataLoader` batch at a
+  time (`_AugmentedPatches`, a proper `torch.utils.data.Dataset`), instead
+  of materializing all of them up front. Peak memory is now
+  `O(batch_size)` instead of `O(len(patches) * 16)`. Same 16 deterministic
+  variants per patch, same total dataset size and training behaviour;
+  Gaussian noise is now independently seeded per sample rather than drawn
+  from one sequential stream, so exact U-Net numbers at the same seed shift
+  slightly (still fully reproducible: same seed → same result).
+
 ## [1.11.1]
 
 ### Changed

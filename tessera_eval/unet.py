@@ -14,7 +14,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader, TensorDataset
+    from torch.utils.data import DataLoader, Dataset
 
     _HAS_TORCH = True
 except ImportError:
@@ -195,6 +195,58 @@ def extract_labelled_patches_regression(tile_emb, target_raster, patch_size=256,
 # ---------------------------------------------------------------------------
 if _HAS_TORCH:
 
+    class _AugmentedPatches(Dataset):
+        """Lazily generates the 16 geometric+noise augmentation variants of
+        each patch -- 4 rotations x {as-is, +noise} x {as-is, h-flipped} --
+        on ``__getitem__``, instead of eagerly stacking all
+        ``len(patches) * 16`` copies into one array before training starts.
+
+        The eager version allocated ``len(patches) * 16 * dim * H * W * 4``
+        bytes up front: a 500-patch, 128-dim, 256x256 run OOMs at ~75 GiB
+        (confirmed live -- "Unable to allocate 74.5 GiB for an array with
+        shape (2384, 128, 256, 256)", Moustafa Eweda, final-model training
+        via train_models(), which -- unlike the learning curve's per-pct
+        20-patch cap -- hands the whole cached patch set to this function
+        uncapped). With this Dataset, PyTorch's DataLoader only ever
+        materializes one batch at a time, so peak memory is
+        O(batch_size), not O(len(patches) * 16).
+
+        Same 16 deterministic variants per patch, same dataset length --
+        only *when* each copy is materialized changes. Noise is
+        independently seeded per (patch, variant) rather than drawn from one
+        sequential stream shared across the whole eager pass, so exact
+        numbers differ from the pre-fix version at the same seed (a run is
+        still fully reproducible: same seed -> same result -- see
+        CHANGELOG).
+        """
+
+        def __init__(self, patches, seed, label_dtype):
+            self.patches = patches
+            self.seed = seed
+            self.label_dtype = label_dtype
+
+        def __len__(self):
+            return len(self.patches) * 16
+
+        def __getitem__(self, i):
+            patch_idx, variant_idx = divmod(i, 16)
+            emb_patch, lbl_patch = self.patches[patch_idx]
+            emb = emb_patch.transpose(2, 0, 1)  # (dim, H, W)
+            lbl = lbl_patch.astype(self.label_dtype)
+
+            k, sub = divmod(variant_idx, 4)
+            emb_r = np.rot90(emb, k, axes=(1, 2)).copy()
+            lbl_r = np.rot90(lbl, k, axes=(0, 1)).copy()
+
+            if sub >= 2:  # horizontal flip
+                emb_r = emb_r[:, :, ::-1].copy()
+                lbl_r = lbl_r[:, ::-1].copy()
+            if sub % 2 == 1:  # + Gaussian noise, embeddings only (never labels/targets)
+                rng = np.random.RandomState(self.seed + i)
+                emb_r = emb_r + rng.normal(0, 0.02, emb_r.shape).astype(np.float32)
+
+            return torch.from_numpy(emb_r), torch.from_numpy(lbl_r)
+
     class _ConvBlock(nn.Module):
         """Two Conv3x3 + BN + ReLU layers."""
 
@@ -350,46 +402,16 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
     if not filtered:
         raise ValueError("No patches with consistent shapes")
 
-    # Augmentation: 8 geometric variants × 3 noise levels = 24× per patch
-    # Geometric: 4 rotations × 2 flips = 8
-    # Noise: original + 2 Gaussian noise variants per geometric transform
-    rng_aug = np.random.RandomState(seed)
-    emb_list = []
-    lbl_list = []
-    for emb_patch, lbl_patch in filtered:
-        emb = emb_patch.transpose(2, 0, 1)  # (dim, H, W)
-        lbl = lbl_patch.astype(np.int64)  # (H, W)
-        for k in range(4):
-            emb_r = np.rot90(emb, k, axes=(1, 2)).copy()
-            lbl_r = np.rot90(lbl, k, axes=(0, 1)).copy()
-            # Original geometric variant
-            emb_list.append(emb_r)
-            lbl_list.append(lbl_r)
-            # + Gaussian noise variant
-            noise = rng_aug.normal(0, 0.02, emb_r.shape).astype(np.float32)
-            emb_list.append(emb_r + noise)
-            lbl_list.append(lbl_r)
-            # Horizontal flip
-            emb_f = emb_r[:, :, ::-1].copy()
-            lbl_f = lbl_r[:, ::-1].copy()
-            emb_list.append(emb_f)
-            lbl_list.append(lbl_f)
-            # + Gaussian noise on flip
-            noise = rng_aug.normal(0, 0.02, emb_f.shape).astype(np.float32)
-            emb_list.append(emb_f + noise)
-            lbl_list.append(lbl_f)
-
-    aug_factor = len(emb_list) // len(filtered) if filtered else 0
-    X = torch.from_numpy(np.stack(emb_list))
-    Y = torch.from_numpy(np.stack(lbl_list))
+    # Augmentation: 4 rotations x {as-is, +noise} x {as-is, h-flipped} = 16x
+    # per patch, generated lazily by _AugmentedPatches (see its docstring) so
+    # peak memory is O(batch_size), not O(len(filtered) * 16).
+    dataset = _AugmentedPatches(filtered, seed, label_dtype=np.int64)
     logger.info(
-        "U-Net training: %d original patches (×%d augmentation = %d)",
+        "U-Net training: %d original patches (×16 augmentation = %d samples/epoch)",
         len(filtered),
-        aug_factor,
-        len(emb_list),
+        len(dataset),
     )
 
-    dataset = TensorDataset(X, Y)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -397,7 +419,7 @@ def train_unet_on_patches(patches, n_classes, params=None, progress_callback=Non
         generator=torch.Generator().manual_seed(seed),
     )
 
-    in_channels = X.shape[1]
+    in_channels = target_emb_shape[2]  # (H, W, dim) -> dim
     # n_classes+1 outputs: index 0 is the ignore/background class
     model = TinyUNet(
         in_channels=in_channels, n_classes=n_classes + 1, depth=depth, base_filters=base_filters
@@ -491,42 +513,17 @@ def train_unet_regressor_on_patches(patches, params=None, progress_callback=None
     if not filtered:
         raise ValueError("No patches with consistent shapes")
 
-    # Same augmentation as train_unet_on_patches -- rotation/flip preserve
-    # NaN positions correctly; Gaussian noise is only ever added to the
-    # embeddings, never the targets, so it can't turn a NaN into a number.
-    rng_aug = np.random.RandomState(seed)
-    emb_list = []
-    tgt_list = []
-    for emb_patch, tgt_patch in filtered:
-        emb = emb_patch.transpose(2, 0, 1)
-        tgt = tgt_patch.astype(np.float32)
-        for k in range(4):
-            emb_r = np.rot90(emb, k, axes=(1, 2)).copy()
-            tgt_r = np.rot90(tgt, k, axes=(0, 1)).copy()
-            emb_list.append(emb_r)
-            tgt_list.append(tgt_r)
-            noise = rng_aug.normal(0, 0.02, emb_r.shape).astype(np.float32)
-            emb_list.append(emb_r + noise)
-            tgt_list.append(tgt_r)
-            emb_f = emb_r[:, :, ::-1].copy()
-            tgt_f = tgt_r[:, ::-1].copy()
-            emb_list.append(emb_f)
-            tgt_list.append(tgt_f)
-            noise = rng_aug.normal(0, 0.02, emb_f.shape).astype(np.float32)
-            emb_list.append(emb_f + noise)
-            tgt_list.append(tgt_f)
-
-    aug_factor = len(emb_list) // len(filtered) if filtered else 0
-    X = torch.from_numpy(np.stack(emb_list))
-    Y = torch.from_numpy(np.stack(tgt_list))
+    # Same augmentation as train_unet_on_patches, generated lazily by
+    # _AugmentedPatches: rotation/flip preserve NaN positions correctly;
+    # Gaussian noise is only ever added to the embeddings, never the
+    # targets, so it can't turn a NaN into a number.
+    dataset = _AugmentedPatches(filtered, seed, label_dtype=np.float32)
     logger.info(
-        "U-Net regressor training: %d original patches (×%d augmentation = %d)",
+        "U-Net regressor training: %d original patches (×16 augmentation = %d samples/epoch)",
         len(filtered),
-        aug_factor,
-        len(emb_list),
+        len(dataset),
     )
 
-    dataset = TensorDataset(X, Y)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -534,7 +531,7 @@ def train_unet_regressor_on_patches(patches, params=None, progress_callback=None
         generator=torch.Generator().manual_seed(seed),
     )
 
-    in_channels = X.shape[1]
+    in_channels = target_emb_shape[2]  # (H, W, dim) -> dim
     model = TinyUNet(in_channels=in_channels, n_classes=1, depth=depth, base_filters=base_filters)
 
     device = torch.device(
