@@ -28,9 +28,11 @@ EMBED_DIM = 128
 def test_make_classifier_and_regressor_take_the_seed():
     assert make_classifier("rf", seed=7).random_state == 7
     assert make_classifier("xgboost", seed=7).random_state == 7 if _has_xgb() else True
-    assert make_classifier("mlp", seed=7).random_state == 7
+    # mlp/mlp_reg are a Pipeline(StandardScaler, MLP*) -- the seed lives on
+    # the wrapped estimator, not the pipeline itself.
+    assert make_classifier("mlp", seed=7).named_steps["mlp"].random_state == 7
     assert make_regressor("rf_reg", seed=7).random_state == 7
-    assert make_regressor("mlp_reg", seed=7).random_state == 7
+    assert make_regressor("mlp_reg", seed=7).named_steps["mlp"].random_state == 7
     # default unchanged
     assert make_classifier("rf").random_state == 42
 

@@ -6,11 +6,41 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 # Models that train on precomputed neighbourhood features rather than plain
 # per-pixel vectors. The single source of truth for every "is this a spatial
 # model" decision (feature extraction, fixed-test-set skips, map support).
 SPATIAL_MODELS = ("spatial_mlp", "spatial_mlp_5x5")
+
+
+def _make_mlp(estimator_cls, hidden, max_iter, seed):
+    """Build an MLP (classifier or regressor) preceded by feature scaling.
+
+    sklearn's MLPClassifier/MLPRegressor use the Adam solver with a fixed
+    default learning_rate_init=0.001 and no scaling of their own. Tessera
+    embeddings aren't guaranteed to already be zero-mean/unit-variance, and
+    an unscaled MLP under those defaults converges to a visibly worse
+    optimum within a fixed max_iter budget -- diagnosed from a real macro-F1
+    gap vs. the Tessera paper's own Austrian-crop numbers (Louis Driver,
+    2026-09-15): TEE's F1 plateaued ~20-26 points below the paper's at every
+    training percentage, widening rather than narrowing with more data (the
+    signature of an optimization ceiling, not a data-availability one), and
+    a *larger* MLP sometimes scored *worse* than a smaller one at the same
+    percentage -- both point at undertraining, not model capacity or task
+    difficulty. StandardScaler is fit fresh inside the Pipeline on each
+    training call, so there's no leakage between train/test folds; every
+    other classifier/regressor here (RF, XGBoost, kNN's Euclidean metric
+    aside) doesn't need it and is left as-is to keep this fix scoped to the
+    actual suspect.
+    """
+    return Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("mlp", estimator_cls(hidden_layer_sizes=hidden, max_iter=max_iter, random_state=seed)),
+        ]
+    )
 
 
 def _strip_variant_suffix(name):
@@ -97,11 +127,7 @@ def make_classifier(name, params=None, seed=42):
             hidden = tuple(int(x) for x in layers_str.split(","))
         else:
             hidden = (64, 32)
-        return MLPClassifier(
-            hidden_layer_sizes=hidden,
-            max_iter=int(p.get("max_iter", 200)),
-            random_state=seed,
-        )
+        return _make_mlp(MLPClassifier, hidden, int(p.get("max_iter", 200)), seed)
     elif base_name in SPATIAL_MODELS:
         default_layers = "256,128" if base_name == "spatial_mlp" else "512,256"
         default_iter = 300 if base_name == "spatial_mlp" else 400
@@ -110,11 +136,7 @@ def make_classifier(name, params=None, seed=42):
             hidden = tuple(int(x) for x in layers_str.split(","))
         else:
             hidden = tuple(int(x) for x in default_layers.split(","))
-        return MLPClassifier(
-            hidden_layer_sizes=hidden,
-            max_iter=int(p.get("max_iter", default_iter)),
-            random_state=seed,
-        )
+        return _make_mlp(MLPClassifier, hidden, int(p.get("max_iter", default_iter)), seed)
     else:
         raise ValueError(f"Unknown classifier: {name}")
 
@@ -317,11 +339,7 @@ def make_regressor(name, params=None, seed=42):
             hidden = tuple(int(x) for x in layers_str.split(","))
         else:
             hidden = (64, 32)
-        return MLPRegressor(
-            hidden_layer_sizes=hidden,
-            max_iter=int(p.get("max_iter", 200)),
-            random_state=seed,
-        )
+        return _make_mlp(MLPRegressor, hidden, int(p.get("max_iter", 200)), seed)
     elif base_name in SPATIAL_MODELS:
         # Deliberately no "_reg" suffix, unlike every other regressor here --
         # "spatial" describes which precomputed feature array (3x3 or 5x5
@@ -339,10 +357,6 @@ def make_regressor(name, params=None, seed=42):
             hidden = tuple(int(x) for x in layers_str.split(","))
         else:
             hidden = tuple(int(x) for x in default_layers.split(","))
-        return MLPRegressor(
-            hidden_layer_sizes=hidden,
-            max_iter=int(p.get("max_iter", default_iter)),
-            random_state=seed,
-        )
+        return _make_mlp(MLPRegressor, hidden, int(p.get("max_iter", default_iter)), seed)
     else:
         raise ValueError(f"Unknown regressor: {name}")

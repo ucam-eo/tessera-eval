@@ -6,6 +6,36 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.4]
+
+### Fixed
+- **MLP classifiers/regressors trained on unscaled embeddings.**
+  `make_classifier`/`make_regressor`'s `mlp`, `spatial_mlp`, and
+  `spatial_mlp_5x5` branches built a bare `MLPClassifier`/`MLPRegressor`
+  with no feature scaling. sklearn's MLP (Adam, default
+  `learning_rate_init=0.001`) is sensitive to input scale, and real
+  Tessera embeddings are not zero-mean/unit-variance (checked directly:
+  per-dimension means range roughly -2.5 to +5, stds roughly 1.0-2.2)
+  — so training converged to a visibly worse optimum within a fixed
+  `max_iter` budget. Found while investigating a large macro-F1 gap
+  between TEE and the Tessera paper's own Austrian-crop numbers (Louis
+  Driver, 2026-09-15): a larger MLP sometimes scored *worse* than a
+  smaller one at the same training percentage, and the gap widened
+  rather than narrowed with more training data — both point at
+  undertraining rather than a data or task-difficulty limit. Fixed by
+  wrapping every MLP/spatial-MLP construction site in a shared
+  `_make_mlp()` helper that builds `Pipeline(StandardScaler, MLP*)`
+  instead of a bare estimator (`StandardScaler` fits fresh per training
+  call, so there's no leakage across train/test). Verified real,
+  positive, and low-variance on genuine embeddings (6,168 points sampled
+  across the full Austrian crop dataset, 10 seeds each): macro F1
+  +2.05 points at a 10% training split (48.03→50.08), +0.75 points at
+  70% (59.54→60.29) — a real but modest effect, not by itself the
+  explanation for the much larger gap still under investigation.
+  `RandomForestClassifier`/`XGBClassifier`/`KNeighborsClassifier` are
+  scale-invariant (or already scale-sensitive by design, for kNN) and
+  are left untouched — this fix is scoped to the MLP family only.
+
 ## [1.11.3]
 
 ### Fixed
