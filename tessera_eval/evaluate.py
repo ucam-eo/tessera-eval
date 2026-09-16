@@ -148,6 +148,8 @@ def run_learning_curve(
     test_labels=None,
     task="classification",
     seed=42,
+    groups=None,
+    group_test_fraction=0.2,
     **kwargs,
 ):
     """Generator that yields progress events after each training percentage.
@@ -179,6 +181,26 @@ def run_learning_curve(
         test_vectors: Optional fixed test set vectors (spatial split mode)
         test_labels: Optional fixed test set labels (spatial split mode)
         task: "classification" or "regression"
+        groups: Optional array, shape (N,), aligned with vectors/labels --
+            a group id (e.g. the source shapefile polygon/field) per row.
+            When given (classification only, and only when test_vectors
+            isn't already set some other way), a fixed group_test_fraction
+            of *whole groups* is carved out up front as the test pool --
+            see the "group holdout" block below for why: pixels from the
+            same field are near-duplicates (Tessera embeddings are highly
+            spatially autocorrelated within a field), so letting a random
+            per-pixel split put some of a field's pixels in train and
+            others in test lets a classifier "cheat" by recognizing the
+            field rather than the habitat. Confirmed on real data (Louis
+            Driver's Austrian-crop investigation, 2026-09-16): naive
+            per-pixel StratifiedKFold inflated macro F1 by 0.11-0.14 over
+            an honest per-field StratifiedGroupKFold split, same data, same
+            models. From the carve-out on, this behaves exactly like
+            spatial-split mode (fixed test pool, growing training pct
+            drawn from the remaining pool) -- just carved out by group
+            membership instead of a drawn geographic box.
+        group_test_fraction: Fraction of groups (not pixels) held out for
+            the fixed test pool when groups is given (default 0.2).
         **kwargs: Extra arguments accepted for compatibility.
 
     Yields:
@@ -208,8 +230,26 @@ def run_learning_curve(
     if finish_classifiers is None:
         finish_classifiers = set()
 
+    # Group holdout: carve out a fixed pool of whole groups (fields) as the
+    # test set, once, before anything else below -- see groups' docstring
+    # above. Only meaningful for classification (StratifiedGroupKFold needs
+    # classes to stratify by) and only when the caller hasn't already fixed
+    # a test set some other way (an explicit test_vectors/test_labels, e.g.
+    # a spatial or year split, takes precedence -- groups is ignored then).
+    if groups is not None and test_vectors is None and task == "classification":
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        n_splits = max(2, round(1 / group_test_fraction))
+        gkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        train_pool_idx, test_pool_idx = next(gkf.split(vectors, labels, groups=groups))
+        test_vectors, test_labels = vectors[test_pool_idx], labels[test_pool_idx]
+        vectors, labels = vectors[train_pool_idx], labels[train_pool_idx]
+
     # Spatial split mode: test_vectors/test_labels are a fixed, separate test set.
-    # In this mode, vectors/labels are the train-only pool.
+    # In this mode, vectors/labels are the train-only pool. (The group
+    # holdout above reaches this same mode by construction -- from here on
+    # there's no distinction between "held out by field" and "held out by
+    # drawn geography".)
     spatial_split = test_vectors is not None and test_labels is not None
 
     if spatial_split:
@@ -850,6 +890,7 @@ def run_kfold_cv(
     spatial_vectors_5x5=None,
     spatial_labels=None,
     dim=None,
+    groups=None,
 ):
     """Generator that yields per-fold and aggregate results for k-fold CV.
 
@@ -880,6 +921,16 @@ def run_kfold_cv(
         spatial_vectors_5x5: Optional float32 array, shape (M, 25*dim), for spatial_mlp_5x5
         spatial_labels: Optional labels aligned with the spatial vectors, shape (M,)
         dim: Embedding dim (for augment_spatial reshape); inferred if omitted
+        groups: Optional array, shape (N,), aligned with vectors/labels -- a
+            group id (e.g. source shapefile polygon/field) per row. When
+            given, folds the *pixel* models' split with StratifiedGroupKFold
+            (classification) / GroupKFold (regression) instead of
+            StratifiedKFold/KFold, so no group's rows ever cross a fold
+            boundary -- see run_learning_curve's groups docstring for why
+            this matters (pixel-level leakage within a field/polygon
+            otherwise inflates the score). Only applied to the pixel-model
+            split -- spatial_mlp/spatial_mlp_5x5 fold over a different point
+            pool (patch-derived) that groups isn't aligned with.
 
     Yields:
         dict events:
@@ -924,7 +975,12 @@ def run_kfold_cv(
             dim = vectors.shape[1]
 
     if is_classification:
-        pix_splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+        if groups is not None:
+            from sklearn.model_selection import StratifiedGroupKFold
+
+            pix_splitter = StratifiedGroupKFold(n_splits=k, shuffle=True, random_state=seed)
+        else:
+            pix_splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
         sp_splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
         n_classes = len(np.unique(labels))
         if spatial_labels is not None and len(spatial_labels):
@@ -933,10 +989,15 @@ def run_kfold_cv(
             n_classes = max(n_classes, int(np.max(spatial_labels)) + 1)
         cm_accum = {name: np.zeros((n_classes, n_classes), dtype=np.int64) for name in run_names}
     else:
-        pix_splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
+        if groups is not None:
+            from sklearn.model_selection import GroupKFold
+
+            pix_splitter = GroupKFold(n_splits=k)
+        else:
+            pix_splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
         sp_splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
 
-    pix_folds = list(pix_splitter.split(vectors, labels))
+    pix_folds = list(pix_splitter.split(vectors, labels, groups=groups))
 
     # Spatial 3x3 and 5x5 features come from the same patches, so a single
     # split over spatial_labels serves both.

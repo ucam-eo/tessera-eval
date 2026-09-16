@@ -90,6 +90,7 @@ _tile_cache = {
     "key": None,
     "vectors": None,
     "labels": None,
+    "groups": None,
     "class_names": None,
     "stats": None,
     "spatial_3x3": None,
@@ -945,6 +946,19 @@ def run_large_area():
     # only) -- run_kfold_cv, previously CLI-only.
     eval_mode = body.get("eval_mode", "learning_curve")
     kfold_k = max(2, min(20, int(body.get("kfold_k", 5))))
+    # Opt-in: hold out whole fields (source shapefile polygons), not
+    # individual pixels, so no field's pixels ever land on both sides of a
+    # train/test split -- see run_learning_curve/run_kfold_cv's `groups`
+    # docstring. Off by default: it changes every reported score (usually
+    # downward -- confirmed 0.11-0.14 macro F1 of pure optimism on real
+    # data, Louis Driver's investigation, 2026-09-16) and needs an explicit
+    # decision from the user, not a silent behaviour change for existing
+    # evaluations. Ignored for regression in learning-curve mode (see that
+    # function's groups docstring) and unavailable whenever the disk result
+    # cache is hit (it predates storing group ids -- see that cache path's
+    # comment) or a fixed test set is already in play (spatial/year/file
+    # split takes precedence).
+    group_by_field = bool(body.get("group_by_field", False))
     # One seed for the whole run: sample-point selection, tile-fetch order,
     # learning-curve resampling / k-fold splits, and every estimator's own
     # random_state (RF/XGBoost/MLP, U-Net). Settable from the UI / CLI.
@@ -1083,6 +1097,7 @@ def run_large_area():
         # Check in-memory cache first, then disk cache
         cache_key = (field_name, train_year, test_year, sampling)
         vectors = labels = class_names = stats = None
+        groups = None
         spatial_3x3 = spatial_5x5 = unet_patches = None
         spatial_labels_3x3 = spatial_labels_5x5 = None
         all_sample_points = None  # (lon, lat) coordinates of all sample points
@@ -1096,6 +1111,7 @@ def run_large_area():
         if _tile_cache["key"] == cache_key and _tile_cache["vectors"] is not None:
             vectors = _tile_cache["vectors"]
             labels = _tile_cache["labels"]
+            groups = _tile_cache.get("groups")
             class_names = _tile_cache["class_names"]
             stats = _tile_cache["stats"]
             spatial_3x3 = _tile_cache.get("spatial_3x3")
@@ -1174,6 +1190,13 @@ def run_large_area():
                     "key": cache_key,
                     "vectors": vectors,
                     "labels": labels,
+                    # The on-disk result cache (_result_cache_path) predates
+                    # group IDs and doesn't store them -- a hit here has no
+                    # groups to offer, so explicitly clear the slot rather
+                    # than leaving a previous run's (mismatched) groups
+                    # array in place. group_by_field is simply unavailable
+                    # until the next fresh fetch repopulates it.
+                    "groups": None,
                     "class_names": class_names,
                     "stats": stats,
                     "spatial_3x3": None,
@@ -1290,6 +1313,15 @@ def run_large_area():
 
                 sample_points = []
                 sample_labels = []
+                # Source-polygon index per sampled point, aligned 1:1 with
+                # sample_points/sample_labels -- the "field" a pixel-level
+                # group-holdout split (run_learning_curve/run_kfold_cv's
+                # `groups` param, opt-in via group_by_field below) needs to
+                # keep a whole field on one side of train/test. Built
+                # unconditionally here (cheap -- _sample_points_within_budget
+                # already computes it, it was just discarded before) so
+                # toggling the option on doesn't need a second sampling pass.
+                sample_groups = []
 
                 if is_classification:
                     label_ids = le.transform(valid_gdf[field_name])
@@ -1333,12 +1365,13 @@ def run_large_area():
                             continue
                         per_class = raw_alloc.get(cls_idx, MIN_PER_CLASS)
                         try:
-                            coords, _row_idx = _sample_points_within_budget(
+                            coords, row_idx = _sample_points_within_budget(
                                 cls_gdf, per_class, sampling_rng
                             )
                             if len(coords) > 0:
                                 sample_points.extend(coords.tolist())
                                 sample_labels.extend([cls_idx] * len(coords))
+                                sample_groups.extend(row_idx.tolist())
                         except Exception as e:
                             logger.warning("sample_points failed for class %d: %s", cls_idx, e)
                 else:
@@ -1360,6 +1393,7 @@ def run_large_area():
                             values = valid_gdf.loc[row_idx, field_name].to_numpy(dtype=np.float64)
                             sample_points.extend(coords.tolist())
                             sample_labels.extend(values.tolist())
+                            sample_groups.extend(row_idx.tolist())
                     except Exception as e:
                         logger.warning("sample_points failed for regression: %s", e)
 
@@ -1571,6 +1605,7 @@ def run_large_area():
                 labels = np.array(
                     sample_labels, dtype=np.int32 if is_classification else np.float32
                 )
+                groups = np.array(sample_groups)
 
                 # Remove NaN rows (points outside tile coverage)
                 valid_mask = ~np.isnan(vectors).any(axis=1)
@@ -1591,6 +1626,7 @@ def run_large_area():
                     )
                     vectors = vectors[valid_mask].astype(np.float32)
                     labels = labels[valid_mask]
+                    groups = groups[valid_mask]
                 else:
                     vectors = vectors.astype(np.float32)
 
@@ -1625,6 +1661,7 @@ def run_large_area():
                         "key": cache_key,
                         "vectors": vectors,
                         "labels": labels,
+                        "groups": groups,
                         "class_names": class_names,
                         "stats": stats,
                         "spatial_3x3": None,
@@ -2201,6 +2238,65 @@ def run_large_area():
             start_event["file_split"] = True
             start_event["train_count"] = int(len(labels))
             start_event["test_count"] = int(len(file_split_test_labels))
+
+        # group_by_field: only meaningful when nothing above already fixed
+        # a test set (that takes precedence -- run_learning_curve/
+        # run_kfold_cv would just ignore groups in that case anyway) and
+        # only when groups actually survived to here (a disk result-cache
+        # hit clears it -- see that cache path's comment). effective_groups
+        # is what actually gets passed to run_learning_curve/run_kfold_cv
+        # below; a status event explains it whenever the request asked for
+        # group_by_field but it couldn't be honoured, rather than silently
+        # falling back to the (optimistic) ungrouped split.
+        effective_groups = None
+        if group_by_field:
+            # k-fold mode always cross-validates over the full vectors/
+            # labels regardless of any spatial/year/file split (those are
+            # ignored there, each with its own "ignored" status message
+            # elsewhere) -- so the fixed-test-set precedence rule below
+            # only applies in learning-curve mode.
+            already_fixed = eval_mode != "kfold" and (
+                has_spatial_split
+                or year_split_test_vectors is not None
+                or file_split_test_vectors is not None
+            )
+            if already_fixed:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": "Group by field ignored — a spatial/year/test-file "
+                            "split is already fixing the test set.",
+                        }
+                    )
+                    + "\n"
+                )
+            elif groups is None:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": "Group by field ignored — not available for this "
+                            "cached result; re-run to regenerate it.",
+                        }
+                    )
+                    + "\n"
+                )
+            elif task != "classification":
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": "Group by field ignored — not yet supported for "
+                            "regression.",
+                        }
+                    )
+                    + "\n"
+                )
+            else:
+                effective_groups = groups
+                start_event["group_by_field"] = True
+
         yield json.dumps(start_event) + "\n"
 
         # Run learning curve (all classifiers including U-Net)
@@ -2216,6 +2312,7 @@ def run_large_area():
             finish_classifiers=_finish_classifiers,
             unet_patches=unet_patches,
             task=task,
+            groups=effective_groups,
         )
         if has_spatial_split:
             lc_kwargs["test_vectors"] = spatial_test_vectors
@@ -2299,6 +2396,7 @@ def run_large_area():
                     spatial_labels_3x3 if spatial_labels_3x3 is not None else spatial_labels_5x5
                 ),
                 dim=(vectors.shape[1] if vectors is not None else None),
+                groups=effective_groups,
             ):
                 if _cancelled():
                     logger.info("Evaluation cancelled during k-fold CV")

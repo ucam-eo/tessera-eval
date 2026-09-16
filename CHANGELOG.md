@@ -6,6 +6,61 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.0]
+
+### Added
+- **Group-by-field split (`groups` in `run_learning_curve`/`run_kfold_cv`,
+  opt-in `group_by_field` request flag) — fixes a real optimism bug in
+  every existing TEE evaluation, not just Louis's Austrian-crop case.**
+  Continuing the same investigation as v1.12.0's `deep_mlp`: Tessera
+  embeddings are highly spatially autocorrelated within a field, so TEE's
+  existing splits (`StratifiedKFold` for k-fold, per-class percentage
+  sampling for the learning curve) let pixels from the *same* shapefile
+  polygon land on both sides of train/test — a classifier can then partly
+  "recognize the field" instead of learning the habitat, inflating the
+  reported score. Verified directly on real data (not synthetic): fetched
+  ~2M real per-pixel embeddings across a 25km×25km slice of Austria (6,674
+  fields, all 17 classes — genuinely more labelled pixels than Louis's own
+  177K-pixel run), subsampled to 40K, and compared the *same* `mlp`/
+  `deep_mlp` models under a naive `StratifiedKFold` vs. an honest
+  `StratifiedGroupKFold` (fields never split across folds): **naive macro
+  F1 was 0.11–0.14 higher** than the honest number for both models (mlp:
+  0.744 vs. 0.607; deep_mlp: 0.747 vs. 0.638) — a bigger effect than
+  `deep_mlp`'s own architecture edge over plain `mlp` by an order of
+  magnitude. (One open puzzle, not yet resolved: the *naive* number on this
+  compact 25km test region lands close to Frank's reported paper number,
+  and the *honest* number lands close to Louis's own real (much larger,
+  more geographically dispersed) run — direction not fully understood yet,
+  noted for follow-up rather than papered over.)
+  Mechanism: `_sample_points_within_budget` (server.py) already computed
+  `row_index` — which source shapefile polygon each sampled point came
+  from — for every point sampled for pixel-classifier training; it was
+  simply discarded (`_row_idx`) at every call site. Now captured as
+  `sample_groups`, threaded through to `vectors`/`labels` construction
+  (same order, same NaN-coverage filtering) and passed as `groups` to
+  `run_learning_curve` (new `groups`/`group_test_fraction` params: carves
+  out a fixed pool of whole groups as the test set via
+  `StratifiedGroupKFold`, then behaves exactly like the existing
+  spatial-split fixed-test-set mode from there) and `run_kfold_cv` (new
+  `groups` param: swaps the *pixel*-model splitter to
+  `StratifiedGroupKFold`/`GroupKFold`; spatial_mlp/spatial_mlp_5x5 keep
+  their own separate patch-derived split, unaffected).
+  **Opt-in, not the new default** (`group_by_field` request flag, off by
+  default): flipping this on changes every reported score, usually
+  downward, so it needs an explicit decision rather than silently
+  invalidating comparisons against a user's past evaluations. Ignored (with
+  a clear status message) whenever a fixed test set is already active
+  (spatial/year/file split takes precedence), when the on-disk result cache
+  is hit (predates storing group ids — the in-memory cache carries them,
+  the disk one doesn't yet), or for regression (not yet supported).
+  Classification-only for now, same scoping rationale as `deep_mlp`.
+  7 new tests (`tests/test_group_holdout.py`), including two direct
+  regression tests against synthetic leaky data (a naive split must score
+  ≥0.1 macro F1 higher than the group-holdout split, same data, same
+  model) and a fold-membership check that no group ever appears in more
+  than one `StratifiedGroupKFold` test fold. Full suite 249 passed (was
+  242 after v1.12.0).
+
 ## [1.12.0]
 
 ### Added
