@@ -61,6 +61,12 @@ def available_classifiers():
         names.append("xgboost")
     except ImportError:
         pass
+    try:
+        import torch  # noqa: F401
+
+        names.append("deep_mlp")
+    except ImportError:
+        pass
     return names
 
 
@@ -69,7 +75,7 @@ def make_classifier(name, params=None, seed=42):
 
     Args:
         name: Classifier name — one of 'nn', 'rf', 'xgboost', 'mlp',
-              'spatial_mlp', 'spatial_mlp_5x5'.
+              'deep_mlp', 'spatial_mlp', 'spatial_mlp_5x5'.
               May include a variant suffix (e.g., 'mlp_v2') which is
               stripped before lookup.
         params: Optional dict of hyperparameters
@@ -128,6 +134,30 @@ def make_classifier(name, params=None, seed=42):
         else:
             hidden = (64, 32)
         return _make_mlp(MLPClassifier, hidden, int(p.get("max_iter", 200)), seed)
+    elif base_name == "deep_mlp":
+        # PyTorch MLP matching the Tessera paper's own downstream-eval
+        # architecture (BatchNorm + Dropout + AdamW + val-F1 checkpoint
+        # selection) -- see deep_mlp.py's module docstring for the full
+        # diagnosis. Optional (requires torch); raises a clear error via
+        # _require_torch() if it's requested without torch installed,
+        # rather than available_classifiers() silently hiding it from a
+        # caller that already knows the name.
+        from tessera_eval.deep_mlp import DeepMLPClassifier
+
+        layers_str = p.get("hidden_layers", "512,256")
+        if isinstance(layers_str, str):
+            hidden = tuple(int(x) for x in layers_str.split(","))
+        else:
+            hidden = (512, 256)
+        return DeepMLPClassifier(
+            hidden=hidden,
+            dropout=float(p.get("dropout", 0.3)),
+            lr=float(p.get("lr", 1e-3)),
+            weight_decay=float(p.get("weight_decay", 0.01)),
+            batch_size=int(p.get("batch_size", 8192)),
+            epochs=int(p.get("epochs", 150)),
+            seed=seed,
+        )
     elif base_name in SPATIAL_MODELS:
         default_layers = "256,128" if base_name == "spatial_mlp" else "512,256"
         default_iter = 300 if base_name == "spatial_mlp" else 400

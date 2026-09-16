@@ -6,6 +6,58 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.0]
+
+### Added
+- **`deep_mlp`: a PyTorch MLP matching the Tessera paper's own downstream-eval
+  architecture.** Continuing the Louis Driver Austrian-crop F1-gap
+  investigation (v1.11.4's changelog entry): Frank, the paper's own
+  downstream-eval author, described his setup directly (2026-09-16) --
+  128→512→256→17, each hidden layer **Linear+BatchNorm1d+ReLU+Dropout(0.3)**,
+  trained with **AdamW**(1e-3, weight_decay 0.01), batch 8192, 150 epochs,
+  **best checkpoint kept by validation weighted-F1** -- and flagged,
+  unprompted, that "Louis's v1/v2/v3 don't seem to have BatchNorm and that
+  really matters." sklearn's `MLPClassifier` (classify.py's existing `mlp`,
+  even after v1.11.4's `StandardScaler` fix) has no BatchNorm/Dropout
+  equivalent and no checkpoint selection at all -- confirmed the gap
+  survives regardless of training-data volume (Louis's own learning-curve
+  numbers: best sklearn variant tops out at macro F1 0.598 at 80% training
+  data, vs. Frank's 0.7248 at 30%). New `tessera_eval/deep_mlp.py`
+  (`DeepMLPClassifier`, a plain fit/predict/predict_proba wrapper around a
+  small `torch.nn.Sequential`) reproduces that architecture; wired into
+  `make_classifier`'s new `"deep_mlp"` branch (hyperparameters: `hidden_layers`,
+  `dropout`, `lr`, `weight_decay`, `batch_size`, `epochs`) and
+  `available_classifiers()`. Classification-only -- that's the only task
+  this was diagnosed against.
+  Optional dependency, same convention as U-Net (`unet.py`'s `_HAS_TORCH`
+  guard): not in `requirements.txt`/`pyproject.toml`, install manually
+  (`pip install torch`); `available_classifiers()` only advertises it when
+  torch is importable, and requesting it without torch installed raises a
+  clear `RuntimeError` rather than an opaque one.
+  Interestingly, Frank *doesn't* scale his input features either --
+  BatchNorm1d right after the first `Linear` does that job per-batch, which
+  is also why v1.11.4's scaling fix alone only closed ~1-2 of the ~20+ point
+  gap: it was fixing the same symptom sklearn's MLP has for a different
+  reason (no BatchNorm to do it implicitly).
+  **Honest verification, not yet a solved gap**: fit/predict/predict_proba
+  tested on synthetic separable data and wired end-to-end through
+  `make_classifier` (`tests/test_deep_mlp.py`, 10 tests, skipped when torch
+  isn't installed — mirrors `test_unet_regression.py`'s own skip pattern).
+  Head-to-head against sklearn's `mlp` (Louis's own best variant,
+  `256,128,64`) on real Tessera embeddings (2,040 points, 17 balanced
+  classes, sampled across the Austria extent via `geotessera` directly) via
+  `run_learning_curve` at 30%/80% training splits: `deep_mlp` beat `mlp` by
+  a small, real margin (macro F1 +0.0075 at 30%, +0.0073 at 80%) -- real,
+  but nowhere close to Frank's reported gap-closing number. Most likely
+  explanation: that 2,040-point sample is tiny next to Frank's actual run
+  (a 78k-pixel downsampled raster, tens of thousands of training pixels
+  from a field-level area-stratified split) -- a ~200K-parameter net with
+  BatchNorm needs real data volume to show its advantage, and this repo has
+  no local equivalent of Frank's full labelled raster to test against. The
+  fair test is Louis's own next full-scale run (his real ~177K-pixel
+  dataset) with `deep_mlp` added to his classifier list, not a small
+  synthetic-scale rehearsal of it here. The bulk of the F1 gap remains open.
+
 ## [1.11.4]
 
 ### Fixed
