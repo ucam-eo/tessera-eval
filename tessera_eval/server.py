@@ -192,6 +192,53 @@ def _get_zarr():
     return _zarr_instance or None
 
 
+def _fit_with_wire_heartbeat(fit_fn):
+    """Like evaluate.py's _fit_with_heartbeat, but translated into an SSE
+    stream's own wire format (JSON-string lines, not {"type": ...} dicts)
+    -- use as ``result = yield from _fit_with_wire_heartbeat(fit_fn)``
+    inside any of this module's ``stream()`` generators.
+
+    train_models() (Download Models) and create_map() both used to train
+    every model with a single raw, blocking call and no heartbeat at all
+    -- unlike run_learning_curve/run_kfold_cv, which already got this fix
+    (see evaluate.py's _fit_with_heartbeat docstring: a spatial_mlp/U-Net
+    fit can run well past 20 minutes, and a silent SSE stream that whole
+    time gets read as dead and dropped by whatever's carrying the
+    connection). Confirmed live (Moustafa Eweda): a U-Net "Download
+    Models" run that completed server-side surfaced in the browser as
+    "Training error: network error" -- the download endpoint went
+    completely silent for the whole training run. Also protects
+    deep_mlp's own download-model and create-map paths the same way (a
+    150-epoch fit on a large training set, or create_map's own from-
+    scratch refit, is exactly the kind of long, silent call these two
+    endpoints never guarded against before).
+    """
+    import sys
+
+    # tessera_eval/__init__.py re-exports a function *also* named `evaluate`
+    # from this submodule, which shadows `tessera_eval.evaluate` (the
+    # submodule) for `import tessera_eval.evaluate as x` -- go via
+    # sys.modules directly, same workaround test_fit_heartbeat.py already
+    # documents and uses.
+    _evaluate_mod = sys.modules["tessera_eval.evaluate"]
+    # Read the interval as a live module attribute at call time, not via
+    # _fit_with_heartbeat's own default parameter (bound once, at
+    # evaluate.py's import time) -- so a test (or any future caller) that
+    # monkeypatches tessera_eval.evaluate._HEARTBEAT_INTERVAL_S actually
+    # takes effect here, the same way run_learning_curve's own call sites
+    # already do (they pass interval=_HEARTBEAT_INTERVAL_S explicitly too).
+    gen = _evaluate_mod._fit_with_heartbeat(
+        fit_fn, interval=_evaluate_mod._HEARTBEAT_INTERVAL_S
+    )
+    while True:
+        try:
+            gen.send(None)
+        except StopIteration as si:
+            return si.value
+        else:
+            yield json.dumps({"event": "heartbeat"}) + "\n"
+
+
 def _probe_zarr_coverage(gtz, bounds, year):
     """True when the zarr store has a valid embedding for *year* at the
     centre of *bounds* (west, south, east, north).
@@ -2659,18 +2706,22 @@ def train_models():
 
                         if is_classification:
                             n_cls = len(np.unique(labels))
-                            model = train_unet_on_patches(
-                                unet_patches,
-                                n_cls,
-                                model_params.get(name, {}),
-                                progress_callback=_unet_cb,
+                            model = yield from _fit_with_wire_heartbeat(
+                                lambda: train_unet_on_patches(
+                                    unet_patches,
+                                    n_cls,
+                                    model_params.get(name, {}),
+                                    progress_callback=_unet_cb,
+                                )
                             )
                         else:
                             # Regression U-Net is single-channel -- no n_cls arg.
-                            model = train_unet_on_patches(
-                                unet_patches,
-                                model_params.get(name, {}),
-                                progress_callback=_unet_cb,
+                            model = yield from _fit_with_wire_heartbeat(
+                                lambda: train_unet_on_patches(
+                                    unet_patches,
+                                    model_params.get(name, {}),
+                                    progress_callback=_unet_cb,
+                                )
                             )
                         for ep, tot, loss in _unet_progress:
                             yield (
@@ -2733,7 +2784,7 @@ def train_models():
                         spatial_3x3, spatial_labels_3x3, window=3, dim=vectors.shape[1], seed=seed
                     )
                     clf = make_classifier(name, model_params.get(name, {}), seed=seed)
-                    clf.fit(X_aug, y_aug)
+                    yield from _fit_with_wire_heartbeat(lambda: clf.fit(X_aug, y_aug))
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".joblib", prefix=f"{name}_model_", delete=False
                     )
@@ -2750,7 +2801,7 @@ def train_models():
                         spatial_5x5, spatial_labels_5x5, window=5, dim=vectors.shape[1], seed=seed
                     )
                     clf = make_classifier(name, model_params.get(name, {}), seed=seed)
-                    clf.fit(X_aug, y_aug)
+                    yield from _fit_with_wire_heartbeat(lambda: clf.fit(X_aug, y_aug))
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".joblib", prefix=f"{name}_model_", delete=False
                     )
@@ -2783,7 +2834,7 @@ def train_models():
                         if is_classification
                         else make_regressor(name, model_params.get(name, {}), seed=seed)
                     )
-                    clf.fit(vectors, labels)
+                    yield from _fit_with_wire_heartbeat(lambda: clf.fit(vectors, labels))
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".joblib", prefix=f"{name}_model_", delete=False
                     )
@@ -3163,7 +3214,7 @@ def create_map():
                 if is_classification
                 else make_regressor(model_key, model_params.get(model_key, {}), seed=seed)
             )
-            clf.fit(vectors, labels)
+            yield from _fit_with_wire_heartbeat(lambda: clf.fit(vectors, labels))
         except Exception as e:
             yield (
                 json.dumps({"event": "error", "message": f"Failed to train classifier: {e}"}) + "\n"

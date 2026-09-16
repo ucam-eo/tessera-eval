@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.1]
+
+### Fixed
+- **"Download Models" and Create Map could silently go dark mid-training,
+  surfacing to the user as a browser "network error" even though the
+  server-side training was still running (or had already finished).**
+  `train_models()` ("Download Models", deferred from evaluation) and
+  `create_map()`'s own from-scratch refit both trained every model with a
+  single raw, blocking call — `train_unet_on_patches(...)` or `clf.fit(...)`
+  directly — with no heartbeat at all, unlike `run_learning_curve`/
+  `run_kfold_cv`, which already got `evaluate.py`'s `_fit_with_heartbeat`
+  fix for exactly this failure mode (a slow enough fit leaves the SSE
+  stream silent for its whole duration, and whatever's carrying the
+  connection reads that as dead and drops it). Confirmed live (Moustafa
+  Eweda): a U-Net "Download Models" run that had completed successfully
+  server-side surfaced in the browser as "Training error: network error" —
+  the download endpoint had gone completely silent for the whole run.
+  Fixed by a new `_fit_with_wire_heartbeat()` (translates
+  `_fit_with_heartbeat`'s events into this module's own JSON-string wire
+  format), wrapping all 6 blocking training calls across both endpoints:
+  U-Net classification and regression, `spatial_mlp`/`spatial_mlp_5x5`,
+  and the generic pixel-classifier/regressor branch in each. The generic
+  branch also protects `deep_mlp`'s own download-model and create-map
+  paths the same way — a 150-epoch fit on a large training set is exactly
+  the kind of long, silent call these two endpoints never guarded against
+  before v1.12.0 added it as an option.
+  4 new tests (`tests/test_train_models_heartbeat.py`): isolated coverage
+  of `_fit_with_wire_heartbeat` (fast fit → no heartbeats; slow fit →
+  heartbeats + correct return value; exception still propagates after
+  heartbeats), plus an integration test reproducing the actual bug —
+  `train_models()` with a slow classifier fit must emit real heartbeat
+  events, not go silent. Full suite 253 passed (was 249).
+
 ## [1.13.0]
 
 ### Added
