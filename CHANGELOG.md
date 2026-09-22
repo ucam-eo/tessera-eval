@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.0]
+
+### Added
+- **`spatial_kfold`: a real geographic split for k-fold cross-validation.**
+  Ordinary k-fold here (`run_kfold_cv`) shuffles points at random, with no
+  notion of location at all — two points from neighbouring fields, or even
+  the same field, can land on opposite sides of a fold, the same
+  spatial-autocorrelation optimism a plain random split has (documented in
+  the user guide's own "K-fold is not a spatial split" section). The
+  learning curve already has a real geographic split (Spatial Train/Test
+  Split, drawn train/test bounding boxes) — k-fold had no equivalent until
+  this. New opt-in request flag `spatial_kfold` (off by default, same
+  rationale as `group_by_field`: it changes every reported k-fold score).
+  Mechanism: new `server.py` helper `_spatial_block_groups()` assigns each
+  sampled point to one of ~k geographic blocks via a quantile grid over its
+  (lon, lat) (quantile edges rather than equal-width degree bins, so block
+  *point counts* stay roughly balanced even over a lopsided AOI), then
+  feeds that as `groups` into the exact same `StratifiedGroupKFold`/
+  `GroupKFold` machinery `group_by_field` already uses (v1.13.0) — the
+  splitting mechanism needed zero changes, only the grouping key is new.
+  k-fold-only (the learning curve already has its own geographic split);
+  takes precedence over `group_by_field` when both are requested (only one
+  grouping can drive a single split); falls back to plain k-fold with a
+  clear status message when sample-point coordinates aren't available
+  (cached result) or points are too clustered to form k distinct blocks.
+  12 new tests: `tests/test_spatial_block_groups.py` (grouping-function
+  properties — balance, determinism, degenerate single-location/single-line
+  inputs) and `tests/test_spatial_kfold_server.py` (request-flag wiring —
+  activates in k-fold mode, ignored outside it, takes precedence over
+  `group_by_field` with a status message, `group_by_field` alone still
+  works unchanged). Full suite 265 passed (was 253).
+
 ## [1.13.1]
 
 ### Fixed

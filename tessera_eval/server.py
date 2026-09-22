@@ -341,6 +341,63 @@ def _sample_points_within_budget(rows_gdf, budget, rng):
     return coords, row_index
 
 
+def _spatial_block_groups(points_lonlat, n_blocks):
+    """Assign each (lon, lat) point to one of ~n_blocks geographic blocks,
+    for use as the ``groups`` array in a k-fold split (StratifiedGroupKFold/
+    GroupKFold, see evaluate.run_kfold_cv) -- the "spatial k-fold" option.
+
+    Ordinary k-fold here shuffles points at random, so two points from the
+    same field, or just from neighbouring locations, can land on opposite
+    sides of a fold -- the same spatial-autocorrelation optimism as a
+    random train/test split (see the user guide's "K-fold is not a spatial
+    split" section, and group_by_field's docstring/CHANGELOG for the
+    analogous field-level leakage this doesn't cover). Unlike
+    group_by_field (grouped by source shapefile polygon), this groups by
+    *geography* directly, so it also fixes leakage between adjacent fields,
+    not just within one -- the thing k-fold genuinely had no mechanism for
+    before this.
+
+    Uses a quantile grid rather than equal-width degree bins: an AOI is
+    rarely a perfect square, and equal-width binning over a lopsided sample
+    would leave some cells nearly empty and others overloaded. Quantile
+    edges instead give each cell a roughly equal point count. The grid is
+    sized close to a square (n_lon_bins * n_lat_bins >= n_blocks) so a split
+    with n_splits == n_blocks tends to land close to "one geographic block
+    per fold" -- the intuitive reading of "spatial k-fold" -- without being
+    an exact guarantee (StratifiedGroupKFold still balances group sizes and
+    class stats, not pure geography, when assigning blocks to folds).
+
+    Args:
+        points_lonlat: array-like, shape (N, 2) -- (lon, lat) per point,
+            same row order as the vectors/labels this groups.
+        n_blocks: target number of spatial blocks (typically the k-fold
+            fold count -- see server.py's spatial_kfold wiring).
+
+    Returns:
+        int64 array, shape (N,) -- a block id per point. The actual number
+        of distinct ids can be less than n_blocks when points cluster onto
+        few locations or share coordinates (duplicate quantile edges
+        collapse together) -- callers that need at least k groups (k-fold
+        requires n_groups >= n_splits) should check
+        ``len(np.unique(result))`` themselves.
+    """
+    points = np.asarray(points_lonlat, dtype=np.float64)
+    n_lat_bins = max(1, int(round(np.sqrt(max(1, n_blocks)))))
+    n_lon_bins = max(1, int(np.ceil(n_blocks / n_lat_bins)))
+
+    def _quantile_bin(values, n_bins):
+        if n_bins <= 1 or len(np.unique(values)) <= 1:
+            return np.zeros(len(values), dtype=np.int64)
+        edges = np.unique(np.quantile(values, np.linspace(0, 1, n_bins + 1)))
+        if len(edges) <= 2:
+            return np.zeros(len(values), dtype=np.int64)
+        return np.digitize(values, edges[1:-1], right=False).astype(np.int64)
+
+    lon_bins = _quantile_bin(points[:, 0], n_lon_bins)
+    lat_bins = _quantile_bin(points[:, 1], n_lat_bins)
+    return lon_bins * (int(lat_bins.max()) + 1) + lat_bins
+
+
 def _extract_tile_patches(
     gt,
     gdf,
@@ -1006,6 +1063,23 @@ def run_large_area():
     # comment) or a fixed test set is already in play (spatial/year/file
     # split takes precedence).
     group_by_field = bool(body.get("group_by_field", False))
+    # Opt-in: split k-fold cross-validation by *geography* rather than
+    # shuffling points at random. Ordinary k-fold here (see run_kfold_cv)
+    # partitions points with no notion of location at all -- two points
+    # from neighbouring fields, or even the same field, can land on
+    # opposite sides of a fold, the same spatial-autocorrelation optimism a
+    # plain random split has. The learning curve already has a real
+    # geographic split (Spatial Train/Test Split, train_bboxes/test_bboxes
+    # below) -- k-fold had no equivalent at all until this. Implemented via
+    # _spatial_block_groups() (quantile grid over each point's lon/lat) fed
+    # into run_kfold_cv's existing `groups` param (StratifiedGroupKFold/
+    # GroupKFold -- the same mechanism group_by_field already uses, just
+    # grouped by geography instead of by source polygon). k-fold-only (the
+    # learning curve already has its own geographic split) and off by
+    # default for the same reason group_by_field is: it changes every
+    # reported k-fold score. Takes precedence over group_by_field if both
+    # are set, since only one grouping can drive a single split.
+    spatial_kfold = bool(body.get("spatial_kfold", False))
     # One seed for the whole run: sample-point selection, tile-fetch order,
     # learning-curve resampling / k-fold splits, and every estimator's own
     # random_state (RF/XGBoost/MLP, U-Net). Settable from the UI / CLI.
@@ -2286,17 +2360,99 @@ def run_large_area():
             start_event["train_count"] = int(len(labels))
             start_event["test_count"] = int(len(file_split_test_labels))
 
+        # spatial_kfold: computed first since it takes precedence over
+        # group_by_field when both are set (only one grouping can drive a
+        # single split -- see spatial_kfold's own request-flag comment).
+        # k-fold-only: the learning curve already has its own geographic
+        # split (Spatial Train/Test Split, has_spatial_split above), so
+        # this doesn't need the "already_fixed" precedence check
+        # group_by_field has below -- it simply doesn't apply outside
+        # k-fold mode at all.
+        effective_groups = None
+        if spatial_kfold:
+            if eval_mode != "kfold":
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": "Spatial k-fold ignored — only applies to k-fold "
+                            "cross-validation. Use the learning curve's Spatial Train/Test "
+                            "Split for a geographic split there.",
+                        }
+                    )
+                    + "\n"
+                )
+            elif all_sample_points is None:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": "Spatial k-fold ignored — sample point coordinates "
+                            "aren't available for this cached result; re-run to regenerate it.",
+                        }
+                    )
+                    + "\n"
+                )
+            else:
+                sp_kf = np.array(all_sample_points)
+                if all_valid_mask is not None and all_valid_mask.sum() < len(sp_kf):
+                    sp_kf = sp_kf[all_valid_mask]
+                if len(sp_kf) != len(vectors):
+                    # Shouldn't happen (sp_kf and vectors both come from the
+                    # same valid_mask filtering) -- defensive check rather
+                    # than letting a length mismatch crash inside sklearn
+                    # with a confusing error.
+                    yield (
+                        json.dumps(
+                            {
+                                "event": "status",
+                                "message": "Spatial k-fold ignored — point coordinates don't "
+                                "match the training data; re-run to regenerate it.",
+                            }
+                        )
+                        + "\n"
+                    )
+                else:
+                    spatial_groups = _spatial_block_groups(sp_kf, kfold_k)
+                    n_distinct = len(np.unique(spatial_groups))
+                    if n_distinct < kfold_k:
+                        yield (
+                            json.dumps(
+                                {
+                                    "event": "status",
+                                    "message": f"Spatial k-fold ignored — only {n_distinct} "
+                                    f"distinct spatial blocks for k={kfold_k} folds (points too "
+                                    "clustered); try a smaller k.",
+                                }
+                            )
+                            + "\n"
+                        )
+                    else:
+                        effective_groups = spatial_groups
+                        start_event["spatial_kfold"] = True
+                        if group_by_field:
+                            yield (
+                                json.dumps(
+                                    {
+                                        "event": "status",
+                                        "message": "Group by field ignored — Spatial k-fold "
+                                        "is active for this run.",
+                                    }
+                                )
+                                + "\n"
+                            )
+
         # group_by_field: only meaningful when nothing above already fixed
         # a test set (that takes precedence -- run_learning_curve/
-        # run_kfold_cv would just ignore groups in that case anyway) and
+        # run_kfold_cv would just ignore groups in that case anyway),
+        # spatial_kfold didn't already claim effective_groups above, and
         # only when groups actually survived to here (a disk result-cache
         # hit clears it -- see that cache path's comment). effective_groups
         # is what actually gets passed to run_learning_curve/run_kfold_cv
         # below; a status event explains it whenever the request asked for
         # group_by_field but it couldn't be honoured, rather than silently
         # falling back to the (optimistic) ungrouped split.
-        effective_groups = None
-        if group_by_field:
+        if group_by_field and effective_groups is None:
             # k-fold mode always cross-validates over the full vectors/
             # labels regardless of any spatial/year/file split (those are
             # ignored there, each with its own "ignored" status message
