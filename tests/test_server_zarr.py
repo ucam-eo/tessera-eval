@@ -12,6 +12,13 @@ import tessera_eval.server as srv
 @pytest.fixture(autouse=True)
 def _fresh_cache(monkeypatch):
     monkeypatch.setattr(srv, "_zarr_instance", None)
+    # The zarr fast path is currently force-disabled at the module level
+    # (_ZARR_DISABLED, 2026-09-23 -- see its own comment: a chunk-size/
+    # caching bug means every read hits the network regardless). Tests that
+    # exercise _get_zarr()'s real connect/cache logic re-enable it
+    # explicitly; everything else should see the same "always None,
+    # never even tries to connect" behaviour production currently has.
+    monkeypatch.setattr(srv, "_ZARR_DISABLED", False)
 
 
 class _FakeStore:
@@ -56,6 +63,20 @@ def test_get_zarr_returns_none_when_store_cannot_open(monkeypatch):
     assert srv._get_zarr() is None
     assert srv._get_zarr() is None
     assert len(calls) == 1, "a failed open must be cached, not retried per call"
+
+
+def test_get_zarr_disabled_returns_none_without_even_trying_to_connect(monkeypatch):
+    """The current production default (_ZARR_DISABLED=True, see its own
+    module-level comment) -- overrides the autouse fixture's re-enable for
+    this one test. _get_zarr() must short-circuit before ever constructing
+    GeoTesseraZarr, not just happen to return None."""
+    monkeypatch.setattr(srv, "_ZARR_DISABLED", True)
+    calls = []
+    monkeypatch.setattr(
+        "geotessera.store.GeoTesseraZarr", lambda **kw: (calls.append(kw), _FakeStore())[1]
+    )
+    assert srv._get_zarr() is None
+    assert calls == [], "disabled zarr must not even attempt to open the store"
 
 
 def test_get_zarr_returns_none_for_a_store_with_no_years(monkeypatch):

@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.2]
+
+### Changed
+- **Zarr fast path temporarily disabled (`_ZARR_DISABLED = True`), forcing
+  every embedding fetch onto the NPY tile path.** Keshav (2026-09-23): the
+  zarr fast path is using a smaller chunk size than intended, and every
+  read still hits the network regardless of the on-disk cache — the same
+  symptom Moustafa Eweda reported and forwarded to Anil (geotessera's own
+  `GeoTesseraZarr`, not `tessera_eval` code). `_get_zarr()` now
+  short-circuits to `None` before even attempting to open the store, so
+  both call sites (`_extract_tile_patches`, `create_map`'s tile loop)
+  already fall back to NPY tiles cleanly (existing `gtz is not None and
+  ...` guards, unchanged). `_get_zarr()`'s own real connection/caching
+  logic is untouched, just bypassed — flip `_ZARR_DISABLED` back to
+  `False` once geotessera's chunk-size/caching behaviour is confirmed
+  fixed upstream. 1 new test (`test_get_zarr_disabled_returns_none_
+  without_even_trying_to_connect`); the 2 existing tests that exercise
+  `_get_zarr()`'s real connect logic now explicitly re-enable it via the
+  file's `_fresh_cache` fixture. Full suite 275 passed (was 274).
+
 ## [1.14.1]
 
 ### Fixed

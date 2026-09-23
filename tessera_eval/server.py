@@ -112,6 +112,16 @@ _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
 _geotessera_instance = None  # cached to avoid 10-30s registry init per run
 _zarr_instance = None  # cached GeoTesseraZarr handle; False = tried and failed
+# Temporarily force every embedding fetch onto the NPY tile path, bypassing
+# GeoTesseraZarr entirely. The zarr fast path is currently using a smaller
+# chunk size than intended (Keshav, 2026-09-23) -- reported symptom matches
+# Moustafa Eweda's earlier report (forwarded to Anil): the on-disk chunk
+# cache only persists ~1.2MB of metadata, not the actual tile data, so
+# every read still hits the network regardless of caching. Set back to
+# False once geotessera's chunk-size/caching behaviour is confirmed fixed
+# upstream -- _get_zarr()'s own real connection logic is untouched below,
+# this just short-circuits it.
+_ZARR_DISABLED = True
 _cancel_flag = None  # threading.Event, set when user cancels
 # Shared across every proxy() call so the TCP+TLS connection to _hosted_url is
 # kept alive and reused (requests' connection-pooling adapter), instead of a
@@ -171,6 +181,8 @@ def _get_zarr():
     included; callers fall back to the NPY tile path on None. Chunk reads
     are cached on disk alongside the NPY tile cache.
     """
+    if _ZARR_DISABLED:
+        return None
     global _zarr_instance
     if _zarr_instance is None:
         try:
