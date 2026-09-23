@@ -2630,6 +2630,23 @@ def run_large_area():
                         )
                         + "\n"
                     )
+                elif et == "classifier_status":
+                    # A model failed to train (e.g. deep_mlp without torch
+                    # installed) -- run_kfold_cv already zero-fills that
+                    # model's score so the run continues, but a silent 0.0
+                    # next to the other models' real scores is
+                    # indistinguishable from "genuinely the worst model",
+                    # confirmed live (Keshav): deep_mlp reporting a flat 0
+                    # across every fold, with no visible cause, when the
+                    # real cause was simply a missing optional dependency
+                    # on that machine. Forward it the same way
+                    # run_learning_curve's identical event already is
+                    # (below) -- see this event's own docstring in
+                    # evaluate.py for what accompanies it (a "failed": True
+                    # flag on that model's fold_result/aggregate metrics).
+                    yield (
+                        json.dumps({"event": "status", "message": event["message"]}) + "\n"
+                    )
                 elif et == "heartbeat":
                     yield json.dumps({"event": "heartbeat"}) + "\n"
 

@@ -208,7 +208,14 @@ def run_learning_curve(
         - {"type": "progress", "pct": float, "classifiers": {name: metrics_dict}}
           -- metrics_dict is {mean_f1, std_f1, mean_f1w, std_f1w} for
           classification, {mean_r2, std_r2, mean_rmse, std_rmse, mean_mae,
-          std_mae} for regression
+          std_mae} for regression. Carries "failed": True when that model
+          raised an exception on at least one fit this run (a missing
+          optional dependency, e.g. deep_mlp without torch, is the common
+          case) -- the numeric fields are still a real 0.0 (so aggregation
+          math doesn't need a special case), but callers should treat a
+          failed model's score as "didn't run", not "scored zero". See the
+          matching {"type": "classifier_status", "message": ...} event,
+          yielded once per model the first time it fails.
         - {"type": "confusion_matrices", "confusion_matrices": {name: [[int]]}}
           (classification only)
         - {"type": "aggregate", "models": {name: metrics_dict}} (regression
@@ -345,6 +352,23 @@ def run_learning_curve(
             len(classifier_names),
             training_pcts,
         )
+
+    # Names that have failed to train at least once, and names already
+    # reported via a classifier_status event -- see the classification/
+    # regression/U-Net except blocks below. A model that fails once (e.g. a
+    # missing optional dependency, deep_mlp without torch) fails identically
+    # at every pct/repeat, so the *first* failure is reported and the rest
+    # are silently zero-filled same as before -- reporting all of them would
+    # flood the stream with the same message once per pct*repeat. Sticking
+    # with "failed at least once" for the whole run (not per-pct) is a
+    # deliberate simplification: an intermittent failure (e.g. xgboost's
+    # contiguous-label requirement only tripping at a tiny pct where a rare
+    # class is absent from the training fold) still gets marked failed for
+    # every pct once it happens anywhere, which is the safer reading -- a
+    # single 0.0 among otherwise-real numbers is exactly the "looks like a
+    # real bad score" case this exists to prevent.
+    failed_names = set()
+    _reported_failures = set()
 
     for pct_idx, pct in enumerate(training_pcts):
         pct_t0 = _time.time()
@@ -488,8 +512,21 @@ def run_learning_curve(
                 # spatial_mlp/spatial_mlp_5x5 directly (see make_regressor's
                 # docstring for why that name has no "_reg" suffix).
                 if is_classification:
-                    clf = make_classifier(name, (classifier_params or {}).get(name, {}), seed=seed)
                     try:
+                        # Construction belongs inside the try too, not just
+                        # the fit/predict call -- a classifier whose
+                        # constructor can itself raise (deep_mlp's
+                        # _require_torch(), see classify.py) would otherwise
+                        # crash this whole generator uncaught, taking every
+                        # other classifier's results down with it. Confirmed
+                        # live: requesting deep_mlp without torch installed
+                        # killed the entire learning-curve run instead of
+                        # just failing that one model (run_kfold_cv already
+                        # had make_classifier inside its own try -- only
+                        # this function had the gap).
+                        clf = make_classifier(
+                            name, (classifier_params or {}).get(name, {}), seed=seed
+                        )
                         y_pred = yield from _fit_predict_relabeled(
                             clf, X_tr, y_tr_aug, X_te, interval=_HEARTBEAT_INTERVAL_S
                         )
@@ -506,9 +543,25 @@ def run_learning_curve(
                         )
                         f1_scores[name].append(0.0)
                         f1w_scores[name].append(0.0)
+                        failed_names.add(name)
+                        if name not in _reported_failures:
+                            _reported_failures.add(name)
+                            yield {
+                                "type": "classifier_status",
+                                "message": f"{name} failed to train: {exc}",
+                            }
                 else:
-                    reg = make_regressor(name, (classifier_params or {}).get(name, {}), seed=seed)
                     try:
+                        # Construction inside the try, same reasoning as the
+                        # classification branch above -- xgboost_reg's lazy
+                        # `from xgboost import XGBRegressor` (classify.py)
+                        # can raise ImportError here too, on a machine
+                        # without xgboost installed (e.g. a saved config
+                        # from someone else's machine, uploaded on this
+                        # one).
+                        reg = make_regressor(
+                            name, (classifier_params or {}).get(name, {}), seed=seed
+                        )
                         yield from _fit_with_heartbeat(
                             lambda: reg.fit(X_tr, y_tr_aug), interval=_HEARTBEAT_INTERVAL_S
                         )
@@ -536,6 +589,13 @@ def run_learning_curve(
                         reg_scores[name]["r2"].append(0.0)
                         reg_scores[name]["rmse"].append(0.0)
                         reg_scores[name]["mae"].append(0.0)
+                        failed_names.add(name)
+                        if name not in _reported_failures:
+                            _reported_failures.add(name)
+                            yield {
+                                "type": "classifier_status",
+                                "message": f"{name} failed to train: {exc}",
+                            }
 
             # U-Net: patch-based train/test split
             # Only run 1 repeat for U-Net (training is expensive, variance is dominated by SGD noise)
@@ -673,6 +733,13 @@ def run_learning_curve(
                             reg_scores[unet_name]["r2"].append(0.0)
                             reg_scores[unet_name]["rmse"].append(0.0)
                             reg_scores[unet_name]["mae"].append(0.0)
+                        failed_names.add(unet_name)
+                        if unet_name not in _reported_failures:
+                            _reported_failures.add(unet_name)
+                            yield {
+                                "type": "classifier_status",
+                                "message": f"{unet_name} failed to train: {exc}",
+                            }
 
         pct_results = {}
         if is_classification:
@@ -685,6 +752,8 @@ def run_learning_curve(
                     "mean_f1w": round(float(np.mean(scoresw)), 4) if scoresw else 0.0,
                     "std_f1w": round(float(np.std(scoresw)), 4) if scoresw else 0.0,
                 }
+                if name in failed_names:
+                    pct_results[name]["failed"] = True
         else:
             for name in active:
                 r2s = reg_scores[name]["r2"]
@@ -698,6 +767,8 @@ def run_learning_curve(
                     "mean_mae": round(float(np.mean(maes)), 4) if maes else 0.0,
                     "std_mae": round(float(np.std(maes)), 4) if maes else 0.0,
                 }
+                if name in failed_names:
+                    pct_results[name]["failed"] = True
                 if is_largest and scatter_accum.get(name, {}).get("y_true"):
                     pct_results[name]["scatter"] = scatter_accum[name]
                 if is_largest:
@@ -938,6 +1009,13 @@ def run_kfold_cv(
         - {"type": "aggregate", "models": {name: aggregate_metrics_dict}}
         - {"type": "confusion_matrices", "confusion_matrices": {name: [[int]]}}
           (classification only)
+        - {"type": "classifier_status", "message": str} -- yielded once per
+          model, the first time it raises an exception on any fold (see
+          run_learning_curve's identical event for the rationale). Both
+          metrics_dict and aggregate_metrics_dict carry "failed": True for
+          that model from then on -- the numeric fields are still a real
+          0.0 fallback, but callers should treat it as "didn't run", not
+          "scored zero".
     """
     import time as _time
 
@@ -1024,6 +1102,15 @@ def run_kfold_cv(
         ", ".join(run_names) or "(none)",
     )
 
+    # Names that have failed to train at least once, and names already
+    # reported via a classifier_status event -- see the per-fold except
+    # block below. Mirrors run_learning_curve's identical fields/rationale:
+    # a hard failure (missing optional dependency, e.g. deep_mlp without
+    # torch) repeats identically on every fold, so only the first is
+    # reported to avoid flooding the stream with k identical messages.
+    failed_names = set()
+    _reported_failures = set()
+
     for fold_idx in range(k):
         _fold_t0 = _time.time()
         train_idx, test_idx = pix_folds[fold_idx]
@@ -1094,6 +1181,14 @@ def run_kfold_cv(
                     metrics = {"mean_f1": 0.0, "mean_f1w": 0.0}
                 else:
                     metrics = {"r2": 0.0, "rmse": 0.0, "mae": 0.0}
+                metrics["failed"] = True
+                failed_names.add(name)
+                if name not in _reported_failures:
+                    _reported_failures.add(name)
+                    yield {
+                        "type": "classifier_status",
+                        "message": f"{name} failed to train: {exc}",
+                    }
 
             fold_results[name] = metrics
             all_fold_metrics[name].append(metrics)
@@ -1127,6 +1222,8 @@ def run_kfold_cv(
                 "mean_f1w": round(float(np.mean(f1ws)), 4),
                 "std_f1w": round(float(np.std(f1ws)), 4),
             }
+            if name in failed_names:
+                aggregate[name]["failed"] = True
         else:
             r2s = [f["r2"] for f in folds]
             rmses = [f["rmse"] for f in folds]
@@ -1139,6 +1236,8 @@ def run_kfold_cv(
                 "mean_mae": round(float(np.mean(maes)), 4),
                 "std_mae": round(float(np.std(maes)), 4),
             }
+            if name in failed_names:
+                aggregate[name]["failed"] = True
             # Pooled held-out predicted-vs-actual, subsampled, for the
             # frontend scatter plot (same {"scatter": {y_true, y_pred}}
             # shape the learning curve emits).

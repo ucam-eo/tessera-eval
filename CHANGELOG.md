@@ -6,6 +6,42 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.1]
+
+### Fixed
+- **A model that failed to train reported a real 0.0 score with no visible
+  cause, indistinguishable from "genuinely the worst model".** Confirmed
+  live (Keshav, testing `spatial_kfold`): `deep_mlp` reported macro F1 =
+  0.0 for every fold, with no explanation in the UI — the actual cause was
+  a missing optional dependency (PyTorch not installed on that machine),
+  logged server-side only (`logger.warning`) and silently zero-filled
+  everywhere else. `run_learning_curve` and `run_kfold_cv` now yield a
+  `{"type": "classifier_status", "message": "<name> failed to train: <exc>"}`
+  event the *first* time a given model fails (deduped — a hard dependency
+  failure repeats identically at every pct/repeat/fold, so one message per
+  model per run, not one per attempt), and mark that model's metrics dict
+  with `"failed": True` from then on — the numeric fields stay a real 0.0
+  fallback (so aggregation math needs no special case), but a consumer can
+  now tell "didn't run" apart from "scored zero" without parsing logs.
+  **A second, more severe bug found while building this fix, also fixed
+  here**: in `run_learning_curve` (not `run_kfold_cv`, which already had
+  this right), `make_classifier()`/`make_regressor()` were called *outside*
+  the per-model `try`/`except` — a classifier whose *construction* can
+  raise (`deep_mlp` without torch calls `_require_torch()` in its
+  `__init__`; `xgboost`/`xgboost_reg` do a lazy `from xgboost import ...`
+  that raises `ImportError` if xgboost isn't installed) crashed the *entire
+  learning-curve run* uncaught, taking every other model's results down
+  with it — not just failing that one model, as `run_kfold_cv` already
+  correctly did. Both constructor calls moved inside their `try` blocks.
+  9 new tests (`tests/test_classifier_failure_reporting.py`): failure
+  deduplication (once per model, not once per fold/repeat) in both
+  functions, the `failed` flag appearing on progress/fold_result/aggregate
+  events, independence from other (working) models in the same run,
+  regression coverage, and a direct reproduction of the deep_mlp-without-
+  torch construction-time crash (monkeypatches `deep_mlp._HAS_TORCH` rather
+  than depending on the test environment's own torch install). Full suite
+  274 passed (was 265).
+
 ## [1.14.0]
 
 ### Added
