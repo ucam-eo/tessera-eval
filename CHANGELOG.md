@@ -6,6 +6,36 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.3]
+
+### Fixed
+- **A learning-curve confusion matrix for a spatial model (Spatial MLP
+  3×3/5×5) could silently drop a whole class, showing a fully zero row —
+  0% recall, including the diagonal — for a class the model actually
+  classified correctly.** `run_learning_curve` sized the confusion matrix
+  (`n_classes`) from the pixel labels array alone. A small/rare class that
+  this run's random per-class pixel sampling happened to miss entirely
+  shrank `n_classes` below the true class count — and scikit-learn's
+  `confusion_matrix()` *silently drops* any sample whose true or predicted
+  label isn't in the `labels=` list it's given, rather than erroring. That
+  dropped whichever class has the *highest* label-encoder index from
+  *every* model's confusion matrix that run, not just the classifier that
+  genuinely lacked pixel training data for it — a spatial model's points
+  come from a separate, patch-derived sampling process and can have real,
+  correctly-classified data for exactly that class. Confirmed live
+  (Moustafa Eweda): "Inland rock outcrop and scree" showed a fully zero
+  row in a Spatial MLP 3×3 run, despite 100% recall in a previous run and
+  the resulting habitat map itself looking correct — a reporting bug, not
+  a real regression. `run_kfold_cv` already had the matching fix (size the
+  confusion matrix for the union of the pixel and spatial label domains);
+  `run_learning_curve` never got it until now. Also benefits U-Net's
+  confusion matrix, which reads the same `n_classes`.
+  2 new tests (`tests/test_learning_curve_spatial_confusion_matrix_sizing.py`),
+  including a direct reproduction (confirmed failing without the fix:
+  confusion matrix comes back `2×2` instead of `3×3`) and a check that a
+  plain pixel classifier's legitimately-empty row for the missing class is
+  unaffected. Full suite 277 passed (was 275).
+
 ## [1.14.2]
 
 ### Changed

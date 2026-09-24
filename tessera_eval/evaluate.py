@@ -287,6 +287,29 @@ def run_learning_curve(
     if is_classification:
         all_labels = np.concatenate([labels, test_labels]) if spatial_split else labels
         n_classes = len(np.unique(all_labels))
+        if spatial_labels is not None and len(spatial_labels):
+            # A spatial model's points (patch-derived, sampled independently
+            # of the pixel labels above -- see gather_spatial_features'/
+            # _extract_tile_patches' own docstrings) can include a class
+            # entirely absent from the pixel sample -- e.g. a small/rare
+            # class this run's random per-class pixel budget happened to
+            # miss. Sizing the confusion matrix from pixel labels alone
+            # then truncates n_classes too low, and sklearn's
+            # confusion_matrix() *silently drops* any sample whose true or
+            # predicted label isn't in the labels= list it's given (no
+            # error) -- so whichever class has the highest label-encoder
+            # index vanishes from every model's confusion matrix, not just
+            # the one that actually lacked pixel samples. Confirmed live
+            # (Moustafa Eweda): "Inland rock outcrop and scree" showed a
+            # fully zero row (0% recall, including its own diagonal) in a
+            # Spatial MLP 3x3 learning-curve run, despite the model
+            # correctly classifying every pixel of it (100% recall) in a
+            # previous run and this run's resulting map looking fine -- a
+            # reporting bug, not a real regression. run_kfold_cv already
+            # has this exact fix (identical reasoning in its own comment);
+            # this function never got it. Also benefits U-Net's confusion
+            # matrix below, which reads the same n_classes.
+            n_classes = max(n_classes, int(np.max(spatial_labels)) + 1)
         cm_accum = {
             name: np.zeros((n_classes, n_classes), dtype=np.int64) for name in classifier_names
         }
