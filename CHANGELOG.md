@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.1]
+
+### Added
+- **Explicit status message when a class has zero true test examples in a
+  confusion matrix** ("a zero row"), instead of a silent, misleading-
+  looking result that reads identically to "the classifier failed on this
+  class". New `_zero_row_classes()` in `server.py`, checked against every
+  classifier's confusion matrix in both `run-large-area`'s learning-curve
+  and k-fold forwarding, e.g. *"spatial_mlp: no test samples for Inland
+  rock outcrop and scree this run -- its row/column in the confusion
+  matrix will show 0, not because the classifier failed on it, but because
+  this run's sample never included a test example of it. Try increasing
+  Max patches (spatial models) or Max pixel samples, or a different
+  seed."* Confirmed live (Moustafa Eweda, 2026-09-25, well after the
+  v1.14.3 class-dropping fix): the same class showed a fully zero row
+  across two separate runs. The matrix was correctly sized (38 classes,
+  not truncated -- v1.14.3 working as intended); the real cause was
+  upstream: only 147 total patches were drawn for the whole run (capped 5
+  per tile, not stratified by class), and the class occupies well under
+  0.5% of the labelled area, concentrated in locations a 147-patch
+  geographic sample can easily miss outright. Only the row (true label) is
+  checked, not the column (predicted label) -- a zero column with a
+  non-zero row is a different, genuine "classifier never predicts this
+  class" finding and is deliberately left alone. 11 new tests
+  (`test_zero_row_classes.py`, `test_zero_row_classes_server.py`).
+
 ## [1.15.0]
 
 ### Added

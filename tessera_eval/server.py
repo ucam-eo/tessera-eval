@@ -488,6 +488,51 @@ def _area_stratified_field_split(
     return dict(zip(field_ids.tolist(), bucket.tolist()))
 
 
+def _zero_row_classes(matrix, class_names):
+    """Names of classes whose confusion-matrix row is entirely zero -- i.e.
+    this classifier scored *zero real test examples* of that class this
+    run, not that it failed to recognise any of them.
+
+    Confirmed live (Moustafa Eweda, 2026-09-25, well after the v1.14.3
+    class-dropping fix): "Inland rock outcrop and scree" showed a fully
+    zero row (0% recall, including its own diagonal) in a Spatial MLP 3x3
+    confusion matrix across two separate runs. The matrix was correctly
+    sized (38 classes, not truncated -- v1.14.3 working as intended) --
+    the real cause was upstream of the matrix entirely: this run's patch
+    extraction drew only 147 total patches (capped 5 per tile, not
+    stratified by class) across the whole region, and this class occupies
+    well under 0.5% of the labelled area, concentrated in a small number
+    of locations a 147-patch geographic sample can easily miss outright.
+    A genuinely zero row reads identically to "the model can't recognise
+    this class" -- indistinguishable without digging into the run's own
+    logs the way this investigation did. Surfacing it explicitly (see the
+    "confusion_matrices" forwarding in run_large_area) turns that into a
+    visible, actionable message instead of a silent, misleading-looking
+    result -- the same principle as the year-coverage error (never let a
+    real gap look like an ordinary zero).
+
+    Only the *row* (true label) is checked, not the column (predicted
+    label) -- a zero column with a non-zero row is a different, genuine
+    finding ("this classifier never predicts this class", even though real
+    test examples existed) and should NOT be explained away the same way.
+
+    Args:
+        matrix: 2D array-like (list of lists or ndarray), shape
+            (n_classes, n_classes) -- a single classifier's confusion
+            matrix, true label = row, predicted label = column.
+        class_names: list of str, aligned with the matrix's rows/columns.
+
+    Returns:
+        list of str -- class names (in matrix order) whose row sums to
+        zero. Empty if every class has at least one true test example.
+    """
+    names = []
+    for i, row in enumerate(matrix):
+        if i < len(class_names) and not any(row):
+            names.append(class_names[i])
+    return names
+
+
 def _extract_tile_patches(
     gt,
     gdf,
@@ -2929,6 +2974,27 @@ def run_large_area():
                 elif et == "aggregate":
                     yield json.dumps({"event": "aggregate", "models": event["models"]}) + "\n"
                 elif et == "confusion_matrices":
+                    for clf_name, matrix in event["confusion_matrices"].items():
+                        zero_classes = _zero_row_classes(matrix, class_names)
+                        if zero_classes:
+                            yield (
+                                json.dumps(
+                                    {
+                                        "event": "status",
+                                        "message": (
+                                            f"{clf_name}: no test samples for "
+                                            f"{', '.join(zero_classes)} this run -- its "
+                                            "row/column in the confusion matrix will show "
+                                            "0, not because the classifier failed on it, "
+                                            "but because this run's sample never included "
+                                            "a test example of it. Try increasing Max "
+                                            "patches (spatial models) or Max pixel "
+                                            "samples, or a different seed."
+                                        ),
+                                    }
+                                )
+                                + "\n"
+                            )
                     yield (
                         json.dumps(
                             {
@@ -3019,6 +3085,27 @@ def run_large_area():
                     + "\n"
                 )
             elif event["type"] == "confusion_matrices":
+                for clf_name, matrix in event["confusion_matrices"].items():
+                    zero_classes = _zero_row_classes(matrix, class_names)
+                    if zero_classes:
+                        yield (
+                            json.dumps(
+                                {
+                                    "event": "status",
+                                    "message": (
+                                        f"{clf_name}: no test samples for "
+                                        f"{', '.join(zero_classes)} this run -- its "
+                                        "row/column in the confusion matrix will show 0, "
+                                        "not because the classifier failed on it, but "
+                                        "because this run's sample never included a test "
+                                        "example of it. Try increasing Max patches "
+                                        "(spatial models) or Max pixel samples, or a "
+                                        "different seed."
+                                    ),
+                                }
+                            )
+                            + "\n"
+                        )
                 yield (
                     json.dumps(
                         {
