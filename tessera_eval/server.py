@@ -239,9 +239,7 @@ def _fit_with_wire_heartbeat(fit_fn):
     # monkeypatches tessera_eval.evaluate._HEARTBEAT_INTERVAL_S actually
     # takes effect here, the same way run_learning_curve's own call sites
     # already do (they pass interval=_HEARTBEAT_INTERVAL_S explicitly too).
-    gen = _evaluate_mod._fit_with_heartbeat(
-        fit_fn, interval=_evaluate_mod._HEARTBEAT_INTERVAL_S
-    )
+    gen = _evaluate_mod._fit_with_heartbeat(fit_fn, interval=_evaluate_mod._HEARTBEAT_INTERVAL_S)
     while True:
         try:
             gen.send(None)
@@ -410,7 +408,9 @@ def _spatial_block_groups(points_lonlat, n_blocks):
     return lon_bins * (int(lat_bins.max()) + 1) + lat_bins
 
 
-def _area_stratified_field_split(field_ids, class_ids, field_areas, train_frac=0.30, val_frac=0.10, seed=42):
+def _area_stratified_field_split(
+    field_ids, class_ids, field_areas, train_frac=0.30, val_frac=0.10, seed=42
+):
     """Assign each field (shapefile polygon) to "train"/"val"/"test" so
     that, *within each class independently*, cumulative field area crosses
     train_frac before any field switches to "val", and train_frac+val_frac
@@ -2791,8 +2791,7 @@ def run_large_area():
                     json.dumps(
                         {
                             "event": "status",
-                            "message": "Group by field ignored — not yet supported for "
-                            "regression.",
+                            "message": "Group by field ignored — not yet supported for regression.",
                         }
                     )
                     + "\n"
@@ -2953,9 +2952,7 @@ def run_large_area():
                     # (below) -- see this event's own docstring in
                     # evaluate.py for what accompanies it (a "failed": True
                     # flag on that model's fold_result/aggregate metrics).
-                    yield (
-                        json.dumps({"event": "status", "message": event["message"]}) + "\n"
-                    )
+                    yield (json.dumps({"event": "status", "message": event["message"]}) + "\n")
                 elif et == "heartbeat":
                     yield json.dumps({"event": "heartbeat"}) + "\n"
 

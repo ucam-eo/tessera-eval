@@ -150,6 +150,4 @@ def test_area_stratified_split_ignored_for_regression(client, monkeypatch):
     starts = [e for e in events if e.get("event") == "start"]
     assert starts and "area_stratified_split" not in starts[0]
     statuses = [e.get("message", "") for e in events if e.get("event") == "status"]
-    assert any(
-        "Area-stratified split ignored" in m and "regression target" in m for m in statuses
-    )
+    assert any("Area-stratified split ignored" in m and "regression target" in m for m in statuses)

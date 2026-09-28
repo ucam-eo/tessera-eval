@@ -20,8 +20,6 @@ parsing log messages.
 
 from __future__ import annotations
 
-import sys
-
 import numpy as np
 import pytest
 
@@ -97,9 +95,7 @@ def test_learning_curve_working_classifier_never_marked_failed():
     # messages -- check specifically for a failure message, not the mere
     # presence of any classifier_status event.
     failure_statuses = [
-        e
-        for e in events
-        if e["type"] == "classifier_status" and "failed to train" in e["message"]
+        e for e in events if e["type"] == "classifier_status" and "failed to train" in e["message"]
     ]
     assert not failure_statuses
 
