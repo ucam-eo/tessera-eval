@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.0]
+
+### Added
+- **`area_stratified_split` request flag** (`run-large-area`, learning-curve
+  mode, classification only): reproduces Frank Feng's (TESSERA paper
+  co-author) own Austrian-crop evaluation split exactly — "a field-level,
+  area-stratified split: 30% of each class's area → train; rest 1/7 val,
+  6/7 test", computed independently per class so a rare class's train share
+  is never squeezed by how common other classes are. This is a genuinely
+  different rule from `group_by_field`/`spatial_kfold`'s
+  `StratifiedGroupKFold` (a random holdout of whole groups/fields) — those
+  fix a *fraction of groups*, this fixes each class's train *share of its
+  own area*. Confirmed on real data (Louis Driver's Austrian-crop
+  investigation): switching TEE's `sampling` strategy from `sqrt` to
+  `equal` — the closest existing analogue, competing every class for an
+  even share of one global point budget — closed most of a ~0.11 weighted-
+  F1 gap to Frank's own reported number; this flag implements his literal
+  rule rather than an analogue of it. New `_area_stratified_field_split()`
+  in `server.py` does the per-class, per-field cumulative-area walk (whole
+  fields shuffled by seed, never split across train/test); wired in as a
+  fixed test set the same way the spatial box / test-year / test-file
+  splits already are, so it composes with the rest of the request the same
+  way and takes the same "only one fixed test set can drive a run"
+  precedence over `group_by_field`/`spatial_kfold`/those three. The 10% val
+  share is computed and reported but not otherwise used by
+  `run_learning_curve` (no top-level validation concept there — `deep_mlp`
+  still does its own internal held-out split for checkpoint selection) —
+  dropped rather than folded into train or test, to keep the reported 30%
+  train / 60% test pools honest matches to Frank's own ratios. 12 new
+  tests (`test_area_stratified_field_split.py`,
+  `test_area_stratified_split_server.py`).
+
 ## [1.14.3]
 
 ### Fixed

@@ -410,6 +410,84 @@ def _spatial_block_groups(points_lonlat, n_blocks):
     return lon_bins * (int(lat_bins.max()) + 1) + lat_bins
 
 
+def _area_stratified_field_split(field_ids, class_ids, field_areas, train_frac=0.30, val_frac=0.10, seed=42):
+    """Assign each field (shapefile polygon) to "train"/"val"/"test" so
+    that, *within each class independently*, cumulative field area crosses
+    train_frac before any field switches to "val", and train_frac+val_frac
+    before switching to "test" -- the "area_stratified_split" request flag's
+    engine, reproducing Frank Feng's (TESSERA paper co-author) own Austrian-
+    crop split: "30% of each class's area -> train; rest 1/7 val, 6/7 test"
+    (train_frac=0.30, val_frac=0.10 by default here -- test gets whatever
+    area remains, i.e. 0.60 with the defaults).
+
+    This is a genuinely different rule from group_by_field/spatial_kfold's
+    StratifiedGroupKFold: those hold out a *fraction of groups* (or points),
+    letting each class's absolute train/test pixel counts fall out of
+    however common that class happens to be. This fixes each class's train
+    *share of its own area* instead, so a rare class contributes fewer
+    training pixels in absolute terms but is never structurally shortchanged
+    relative to a common one the way a shared global sampling budget can
+    (confirmed empirically: switching TEE's `sampling` strategy from "sqrt"
+    to "equal" -- the closest existing analogue, competing every class for
+    an even share of one global point budget -- closed most of a ~0.11
+    weighted-F1 gap to Frank's own number; this is the real, literal rule
+    his methodology uses, not a proxy for it).
+
+    Whole fields are shuffled (seeded) before the cumulative-area walk, so
+    which specific fields land in train vs test is randomized but
+    deterministic per seed -- not e.g. always the biggest fields first.
+
+    Args:
+        field_ids: array-like, shape (F,) -- an id per field (row index
+            into the source GeoDataFrame is the typical caller), used only
+            as the dict keys returned.
+        class_ids: array-like, shape (F,) -- each field's class (0-indexed
+            label-encoder id), same order as field_ids.
+        field_areas: array-like, shape (F,) -- each field's area (any
+            consistent unit -- only relative magnitude within a class
+            matters, e.g. the projected-UTM-CRS `_area` column server.py's
+            point sampling already computes).
+        train_frac: fraction of each class's total area allocated to train.
+        val_frac: fraction of each class's total area allocated to val (the
+            remainder, 1 - train_frac - val_frac, goes to test). val is
+            carved out to keep the train/test ratio an honest match to the
+            source rule instead of silently drifting when the caller has no
+            use for a third split -- see area_stratified_split's own
+            request-flag docstring for why run_learning_curve callers
+            typically discard the "val" bucket rather than using it.
+
+    Returns:
+        dict {field_id: "train" | "val" | "test"}, one entry per input
+        field. A class with very few fields (or only one) can end up with
+        an empty val and/or test bucket for that class -- a real
+        consequence of a small sample, not a bug to guard against here.
+    """
+    field_ids = np.asarray(field_ids)
+    class_ids = np.asarray(class_ids)
+    areas = np.asarray(field_areas, dtype=np.float64)
+    rng = np.random.RandomState(seed)
+    bucket = np.full(len(field_ids), "test", dtype=object)
+
+    for cls in np.unique(class_ids):
+        idx = np.where(class_ids == cls)[0]
+        order = idx[rng.permutation(len(idx))]
+        cum = np.cumsum(areas[order])
+        total = cum[-1] if len(cum) else 0.0
+        if total <= 0:
+            continue
+        frac = cum / total
+        train_end = min(len(order), int(np.searchsorted(frac, train_frac, side="left")) + 1)
+        val_end = min(
+            len(order),
+            max(train_end, int(np.searchsorted(frac, train_frac + val_frac, side="left")) + 1),
+        )
+        bucket[order[:train_end]] = "train"
+        bucket[order[train_end:val_end]] = "val"
+        bucket[order[val_end:]] = "test"
+
+    return dict(zip(field_ids.tolist(), bucket.tolist()))
+
+
 def _extract_tile_patches(
     gt,
     gdf,
@@ -1092,6 +1170,29 @@ def run_large_area():
     # reported k-fold score. Takes precedence over group_by_field if both
     # are set, since only one grouping can drive a single split.
     spatial_kfold = bool(body.get("spatial_kfold", False))
+    # Opt-in: reproduce the TESSERA paper's own Austrian-crop split exactly,
+    # instead of TEE's usual pixel/group-holdout splits -- Frank Feng
+    # (paper co-author) described it as "a field-level, area-stratified
+    # split: 30% of each class's area -> train; rest 1/7 val, 6/7 test, not
+    # a random-pixel split" (2026-09-28 email). Field-level like
+    # group_by_field (a whole shapefile polygon never lands on both sides),
+    # but the allocation is a fixed per-class *area quota* rather than a
+    # k-fold-style random group holdout -- the two are genuinely different
+    # rules, not two implementations of the same idea (confirmed: testing
+    # group_by_field alone made scores worse, not better; this is the other
+    # half of his methodology, tested separately). The 10% val share carved
+    # out here is unused by run_learning_curve (no top-level validation
+    # concept -- deep_mlp still does its own internal held-out split for
+    # checkpoint selection, from whatever training pct it's handed) --
+    # dropped rather than folded into train or test, so the train (30%) and
+    # test (60%) pools stay honest matches to his own ratios instead of
+    # silently drifting to 40/60 or 30/70. Classification only (an "area
+    # quota per class" has no meaning for a continuous regression target)
+    # and learning-curve only (k-fold makes its own folds). Takes
+    # precedence over group_by_field/spatial_kfold when more than one is
+    # requested, same reasoning as the drawn spatial split/year split/test
+    # file already do: only one fixed test set can drive a single run.
+    area_stratified_split = bool(body.get("area_stratified_split", False))
     # One seed for the whole run: sample-point selection, tile-fetch order,
     # learning-curve resampling / k-fold splits, and every estimator's own
     # random_state (RF/XGBoost/MLP, U-Net). Settable from the UI / CLI.
@@ -1189,7 +1290,10 @@ def run_large_area():
     # folds, so none of that counts as a fixed test set for a k-fold run
     # (spatial features are still extracted for Spatial MLP).
     has_fixed_test_set = eval_mode != "kfold" and (
-        bool(train_bboxes or test_bboxes) or test_year != train_year or has_test_file
+        bool(train_bboxes or test_bboxes)
+        or test_year != train_year
+        or has_test_file
+        or area_stratified_split
     )
 
     # Determine which spatial features are needed (check base names)
@@ -1462,13 +1566,22 @@ def run_large_area():
 
                     # Sampling strategy: equal, proportional, or sqrt-proportional
                     MIN_PER_CLASS = 50
-                    if sampling in ("proportional", "sqrt"):
-                        import math
-
+                    # Per-polygon area (projected to a local UTM zone -- WGS84
+                    # degrees don't give a usable area) is needed both for
+                    # proportional/sqrt sampling weights below AND for
+                    # area_stratified_split's per-field train/val/test quota
+                    # (computed later, once `groups` exists) -- compute it
+                    # once here whenever either is in play, so
+                    # area_stratified_split doesn't force sampling into
+                    # proportional/sqrt just to get `_area` populated.
+                    if sampling in ("proportional", "sqrt") or area_stratified_split:
                         area_crs = valid_gdf.estimate_utm_crs()
                         projected = valid_gdf.to_crs(area_crs)
                         projected["_area"] = projected.geometry.area
                         valid_gdf["_area"] = projected["_area"].values
+                    if sampling in ("proportional", "sqrt"):
+                        import math
+
                         class_areas = valid_gdf.groupby("_label_id")["_area"].sum()
                         if sampling == "sqrt":
                             weights = {c: math.sqrt(a) for c, a in class_areas.items()}
@@ -1933,6 +2046,153 @@ def run_large_area():
             labels = spatial_train_labels
             total_labelled = len(vectors)
 
+        # ── Area-stratified split (Frank Feng's TESSERA-paper methodology) ──
+        # See area_stratified_split's request-flag docstring above for what
+        # this reproduces and why it's a genuinely different rule from
+        # group_by_field/spatial_kfold. has_fixed_test_set already forced
+        # has_spatial_bboxes=True whenever this flag is set (see its own
+        # comment), which forces the fresh-sample path above -- so `groups`
+        # and `valid_gdf` (with `_label_id`/`_area` columns) are guaranteed
+        # populated here, never a stale cache hit.
+        if area_stratified_split and eval_mode == "kfold":
+            # k-fold makes its own folds (via group_by_field/spatial_kfold's
+            # `groups` mechanism, or a plain shuffle) -- a fixed area-quota
+            # train/test pool has no meaning there, same reason a test file
+            # doesn't apply to k-fold either (see has_test_file's own
+            # eval_mode check). has_fixed_test_set is also False for k-fold
+            # regardless of this flag, so the disk/in-memory cache bypass
+            # this feature relies on isn't guaranteed here -- skip cleanly
+            # rather than risk running against stale valid_gdf/groups.
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            "Area-stratified split ignored — only applies to the learning "
+                            "curve. Use k-fold's own Group by field / Spatial k-fold options."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+            area_split_test_vectors = area_split_test_labels = None
+        elif (
+            area_stratified_split and is_classification and not has_spatial_split and has_test_file
+        ):
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            "Area-stratified split ignored — a separate test file is "
+                            "already fixing the test set for this run."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+            area_split_test_vectors = area_split_test_labels = None
+        elif area_stratified_split and is_classification and not has_spatial_split:
+            if groups is None or valid_gdf is None or "_area" not in valid_gdf.columns:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": (
+                                "area_stratified_split requires fresh point-sampling data "
+                                "(not available from a cached result) -- try again."
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            unique_group_ids = np.unique(groups)
+            field_areas = valid_gdf.loc[unique_group_ids, "_area"].to_numpy()
+            field_classes = valid_gdf.loc[unique_group_ids, "_label_id"].to_numpy()
+            field_bucket = _area_stratified_field_split(
+                unique_group_ids, field_classes, field_areas, seed=seed
+            )
+            bucket_by_field = np.array([field_bucket[g] for g in unique_group_ids])
+            point_bucket = bucket_by_field[np.searchsorted(unique_group_ids, groups)]
+            area_train_mask = point_bucket == "train"
+            area_test_mask = point_bucket == "test"
+            n_area_train = int(area_train_mask.sum())
+            n_area_test = int(area_test_mask.sum())
+            n_area_val = len(point_bucket) - n_area_train - n_area_test
+
+            if n_area_train == 0 or n_area_test == 0:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "error",
+                            "message": (
+                                "Area-stratified split produced an empty "
+                                f"{'train' if n_area_train == 0 else 'test'} pool -- too few "
+                                "fields for at least one class to honour a 30/10/60 split."
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+                return
+
+            logger.info(
+                "Area-stratified split (Frank Feng methodology): %d train, %d test, "
+                "%d val (dropped)",
+                n_area_train,
+                n_area_test,
+                n_area_val,
+            )
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            f"Area-stratified split: {n_area_train:,} train, "
+                            f"{n_area_test:,} test pixels (30%/60% of each class's field "
+                            f"area; {n_area_val:,} pixels in the 10% val share are dropped)"
+                        ),
+                    }
+                )
+                + "\n"
+            )
+
+            area_split_test_vectors = vectors[area_test_mask]
+            area_split_test_labels = labels[area_test_mask]
+            vectors = vectors[area_train_mask]
+            labels = labels[area_train_mask]
+            total_labelled = len(vectors)
+        else:
+            if area_stratified_split and not is_classification:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": (
+                                "Area-stratified split ignored — a per-class area quota "
+                                "has no meaning for a regression target."
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+            elif area_stratified_split and has_spatial_split:
+                yield (
+                    json.dumps(
+                        {
+                            "event": "status",
+                            "message": (
+                                "Area-stratified split ignored — a drawn Spatial Train/Test "
+                                "Split is already fixing the test set for this run."
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+            area_split_test_vectors = area_split_test_labels = None
+
         # ── Train/test-year split ──
         # When test_year != train_year, the test role's points get their
         # embeddings re-fetched at test_year and fed into run_learning_curve's
@@ -1948,7 +2208,31 @@ def run_large_area():
         #   - bboxes drawn: keep today's spatial train/test-region split, but
         #     embed the test region at test_year instead of train_year.
         year_split_test_vectors = year_split_test_labels = None
-        if test_year != train_year and not has_test_file:
+        if test_year != train_year and not has_test_file and area_split_test_vectors is not None:
+            # area_stratified_split already fixed a test pool (by class/
+            # field area, not by year) -- composing that with a *different*
+            # cross-year re-embedding of the same pool would either
+            # double-dip the 30% train share as its own cross-year test set
+            # or silently ignore the other 70%, neither of which matches
+            # either feature's own contract. Simplest correct behaviour:
+            # area_stratified_split wins: it's the intentional, explicit
+            # choice when set, and the test role instead uses test_year's
+            # embeddings the same way normal cross-year comparisons don't
+            # -- i.e. it's evaluated at train_year like any other run
+            # without a year split.
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": (
+                            "Test year ignored — area-stratified split is already fixing "
+                            "the test set for this run."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+        elif test_year != train_year and not has_test_file:
             if all_sample_points is None or all_valid_mask is None:
                 # Shouldn't happen -- has_spatial_bboxes forces a fresh fetch
                 # (which always populates these) whenever years differ. Kept
@@ -2371,6 +2655,10 @@ def run_large_area():
             start_event["file_split"] = True
             start_event["train_count"] = int(len(labels))
             start_event["test_count"] = int(len(file_split_test_labels))
+        if area_split_test_vectors is not None:
+            start_event["area_stratified_split"] = True
+            start_event["train_count"] = int(len(labels))
+            start_event["test_count"] = int(len(area_split_test_labels))
 
         # spatial_kfold: computed first since it takes precedence over
         # group_by_field when both are set (only one grouping can drive a
@@ -2474,6 +2762,7 @@ def run_large_area():
                 has_spatial_split
                 or year_split_test_vectors is not None
                 or file_split_test_vectors is not None
+                or area_split_test_vectors is not None
             )
             if already_fixed:
                 yield (
@@ -2544,6 +2833,14 @@ def run_large_area():
             # these, but assign last to be explicit.
             lc_kwargs["test_vectors"] = file_split_test_vectors
             lc_kwargs["test_labels"] = file_split_test_labels
+        if area_split_test_vectors is not None:
+            # area_stratified_split is mutually exclusive with all three
+            # above by construction (see its own wiring block and the
+            # test-year "ignored" branch) -- assigned last only to be
+            # explicit, not because anything above could have already set
+            # it in practice.
+            lc_kwargs["test_vectors"] = area_split_test_vectors
+            lc_kwargs["test_labels"] = area_split_test_labels
 
         if eval_mode == "kfold":
             # k-fold CV over point features. No learning curve, no
