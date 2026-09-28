@@ -150,9 +150,7 @@ class TestAugmentedPatchesDataset:
         a = _AugmentedPatches(patches, seed=7, label_dtype=np.int64)
         b = _AugmentedPatches(patches, seed=8, label_dtype=np.int64)
         noisy_idx = [i for i in range(len(a)) if (i % 4) % 2 == 1]
-        assert any(
-            not np.array_equal(np.asarray(a[i][0]), np.asarray(b[i][0])) for i in noisy_idx
-        )
+        assert any(not np.array_equal(np.asarray(a[i][0]), np.asarray(b[i][0])) for i in noisy_idx)
 
     def test_regression_targets_preserve_nan_through_rotation_and_flip(self):
         from tessera_eval.unet import _AugmentedPatches
@@ -214,4 +212,6 @@ class TestTrainUnetOnPatchesStillWorks:
         from sklearn.metrics import f1_score
 
         macro_f1 = f1_score(true_vals, pred_vals, average="macro", zero_division=0)
-        assert macro_f1 > 0.3, f"expected the model to learn some real signal, got F1={macro_f1:.3f}"
+        assert macro_f1 > 0.3, (
+            f"expected the model to learn some real signal, got F1={macro_f1:.3f}"
+        )

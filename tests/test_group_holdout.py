@@ -46,7 +46,13 @@ def test_group_holdout_no_group_crosses_train_test_in_learning_curve():
     X, y, groups = _grouped_classes()
     events = list(
         run_learning_curve(
-            X, y, ["nn"], training_pcts=[50], repeats=1, task="classification", seed=1,
+            X,
+            y,
+            ["nn"],
+            training_pcts=[50],
+            repeats=1,
+            task="classification",
+            seed=1,
             groups=groups,
         )
     )
@@ -67,7 +73,13 @@ def test_naive_split_scores_higher_than_group_holdout_on_leaky_synthetic_data():
 
     naive_events = list(
         run_learning_curve(
-            X, y, ["nn"], training_pcts=[80], repeats=3, task="classification", seed=2,
+            X,
+            y,
+            ["nn"],
+            training_pcts=[80],
+            repeats=3,
+            task="classification",
+            seed=2,
         )
     )
     naive_f1 = [e for e in naive_events if e["type"] == "progress"][-1]["classifiers"]["nn"][
@@ -76,7 +88,13 @@ def test_naive_split_scores_higher_than_group_holdout_on_leaky_synthetic_data():
 
     honest_events = list(
         run_learning_curve(
-            X, y, ["nn"], training_pcts=[80], repeats=3, task="classification", seed=2,
+            X,
+            y,
+            ["nn"],
+            training_pcts=[80],
+            repeats=3,
+            task="classification",
+            seed=2,
             groups=groups,
         )
     )
@@ -97,8 +115,16 @@ def test_group_holdout_is_ignored_when_test_vectors_already_given():
     test_X, test_y = X[:10], y[:10]
     events = list(
         run_learning_curve(
-            X, y, ["nn"], training_pcts=[50], repeats=1, task="classification", seed=3,
-            groups=groups, test_vectors=test_X, test_labels=test_y,
+            X,
+            y,
+            ["nn"],
+            training_pcts=[50],
+            repeats=1,
+            task="classification",
+            seed=3,
+            groups=groups,
+            test_vectors=test_X,
+            test_labels=test_y,
         )
     )
     assert any(e["type"] == "progress" for e in events)
@@ -114,7 +140,13 @@ def test_group_holdout_ignored_for_regression():
     groups = rng.randint(0, 20, 100)
     events = list(
         run_learning_curve(
-            X, y, ["rf_reg"], training_pcts=[50], repeats=1, task="regression", seed=4,
+            X,
+            y,
+            ["rf_reg"],
+            training_pcts=[50],
+            repeats=1,
+            task="regression",
+            seed=4,
             groups=groups,
         )
     )
@@ -140,9 +172,7 @@ def test_run_kfold_cv_groups_no_group_split_across_folds():
 
 def test_run_kfold_cv_accepts_groups_and_runs():
     X, y, groups = _grouped_classes(n_groups=60, pts_per_group=10, seed=6)
-    events = list(
-        run_kfold_cv(X, y, ["nn"], k=3, task="classification", seed=6, groups=groups)
-    )
+    events = list(run_kfold_cv(X, y, ["nn"], k=3, task="classification", seed=6, groups=groups))
     agg = [e for e in events if e["type"] == "aggregate"]
     assert agg
     assert "nn" in agg[0]["models"]
@@ -154,9 +184,7 @@ def test_run_kfold_cv_naive_scores_higher_than_grouped_on_leaky_data():
     naive = list(run_kfold_cv(X, y, ["nn"], k=5, task="classification", seed=7))
     naive_f1 = [e for e in naive if e["type"] == "aggregate"][0]["models"]["nn"]["mean_f1"]
 
-    grouped = list(
-        run_kfold_cv(X, y, ["nn"], k=5, task="classification", seed=7, groups=groups)
-    )
+    grouped = list(run_kfold_cv(X, y, ["nn"], k=5, task="classification", seed=7, groups=groups))
     grouped_f1 = [e for e in grouped if e["type"] == "aggregate"][0]["models"]["nn"]["mean_f1"]
 
     assert naive_f1 > grouped_f1 + 0.1, (

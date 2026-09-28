@@ -217,9 +217,7 @@ class TestRunKfoldRegression:
 
     def test_aggregate_carries_pooled_scatter(self, regression_data):
         vectors, targets = regression_data
-        events = list(
-            run_kfold_cv(vectors, targets, ["rf_reg"], k=3, task="regression")
-        )
+        events = list(run_kfold_cv(vectors, targets, ["rf_reg"], k=3, task="regression"))
         agg = [e for e in events if e["type"] == "aggregate"][0]
         sc = agg["models"]["rf_reg"]["scatter"]
         assert sc["y_true"] and sc["y_pred"]
@@ -232,14 +230,23 @@ class TestRunKfoldRegression:
         self, regression_data, classification_data
     ):
         v, t = regression_data
-        a = [e for e in run_kfold_cv(v, t, ["rf_reg"], k=3, task="regression")
-             if e["type"] == "aggregate"][0]
-        b = [e for e in run_kfold_cv(v, t, ["rf_reg"], k=3, task="regression")
-             if e["type"] == "aggregate"][0]
+        a = [
+            e
+            for e in run_kfold_cv(v, t, ["rf_reg"], k=3, task="regression")
+            if e["type"] == "aggregate"
+        ][0]
+        b = [
+            e
+            for e in run_kfold_cv(v, t, ["rf_reg"], k=3, task="regression")
+            if e["type"] == "aggregate"
+        ][0]
         assert a["models"]["rf_reg"]["scatter"] == b["models"]["rf_reg"]["scatter"]
         cv, cl = classification_data
-        cagg = [e for e in run_kfold_cv(cv, cl, ["rf"], k=3, task="classification")
-                if e["type"] == "aggregate"][0]
+        cagg = [
+            e
+            for e in run_kfold_cv(cv, cl, ["rf"], k=3, task="classification")
+            if e["type"] == "aggregate"
+        ][0]
         assert "scatter" not in cagg["models"]["rf"]
 
 
@@ -346,11 +353,7 @@ class TestRunKfoldSpatial:
 
     def test_missing_spatial_features_skips_model(self):
         px, py = self._pixel_data()
-        events = list(
-            run_kfold_cv(
-                px, py, ["rf", "spatial_mlp"], k=3, task="classification"
-            )
-        )
+        events = list(run_kfold_cv(px, py, ["rf", "spatial_mlp"], k=3, task="classification"))
         folds = [e for e in events if e["type"] == "fold_result"]
         assert all(set(f["models"]) == {"rf"} for f in folds)
 

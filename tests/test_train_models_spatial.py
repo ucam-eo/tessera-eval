@@ -84,14 +84,10 @@ def _fake_extract(gt, gdf, field_name, year, le, n_classes, **kw):
     s3 = s5 = lbls = None
     if kw.get("needs_spatial_3x3"):
         lbls = np.array([0, 1, 2] * (N_SPATIAL // 3))
-        s3 = (rng.normal(size=(N_SPATIAL, 9 * EMBED_DIM)) + lbls[:, None] * 3.0).astype(
-            np.float32
-        )
+        s3 = (rng.normal(size=(N_SPATIAL, 9 * EMBED_DIM)) + lbls[:, None] * 3.0).astype(np.float32)
     if kw.get("needs_spatial_5x5"):
         lbls = np.array([0, 1, 2] * (N_SPATIAL // 3))
-        s5 = (rng.normal(size=(N_SPATIAL, 25 * EMBED_DIM)) + lbls[:, None] * 3.0).astype(
-            np.float32
-        )
+        s5 = (rng.normal(size=(N_SPATIAL, 25 * EMBED_DIM)) + lbls[:, None] * 3.0).astype(np.float32)
     return ([], s3, s5, vectors, lbls, lbls)
 
 
@@ -131,7 +127,9 @@ def test_download_models_trains_a_real_spatial_mlp(client):
     events = _train_models(client)
 
     failures = [
-        e for e in events if e.get("event") == "status" and "Failed to train" in e.get("message", "")
+        e
+        for e in events
+        if e.get("event") == "status" and "Failed to train" in e.get("message", "")
     ]
     assert not failures, f"train-models reported a training failure: {failures}"
 
@@ -157,7 +155,9 @@ def test_download_models_trains_a_real_spatial_mlp_5x5(client):
     events = _train_models(client)
 
     failures = [
-        e for e in events if e.get("event") == "status" and "Failed to train" in e.get("message", "")
+        e
+        for e in events
+        if e.get("event") == "status" and "Failed to train" in e.get("message", "")
     ]
     assert not failures, f"train-models reported a training failure: {failures}"
 
@@ -192,7 +192,9 @@ def test_spatial_mlp_never_reaches_train_models_for_a_fixed_test_set(client):
     assert "rf" in ready  # the pixel model still trains fine
 
     failures = [
-        e for e in events if e.get("event") == "status" and "Failed to train" in e.get("message", "")
+        e
+        for e in events
+        if e.get("event") == "status" and "Failed to train" in e.get("message", "")
     ]
     assert not failures
 
@@ -225,6 +227,8 @@ def test_spatial_mlp_skips_cleanly_if_cached_spatial_data_is_ever_missing(client
     assert skips, f"expected a clean skip status for spatial_mlp, got: {events}"
 
     failures = [
-        e for e in events if e.get("event") == "status" and "Failed to train" in e.get("message", "")
+        e
+        for e in events
+        if e.get("event") == "status" and "Failed to train" in e.get("message", "")
     ]
     assert not failures, f"must not attempt (and fail) to train spatial_mlp here: {failures}"

@@ -61,11 +61,26 @@ parameters** instead of reaching for module globals:
 
 ```python
 def evaluate_large_area(
-    gdf, field, *, train_year, test_year, classifiers, classifier_params,
-    sampling, max_patches, eval_mode, kfold_k, seed, task,
-    train_bboxes, test_bboxes, test_gdf, test_field, max_training_samples,
-    gt,                 # a GeoTessera / GeoTesseraZarr handle, caller-owned
-    cache=None,         # a TileCache object (server holds one; CLI passes None)
+    gdf,
+    field,
+    *,
+    train_year,
+    test_year,
+    classifiers,
+    classifier_params,
+    sampling,
+    max_patches,
+    eval_mode,
+    kfold_k,
+    seed,
+    task,
+    train_bboxes,
+    test_bboxes,
+    test_gdf,
+    test_field,
+    max_training_samples,
+    gt,  # a GeoTessera / GeoTesseraZarr handle, caller-owned
+    cache=None,  # a TileCache object (server holds one; CLI passes None)
     cancel=lambda: False,  # Callable[[], bool]
 ) -> Iterator[dict]: ...
 ```
@@ -89,7 +104,10 @@ def run_large_area():
     if gdf is None:
         return jsonify({"error": "No shapefile uploaded."}), 400
     gen = pipeline.evaluate_large_area(
-        gdf, body["field"], gt=_get_geotessera(), cache=_TILE_CACHE,
+        gdf,
+        body["field"],
+        gt=_get_geotessera(),
+        cache=_TILE_CACHE,
         cancel=lambda: _cancel_flag.is_set(),
         **_evaluate_kwargs_from_body(body),
     )

@@ -107,9 +107,7 @@ def test_spatial_kfold_ignored_outside_kfold_mode(client):
 
 
 def test_spatial_kfold_takes_precedence_over_group_by_field(client):
-    events = _run(
-        client, eval_mode="kfold", kfold_k=3, spatial_kfold=True, group_by_field=True
-    )
+    events = _run(client, eval_mode="kfold", kfold_k=3, spatial_kfold=True, group_by_field=True)
     starts = [e for e in events if e.get("event") == "start"]
     assert starts and starts[0].get("spatial_kfold") is True
     assert "group_by_field" not in starts[0]
