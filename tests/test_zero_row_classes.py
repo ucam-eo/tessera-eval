@@ -2,11 +2,18 @@
 test examples in a confusion matrix (a zero row), distinct from a class the
 classifier merely never predicts (a zero column with a non-zero row, which
 this deliberately does NOT flag -- see the function's own docstring).
+
+Also covers _zero_row_advice -- the per-classifier-type advice text that
+goes with a zero-row warning. Its spatial-vs-pixel split exists because
+"increase Max patches" turned out to be the wrong advice for spatial
+models (see its own docstring for the live investigation that found
+this): they draw a fixed 5 patches per tile regardless of Max patches, so
+a different seed is what actually helps, not a bigger patch budget.
 """
 
 from __future__ import annotations
 
-from tessera_eval.server import _zero_row_classes
+from tessera_eval.server import _zero_row_advice, _zero_row_classes
 
 
 def test_no_zero_rows_returns_empty():
@@ -83,3 +90,29 @@ def test_class_names_shorter_than_matrix_is_handled_defensively():
 
 def test_empty_matrix_returns_empty():
     assert _zero_row_classes([], []) == []
+
+
+def test_zero_row_advice_for_spatial_mlp_does_not_recommend_max_patches():
+    advice = _zero_row_advice("spatial_mlp")
+    assert "rarely helps" in advice
+    assert "different seed" in advice
+
+
+def test_zero_row_advice_for_spatial_mlp_5x5_does_not_recommend_max_patches():
+    advice = _zero_row_advice("spatial_mlp_5x5")
+    assert "rarely helps" in advice
+
+
+def test_zero_row_advice_for_spatial_mlp_variant_suffix_still_recognised():
+    """A hyperparameter-sweep variant name (spatial_mlp_v2) must still be
+    recognised as a spatial model -- variant suffixes are stripped the
+    same way _base_name does it elsewhere in server.py."""
+    advice = _zero_row_advice("spatial_mlp_v2")
+    assert "rarely helps" in advice
+    assert "different seed" in advice
+
+
+def test_zero_row_advice_for_pixel_classifier_suggests_max_pixel_samples():
+    for name in ("rf", "mlp", "deep_mlp", "xgboost", "nn"):
+        advice = _zero_row_advice(name)
+        assert "Max pixel samples" in advice, f"unexpected advice for {name}: {advice}"

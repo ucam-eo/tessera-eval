@@ -533,6 +533,49 @@ def _zero_row_classes(matrix, class_names):
     return names
 
 
+def _zero_row_advice(classifier_name):
+    """What to actually try when _zero_row_classes flags a class for
+    `classifier_name` -- different advice for spatial models vs. pixel
+    classifiers, because "increase Max patches" turned out to be the wrong
+    lever for the former.
+
+    Confirmed live (Moustafa Eweda, 2026-09-29): raising Spatial MLP's Max
+    patches from 500 to 600 to 700 changed the total patches extracted by
+    almost nothing (147 -> 144 -> 145 across the three runs) -- patch
+    extraction draws a *fixed* `patches_per_tile = 5` per tile regardless
+    of the Max patches budget (see `_extract_tile_patches`; that budget
+    only matters once total tiles * 5 would exceed it, which essentially
+    never happens -- 73 tiles here gives a 365-patch ceiling, far above
+    any of the three Max patches values tried). What actually worked for
+    him was changing the **seed**: each tile's up-to-5 patch centers are
+    drawn via `rng.choice()` over that tile's labelled pixels, so a
+    different seed changes *which* pixels get picked -- including, by
+    chance, ones belonging to a small/geographically clustered class.
+    Confirmed by his own results: 700 patches + a new seed got "Inland
+    rock outcrop and scree" its first real test examples (96% recall) --
+    but "Hedgerows" (previously fine) became the new zero row instead,
+    consistent with "different seed reshuffles which small classes get
+    lucky" rather than "more patches means better coverage".
+
+    Pixel classifiers (kNN/RF/XGBoost/MLP/deep_mlp) sample independently
+    via Max pixel samples / the Sampling strategy, with no equivalent
+    per-tile cap -- "increase Max pixel samples" is real, useful advice
+    for them.
+    """
+    import re
+
+    base_name = re.sub(r"_v\d+$", "", classifier_name)
+    if base_name in SPATIAL_MODELS:
+        return (
+            "Spatial models draw a fixed 5 patches per tile regardless of Max "
+            "patches, so raising that rarely helps here -- try a different "
+            "seed instead (it changes which labelled pixels become patch "
+            "centers, which is what actually determines which small classes "
+            "get covered)."
+        )
+    return "Try increasing Max pixel samples, or a different seed."
+
+
 def _extract_tile_patches(
     gt,
     gdf,
@@ -2987,9 +3030,7 @@ def run_large_area():
                                             "row/column in the confusion matrix will show "
                                             "0, not because the classifier failed on it, "
                                             "but because this run's sample never included "
-                                            "a test example of it. Try increasing Max "
-                                            "patches (spatial models) or Max pixel "
-                                            "samples, or a different seed."
+                                            f"a test example of it. {_zero_row_advice(clf_name)}"
                                         ),
                                     }
                                 )
@@ -3098,9 +3139,7 @@ def run_large_area():
                                         "row/column in the confusion matrix will show 0, "
                                         "not because the classifier failed on it, but "
                                         "because this run's sample never included a test "
-                                        "example of it. Try increasing Max patches "
-                                        "(spatial models) or Max pixel samples, or a "
-                                        "different seed."
+                                        f"example of it. {_zero_row_advice(clf_name)}"
                                     ),
                                 }
                             )

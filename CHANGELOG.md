@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.2]
+
+### Fixed
+- **The zero-row confusion-matrix warning (v1.15.1) suggested "increase Max
+  patches" as advice for spatial models -- that's wrong, and following it
+  doesn't help.** Patch extraction draws a fixed 5 patches per tile
+  regardless of the Max patches budget (`_extract_tile_patches`'s
+  `patches_per_tile = 5`); that budget only matters once total tiles × 5
+  would exceed it, which essentially never happens in practice. Confirmed
+  live (Moustafa Eweda, 2026-09-29): raising Max patches 500 → 600 → 700
+  changed total patches extracted by almost nothing (147 → 144 → 145
+  across three real runs) -- what actually got a previously-missing class
+  ("Inland rock outcrop and scree") its first real test examples was a
+  **different seed** (each tile's up-to-5 patch centers are drawn via
+  `rng.choice()` over that tile's labelled pixels, so a new seed changes
+  which pixels get picked). The trade-off: a new class ("Hedgerows")
+  became the new zero row instead -- a different seed reshuffles which
+  small classes get lucky, it doesn't guarantee full coverage. New
+  `_zero_row_advice(classifier_name)` gives spatial models the honest
+  advice (try a different seed; Max patches rarely helps) and keeps the
+  original advice (Max pixel samples, or a different seed) for pixel
+  classifiers, which have no equivalent per-tile cap. 5 new tests.
+
 ## [1.15.1]
 
 ### Added
