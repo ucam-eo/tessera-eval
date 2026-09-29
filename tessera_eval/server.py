@@ -535,44 +535,37 @@ def _zero_row_classes(matrix, class_names):
 
 def _zero_row_advice(classifier_name):
     """What to actually try when _zero_row_classes flags a class for
-    `classifier_name` -- different advice for spatial models vs. pixel
-    classifiers, because "increase Max patches" turned out to be the wrong
-    lever for the former.
+    `classifier_name`.
 
-    Confirmed live (Moustafa Eweda, 2026-09-29): raising Spatial MLP's Max
-    patches from 500 to 600 to 700 changed the total patches extracted by
-    almost nothing (147 -> 144 -> 145 across the three runs) -- patch
-    extraction draws a *fixed* `patches_per_tile = 5` per tile regardless
-    of the Max patches budget (see `_extract_tile_patches`; that budget
-    only matters once total tiles * 5 would exceed it, which essentially
-    never happens -- 73 tiles here gives a 365-patch ceiling, far above
-    any of the three Max patches values tried). What actually worked for
-    him was changing the **seed**: each tile's up-to-5 patch centers are
-    drawn via `rng.choice()` over that tile's labelled pixels, so a
-    different seed changes *which* pixels get picked -- including, by
-    chance, ones belonging to a small/geographically clustered class.
-    Confirmed by his own results: 700 patches + a new seed got "Inland
-    rock outcrop and scree" its first real test examples (96% recall) --
-    but "Hedgerows" (previously fine) became the new zero row instead,
-    consistent with "different seed reshuffles which small classes get
-    lucky" rather than "more patches means better coverage".
+    History (why this isn't just "try increasing Max patches / Max pixel
+    samples" for everyone): investigating a real, recurring report
+    (Moustafa Eweda, 2026-09-29 -- see CHANGELOG v1.15.1/v1.15.2/v1.15.3)
+    found that raising Spatial MLP's Max patches from 500 to 600 to 700
+    changed total patches extracted by almost nothing (147 -> 144 -> 145
+    across three real runs). Root cause: `_extract_tile_patches`'s
+    `patches_per_tile` had been silently stuck at a fixed 5 regardless of
+    the Max patches budget since a 2026-04-03 commit accidentally flattened
+    it while fixing an unrelated bug (see that function's own comment) --
+    so for that investigation, changing the **seed** (which changes which
+    labelled pixels get picked as each tile's patch centers) was the only
+    thing that actually worked; a v1.15.2 release said so.
 
-    Pixel classifiers (kNN/RF/XGBoost/MLP/deep_mlp) sample independently
-    via Max pixel samples / the Sampling strategy, with no equivalent
-    per-tile cap -- "increase Max pixel samples" is real, useful advice
-    for them.
+    `patches_per_tile` now scales with Max patches again (v1.15.3) --
+    "increase Max patches" is real, working advice for spatial models once
+    more, same as it always was meant to be. A different seed remains
+    genuinely complementary: even with a bigger per-tile budget, a
+    sufficiently small/clustered class can still miss the random draw, and
+    a new seed picks different labelled pixels as candidates. Pixel
+    classifiers (kNN/RF/XGBoost/MLP/deep_mlp) sample independently via Max
+    pixel samples / the Sampling strategy, with no per-tile cap at all --
+    "increase Max pixel samples" has always been real, useful advice for
+    them, unaffected by any of the above.
     """
     import re
 
     base_name = re.sub(r"_v\d+$", "", classifier_name)
     if base_name in SPATIAL_MODELS:
-        return (
-            "Spatial models draw a fixed 5 patches per tile regardless of Max "
-            "patches, so raising that rarely helps here -- try a different "
-            "seed instead (it changes which labelled pixels become patch "
-            "centers, which is what actually determines which small classes "
-            "get covered)."
-        )
+        return "Try increasing Max patches, or a different seed."
     return "Try increasing Max pixel samples, or a different seed."
 
 

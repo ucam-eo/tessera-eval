@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.4]
+
+### Fixed
+- **The zero-row warning's advice text was already stale the moment
+  v1.15.3 shipped.** v1.15.2 told spatial models "Max patches rarely
+  helps" (true at the time — `patches_per_tile` was stuck at a fixed 5
+  regardless of the budget); v1.15.3, released minutes later in the same
+  investigation, fixed that exact bug, making "increase Max patches" real
+  advice again. `_zero_row_advice` now says so — spatial models get "Try
+  increasing Max patches, or a different seed", matching pixel
+  classifiers' phrasing. Tests updated to match.
+
 ## [1.15.3]
 
 ### Fixed

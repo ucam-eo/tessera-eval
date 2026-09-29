@@ -4,11 +4,11 @@ classifier merely never predicts (a zero column with a non-zero row, which
 this deliberately does NOT flag -- see the function's own docstring).
 
 Also covers _zero_row_advice -- the per-classifier-type advice text that
-goes with a zero-row warning. Its spatial-vs-pixel split exists because
-"increase Max patches" turned out to be the wrong advice for spatial
-models (see its own docstring for the live investigation that found
-this): they draw a fixed 5 patches per tile regardless of Max patches, so
-a different seed is what actually helps, not a bigger patch budget.
+goes with a zero-row warning. See its own docstring for the live
+investigation and the v1.15.2 -> v1.15.3 flip in what advice is actually
+correct for spatial models (briefly: "increase Max patches" looked wrong,
+until the real bug behind that -- patches_per_tile silently stuck at a
+fixed 5 regardless of the budget -- was found and fixed).
 """
 
 from __future__ import annotations
@@ -92,15 +92,19 @@ def test_empty_matrix_returns_empty():
     assert _zero_row_classes([], []) == []
 
 
-def test_zero_row_advice_for_spatial_mlp_does_not_recommend_max_patches():
+def test_zero_row_advice_for_spatial_mlp_recommends_max_patches_and_seed():
+    """Since v1.15.3 restored patches_per_tile's max_patches scaling,
+    "increase Max patches" is real advice for spatial models again -- see
+    _zero_row_advice's own docstring for why this flipped from v1.15.2's
+    "rarely helps" wording."""
     advice = _zero_row_advice("spatial_mlp")
-    assert "rarely helps" in advice
+    assert "Max patches" in advice
     assert "different seed" in advice
 
 
-def test_zero_row_advice_for_spatial_mlp_5x5_does_not_recommend_max_patches():
+def test_zero_row_advice_for_spatial_mlp_5x5_recommends_max_patches():
     advice = _zero_row_advice("spatial_mlp_5x5")
-    assert "rarely helps" in advice
+    assert "Max patches" in advice
 
 
 def test_zero_row_advice_for_spatial_mlp_variant_suffix_still_recognised():
@@ -108,7 +112,7 @@ def test_zero_row_advice_for_spatial_mlp_variant_suffix_still_recognised():
     recognised as a spatial model -- variant suffixes are stripped the
     same way _base_name does it elsewhere in server.py."""
     advice = _zero_row_advice("spatial_mlp_v2")
-    assert "rarely helps" in advice
+    assert "Max patches" in advice
     assert "different seed" in advice
 
 
