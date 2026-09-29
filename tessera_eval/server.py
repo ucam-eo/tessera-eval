@@ -671,8 +671,28 @@ def _extract_tile_patches(
     all_spatial_labels_3x3 = [] if needs_spatial_3x3 else None
     all_spatial_labels_5x5 = [] if needs_spatial_5x5 else None
 
-    patches_per_tile = 5
     total_tiles = len(tiles_to_fetch)
+    # Scale with the max_patches budget, floored at 5 per tile for
+    # geographic diversity even on a small budget -- restores the
+    # pre-2026-04-03 formula (`max(max_patches // total_tiles, 5)`), which
+    # a later commit ("Shuffle tiles and cap at 5 patches per tile for
+    # geographic diversity", cfe8578) accidentally flattened to a fixed
+    # `patches_per_tile = 5` while fixing an unrelated, real bug in the
+    # same diff (tiles were fetched in spatial order, clustering patches
+    # geographically -- the shuffle above is that real fix and stays).
+    # The regression silently broke "increase Max patches" as a lever for
+    # spatial models' patch coverage: at the ~70-100 tile counts typical
+    # here, the pre-regression formula and the flattened one landed within
+    # 1 of each other at the *default* max_patches=500 (500 // 73 = 6, vs
+    # the floor of 5) -- close enough to go unnoticed for months -- but
+    # diverged sharply once a user actually raised the budget. Confirmed
+    # live (Moustafa Eweda, 2026-09-29): raising Max patches 500 -> 700
+    # changed total patches extracted by almost nothing (147 -> 144 -> 145
+    # across three real runs, all effectively pinned at total_tiles * 5)
+    # -- restoring the scaling is what makes that budget knob meaningful
+    # again, on top of _zero_row_advice's "try a different seed" (v1.15.2)
+    # which remains real, complementary advice either way.
+    patches_per_tile = max(5, max_patches // max(1, total_tiles))
 
     # For NPY fallback, create the tile generator (lazy, one tile at a time)
     # Note: fetch_embeddings downloads a landmask per tile for CRS/transform,

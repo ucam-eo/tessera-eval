@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.3]
+
+### Fixed
+- **Restored `max_patches` as a real lever for spatial-model patch
+  coverage — it had been accidentally disabled since 2026-04-03.** A
+  commit that day ("Shuffle tiles and cap at 5 patches per tile for
+  geographic diversity", `cfe8578`) fixed a real bug — tiles were fetched
+  in spatial order, clustering patches geographically; the shuffle it
+  introduced is correct and stays — but in the same diff it flattened
+  `patches_per_tile = max(max_patches // total_tiles, 5)` down to a fixed
+  `patches_per_tile = 5`, silently discarding the budget-proportional
+  scaling. At the ~70-100 tile counts and `max_patches=500` default
+  typical of a real run, the two formulas land within about 1 of each
+  other (`500 // 73 = 6` vs. the floor of 5) — close enough to go
+  unnoticed for five months. Confirmed live (Moustafa Eweda,
+  2026-09-29, investigating v1.15.1/v1.15.2's zero-row warning): raising
+  Max patches 500 → 600 → 700 changed total patches extracted by almost
+  nothing (147 → 144 → 145 across three real runs — effectively pinned at
+  `total_tiles * 5` regardless of the budget). `patches_per_tile` now
+  scales with `max_patches` again (still floored at 5 per tile), so
+  raising Max patches is real, working advice again for a spatial
+  model's small/geographically-clustered classes — on top of
+  `_zero_row_advice`'s "try a different seed" (v1.15.2), which remains
+  real, complementary advice either way. 3 new tests
+  (`test_extract_tile_patches_per_tile_scaling.py`), one confirmed
+  failing before the fix (`total_patches` pinned at `total_tiles * 5`
+  regardless of a much larger `max_patches`).
+
 ## [1.15.2]
 
 ### Fixed
