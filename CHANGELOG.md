@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.6]
+
+### Fixed
+- **A different seed reused the cached sample instead of drawing a new
+  one.** The seed drives the point sampler, but -- like Max pixel samples
+  before v1.15.5 -- it was in neither the in-memory sample cache key nor
+  the on-disk result-cache filename, so "try a different seed" silently
+  changed nothing for pixel classifiers on a cache hit. The seed is now
+  part of both keys (disk files are named
+  `result_<field>_<year>_<sampling>_n<budget>_s<seed>_<hash>.npz`;
+  existing v1.15.5 cache files are simply no longer read and regenerate on
+  first use). Changing the seed now costs a fresh point sample, as it
+  should.
+
 ## [1.15.5]
 
 ### Fixed

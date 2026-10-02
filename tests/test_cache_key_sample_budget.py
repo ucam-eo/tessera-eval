@@ -1,4 +1,4 @@
-"""Max pixel samples must be part of the sample cache key (memory and disk).
+"""Max pixel samples and seed must be part of the sample cache key (memory and disk).
 
 Confirmed live (austria.zip, 2026-10-02): a first run with Max pixel samples
 ~2,000 (left over from a small manual-labels shapefile) generated 1,989
@@ -60,7 +60,7 @@ def client(tmp_path, monkeypatch):
     return srv.app.test_client()
 
 
-def _total_pixels(client, budget):
+def _total_pixels(client, budget, seed=42):
     resp = client.post(
         "/api/evaluation/run-large-area",
         json={
@@ -70,6 +70,7 @@ def _total_pixels(client, budget):
             "classifier_params": {"nn": {"n_neighbors": 1}},
             "sampling": "equal",
             "max_training_samples": budget,
+            "seed": seed,
         },
     )
     assert resp.status_code == 200
@@ -103,3 +104,24 @@ def test_disk_cache_entries_are_separate_per_budget(tmp_path, monkeypatch):
 
     assert srv._load_cached_result("habitat", 2024, gdf, "equal", 2000) is not None
     assert srv._load_cached_result("habitat", 2024, gdf, "equal", 200_000) is None
+
+
+def test_changing_seed_resamples_instead_of_reusing_the_cache(client):
+    """seed drives the point sampler, so a new seed must draw a new sample --
+    otherwise "try a different seed" silently reused the cached points."""
+    _total_pixels(client, 400, seed=1)
+    _total_pixels(client, 400, seed=2)
+    assert _FakeGeoTessera.calls == 2, "a different seed must not hit the cached sample"
+    _total_pixels(client, 400, seed=2)
+    assert _FakeGeoTessera.calls == 2, "the same seed should still hit the cache"
+
+
+def test_disk_cache_entries_are_separate_per_seed(tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "_tile_disk_cache_dir", tmp_path)
+    gdf = _make_gdf()
+    vectors = np.zeros((10, EMBED_DIM), dtype=np.float32)
+    labels = np.zeros(10, dtype=np.int32)
+    srv._save_cached_result("habitat", 2024, gdf, vectors, labels, ["a"], {}, "equal", 2000, seed=1)
+
+    assert srv._load_cached_result("habitat", 2024, gdf, "equal", 2000, seed=1) is not None
+    assert srv._load_cached_result("habitat", 2024, gdf, "equal", 2000, seed=2) is None

@@ -268,7 +268,7 @@ def _probe_zarr_coverage(gtz, bounds, year):
         return False
 
 
-def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_000):
+def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_000, seed=42):
     """Return the disk path for cached evaluation results (vectors + labels).
 
     max_samples (the request's Max pixel samples budget) is part of the key:
@@ -279,8 +279,14 @@ def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_
     confirmed live on austria.zip: 1,989 cached points kept being reused
     after the budget was set back to 200,000, leaving ~150 training pixels
     under a spatial split.
+
+    seed is part of the key for the same reason: it seeds the point sampler,
+    so a different seed must draw a different sample. Without it, "try a
+    different seed" silently reused the cached points for pixel classifiers.
     """
-    return _get_cache_dir() / f"result_{field}_{year}_{sampling}_n{max_samples}_{gdf_hash}.npz"
+    return (
+        _get_cache_dir() / f"result_{field}_{year}_{sampling}_n{max_samples}_s{seed}_{gdf_hash}.npz"
+    )
 
 
 def _gdf_hash(gdf):
@@ -295,9 +301,9 @@ def _gdf_hash(gdf):
     return h.hexdigest()[:12]
 
 
-def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000):
+def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000, seed=42):
     """Load cached evaluation result. Returns (vectors, labels, class_names, stats) or None."""
-    path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples)
+    path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed)
     if path.exists():
         try:
             data = np.load(path, allow_pickle=True)
@@ -941,11 +947,20 @@ def _extract_tile_patches(
 
 
 def _save_cached_result(
-    field, year, gdf, vectors, labels, class_names, stats, sampling="equal", max_samples=200_000
+    field,
+    year,
+    gdf,
+    vectors,
+    labels,
+    class_names,
+    stats,
+    sampling="equal",
+    max_samples=200_000,
+    seed=42,
 ):
     """Save evaluation result to disk cache."""
     try:
-        path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples)
+        path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed)
         np.savez_compressed(
             path,
             vectors=vectors,
@@ -1445,9 +1460,9 @@ def run_large_area():
         t0 = time.time()
 
         # Check in-memory cache first, then disk cache
-        # The sample budget is part of the key -- see _result_cache_path.
+        # The sample budget and seed are part of the key -- see _result_cache_path.
         sample_budget = max_train if max_train else 200_000
-        cache_key = (field_name, train_year, test_year, sampling, sample_budget)
+        cache_key = (field_name, train_year, test_year, sampling, sample_budget, seed)
         vectors = labels = class_names = stats = None
         groups = None
         spatial_3x3 = spatial_5x5 = unet_patches = None
@@ -1509,7 +1524,7 @@ def run_large_area():
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
             cached_result = _load_cached_result(
-                field_name, train_year, gdf, sampling, sample_budget
+                field_name, train_year, gdf, sampling, sample_budget, seed
             )
             if (
                 cached_result
@@ -2055,6 +2070,7 @@ def run_large_area():
                     stats,
                     sampling,
                     sample_budget,
+                    seed,
                 )
 
                 all_sample_points = sample_points
@@ -3922,7 +3938,7 @@ def create_map():
                 return
         gt = _geotessera_instance
 
-        # cache["key"] is (field_name, train_year, test_year, sampling, sample_budget) --
+        # cache["key"] is (field_name, train_year, test_year, sampling, sample_budget, seed) --
         # index 1 regardless of test_year. map_year defaults to this (today's
         # existing behavior: map the same year the model was trained on) but
         # can be overridden to run the trained model as pure inference
