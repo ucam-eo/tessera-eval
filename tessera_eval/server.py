@@ -268,9 +268,19 @@ def _probe_zarr_coverage(gtz, bounds, year):
         return False
 
 
-def _result_cache_path(field, year, gdf_hash, sampling="equal"):
-    """Return the disk path for cached evaluation results (vectors + labels)."""
-    return _get_cache_dir() / f"result_{field}_{year}_{sampling}_{gdf_hash}.npz"
+def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_000):
+    """Return the disk path for cached evaluation results (vectors + labels).
+
+    max_samples (the request's Max pixel samples budget) is part of the key:
+    it decides how many sample points get drawn, so two requests differing
+    only in it must not share a cache entry. It used to be left out, and a
+    run with a tiny budget (e.g. 2,000, left over from a small manual-labels
+    shapefile) poisoned every later run of the same field/year/sampling --
+    confirmed live on austria.zip: 1,989 cached points kept being reused
+    after the budget was set back to 200,000, leaving ~150 training pixels
+    under a spatial split.
+    """
+    return _get_cache_dir() / f"result_{field}_{year}_{sampling}_n{max_samples}_{gdf_hash}.npz"
 
 
 def _gdf_hash(gdf):
@@ -285,9 +295,9 @@ def _gdf_hash(gdf):
     return h.hexdigest()[:12]
 
 
-def _load_cached_result(field, year, gdf, sampling="equal"):
+def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000):
     """Load cached evaluation result. Returns (vectors, labels, class_names, stats) or None."""
-    path = _result_cache_path(field, year, _gdf_hash(gdf), sampling)
+    path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples)
     if path.exists():
         try:
             data = np.load(path, allow_pickle=True)
@@ -930,10 +940,12 @@ def _extract_tile_patches(
     )
 
 
-def _save_cached_result(field, year, gdf, vectors, labels, class_names, stats, sampling="equal"):
+def _save_cached_result(
+    field, year, gdf, vectors, labels, class_names, stats, sampling="equal", max_samples=200_000
+):
     """Save evaluation result to disk cache."""
     try:
-        path = _result_cache_path(field, year, _gdf_hash(gdf), sampling)
+        path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples)
         np.savez_compressed(
             path,
             vectors=vectors,
@@ -1433,7 +1445,9 @@ def run_large_area():
         t0 = time.time()
 
         # Check in-memory cache first, then disk cache
-        cache_key = (field_name, train_year, test_year, sampling)
+        # The sample budget is part of the key -- see _result_cache_path.
+        sample_budget = max_train if max_train else 200_000
+        cache_key = (field_name, train_year, test_year, sampling, sample_budget)
         vectors = labels = class_names = stats = None
         groups = None
         spatial_3x3 = spatial_5x5 = unet_patches = None
@@ -1494,7 +1508,9 @@ def run_large_area():
 
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
-            cached_result = _load_cached_result(field_name, train_year, gdf, sampling)
+            cached_result = _load_cached_result(
+                field_name, train_year, gdf, sampling, sample_budget
+            )
             if (
                 cached_result
                 and not needs_spatial_3x3
@@ -1593,7 +1609,7 @@ def run_large_area():
             gt = _geotessera_instance
 
             try:
-                MAX_SAMPLE_PIXELS = max_train if max_train else 200_000
+                MAX_SAMPLE_PIXELS = sample_budget
 
                 # LabelEncoder/class_names/n_classes are classification-only:
                 # regression targets are continuous, so there's no fixed
@@ -2030,7 +2046,15 @@ def run_large_area():
                     }
                 )
                 _save_cached_result(
-                    field_name, train_year, gdf, vectors, labels, class_names, stats, sampling
+                    field_name,
+                    train_year,
+                    gdf,
+                    vectors,
+                    labels,
+                    class_names,
+                    stats,
+                    sampling,
+                    sample_budget,
                 )
 
                 all_sample_points = sample_points
@@ -3898,7 +3922,7 @@ def create_map():
                 return
         gt = _geotessera_instance
 
-        # cache["key"] is (field_name, train_year, test_year, sampling) --
+        # cache["key"] is (field_name, train_year, test_year, sampling, sample_budget) --
         # index 1 regardless of test_year. map_year defaults to this (today's
         # existing behavior: map the same year the model was trained on) but
         # can be overridden to run the trained model as pure inference
