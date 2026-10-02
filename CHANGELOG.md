@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.5]
+
+### Fixed
+- **Changing Max pixel samples had no effect once a sample was cached.**
+  Neither the in-memory sample cache key nor the on-disk result-cache
+  filename included the sample budget, so a run with a small budget
+  poisoned every later run of the same field/year/sampling. Confirmed live
+  on austria.zip: a first run at ~2,000 (left over from a small
+  manual-labels shapefile) generated 1,989 points, and later runs at
+  200,000 kept reusing them -- under a spatial split that left ~150
+  training pixels ("0.0K" in the Validation panel) and F1 near zero. The
+  budget is now part of both keys (disk files are named
+  `result_<field>_<year>_<sampling>_n<budget>_<hash>.npz`, so existing
+  result-cache files are simply no longer read and regenerate on first
+  use). New tests in `tests/test_cache_key_sample_budget.py`.
+
 ## [1.15.4]
 
 ### Fixed
