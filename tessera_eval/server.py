@@ -24,7 +24,7 @@ import numpy as np
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
-from tessera_eval.classify import SPATIAL_MODELS
+from tessera_eval.classify import DEFAULT_AUGMENT_CAP, SPATIAL_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -318,6 +318,49 @@ def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000,
     return None
 
 
+_POINT_TYPES = ("Point", "MultiPoint")
+_PIXEL_AREA_M2 = 100.0  # one 10 m TESSERA pixel
+
+
+def _optional_limit(body, key, default):
+    """A user-settable limit from the request body.
+
+    Missing key -> `default` (older clients keep today's behaviour); an
+    explicit null / blank / 0 -> None, meaning no limit; otherwise the int.
+    """
+    if key not in body:
+        return default
+    value = body.get(key)
+    if value in (None, "", 0, "0"):
+        return None
+    return int(value)
+
+
+def _is_point_ground_truth(gdf):
+    """True when any labelled feature is a point rather than a polygon."""
+    return bool(len(gdf)) and bool(gdf.geom_type.isin(_POINT_TYPES).any())
+
+
+def _label_area_m2(gdf):
+    """Per-feature labelled area in m^2, as a Series aligned with `gdf`.
+
+    Polygons use their real area in a local UTM projection (WGS84 degrees
+    don't give usable areas). A point labels exactly one 10 m pixel, so it
+    counts as 100 m^2 (a MultiPoint as 100 m^2 per point) -- without this,
+    point ground truth has zero area, which made sqrt/proportional sampling
+    divide by zero and the upload's pixel estimate read 0.
+    """
+    area = gdf.to_crs(gdf.estimate_utm_crs()).geometry.area
+    is_point = gdf.geom_type.isin(_POINT_TYPES)
+    if is_point.any():
+        n_pts = gdf.geometry[is_point].apply(
+            lambda g: len(g.geoms) if g.geom_type == "MultiPoint" else 1
+        )
+        area = area.copy()
+        area[is_point] = n_pts * _PIXEL_AREA_M2
+    return area
+
+
 def _sample_points_within_budget(rows_gdf, budget, rng):
     """Sample up to `budget` points total from rows_gdf's polygons.
 
@@ -347,6 +390,30 @@ def _sample_points_within_budget(rows_gdf, budget, rng):
     empty_idx = np.empty((0,), dtype=rows_gdf.index.dtype if n_rows else np.int64)
     if n_rows == 0 or budget <= 0:
         return empty_coords, empty_idx
+
+    # Point ground truth: each point already *is* a labelled pixel, so take
+    # the points themselves (a random subset if there are more than the
+    # budget). geopandas' sample_points draws inside an area, which a point
+    # doesn't have -- it used to yield nothing, so point shapefiles failed
+    # with "No sample points generated". Polygons in the same rows (mixed
+    # geometry) share whatever budget the points leave.
+    is_point = rows_gdf.geom_type.isin(_POINT_TYPES)
+    if is_point.any():
+        pts = rows_gdf[is_point].explode(index_parts=False)
+        pt_coords = np.column_stack([pts.geometry.x, pts.geometry.y])
+        pt_index = pts.index.to_numpy()
+        if len(pt_coords) > budget:
+            keep = np.sort(rng.choice(len(pt_coords), size=budget, replace=False))
+            pt_coords, pt_index = pt_coords[keep], pt_index[keep]
+        poly_coords, poly_index = _sample_points_within_budget(
+            rows_gdf[~is_point], budget - len(pt_coords), rng
+        )
+        if len(poly_coords) == 0:
+            return pt_coords, pt_index
+        return (
+            np.vstack([pt_coords, poly_coords]),
+            np.concatenate([pt_index, poly_index]),
+        )
 
     if n_rows > budget:
         chosen = rng.choice(rows_gdf.index.to_numpy(), size=budget, replace=False)
@@ -602,8 +669,16 @@ def _extract_tile_patches(
     cancel_flag=None,
     is_classification=True,
     seed=42,
+    max_spatial_px=5000,
+    min_labelled_px=10,
 ):
     """Extract pixel-aligned 2D patches and optionally point samples from tiles.
+
+    max_spatial_px: at most this many labelled pixels per patch become
+    Spatial MLP training/test points (randomly chosen); None = all of them.
+    Set from the Validation panel. min_labelled_px: a patch with fewer
+    labelled pixels than this is skipped (10 for polygons; 1 for point
+    ground truth, where a 256x256 patch may hold only a few points).
 
     Uses zarr read_region() when available (roughly an order of magnitude
     faster on a cold cache than pulling whole NPY tiles), falling back to
@@ -842,7 +917,7 @@ def _extract_tile_patches(
             n_patch_labelled = (
                 (label_patch > 0).sum() if is_classification else (~np.isnan(label_patch)).sum()
             )
-            if n_patch_labelled < 10:
+            if n_patch_labelled < min_labelled_px:
                 continue
 
             # Basic slicing above returns a *view* into tile_emb -- copy() is not
@@ -874,15 +949,19 @@ def _extract_tile_patches(
                 (emb_patch, label_patch.astype(np.int32) if is_classification else label_patch)
             )
 
-            # Subsample labelled pixels for spatial features to cap memory
-            # (~300MB per full 256×256 patch at 3×3, ~800MB at 5×5)
+            # Subsample labelled pixels for spatial features to bound memory
+            # (~300MB per full 256×256 patch at 3×3, ~800MB at 5×5). The
+            # limit is the panel's "Spatial features per patch" setting.
             labelled_mask = label_patch > 0 if is_classification else ~np.isnan(label_patch)
-            MAX_SPATIAL_PX = 5000  # per patch — 100 patches × 5K = 500K total
             n_labelled = labelled_mask.sum()
-            if n_labelled > MAX_SPATIAL_PX and (needs_spatial_3x3 or needs_spatial_5x5):
+            if (
+                max_spatial_px
+                and n_labelled > max_spatial_px
+                and (needs_spatial_3x3 or needs_spatial_5x5)
+            ):
                 # Randomly zero out excess pixels in the mask
                 rows, cols = np.where(labelled_mask)
-                keep = rng.choice(len(rows), size=MAX_SPATIAL_PX, replace=False)
+                keep = rng.choice(len(rows), size=max_spatial_px, replace=False)
                 labelled_mask = np.zeros_like(labelled_mask)
                 labelled_mask[rows[keep], cols[keep]] = True
 
@@ -1162,11 +1241,10 @@ def upload_shapefile():
     else:
         geojson = json.loads(merged.to_json())
 
-    # Estimate total labelled pixels from polygon areas at 10m resolution
+    # Estimate total labelled pixels at 10m resolution (a point is one pixel)
     try:
-        area_crs = merged.estimate_utm_crs()
-        total_area_m2 = merged.to_crs(area_crs).geometry.area.sum()
-        estimated_labelled_pixels = int(total_area_m2 / 100)  # 10m × 10m per pixel
+        total_area_m2 = _label_area_m2(merged).sum()
+        estimated_labelled_pixels = int(total_area_m2 / _PIXEL_AREA_M2)
     except Exception:
         estimated_labelled_pixels = 0
 
@@ -1261,6 +1339,13 @@ def run_large_area():
         max_train = int(max_train)
     sampling = body.get("sampling", "sqrt")  # equal, proportional, sqrt
     max_patches = int(body.get("max_patches", 500))
+    # Spatial MLP limits, both shown and settable in the Validation panel.
+    # max_spatial_train_samples: training points are subsampled to this many
+    # before the 4x flip augmentation (memory/time); None = no limit.
+    # max_spatial_px_per_patch: labelled pixels per patch used as Spatial
+    # MLP points; None = all.
+    spatial_train_cap = _optional_limit(body, "max_spatial_train_samples", DEFAULT_AUGMENT_CAP)
+    spatial_px_per_patch = _optional_limit(body, "max_spatial_px_per_patch", 5000)
     train_bboxes = body.get("train_bboxes", [])
     test_bboxes = body.get("test_bboxes", [])
     # "learning_curve" (default) or "kfold". k-fold cross-validates over all
@@ -1707,10 +1792,7 @@ def run_large_area():
                     # area_stratified_split doesn't force sampling into
                     # proportional/sqrt just to get `_area` populated.
                     if sampling in ("proportional", "sqrt") or area_stratified_split:
-                        area_crs = valid_gdf.estimate_utm_crs()
-                        projected = valid_gdf.to_crs(area_crs)
-                        projected["_area"] = projected.geometry.area
-                        valid_gdf["_area"] = projected["_area"].values
+                        valid_gdf["_area"] = _label_area_m2(valid_gdf).values
                     if sampling in ("proportional", "sqrt"):
                         import math
 
@@ -1781,7 +1863,7 @@ def run_large_area():
                         json.dumps(
                             {
                                 "event": "error",
-                                "message": "No sample points generated from shapefile polygons",
+                                "message": "No sample points generated from the shapefile",
                             }
                         )
                         + "\n"
@@ -1841,6 +1923,8 @@ def run_large_area():
                                 le,
                                 n_classes,
                                 max_patches=max_patches,
+                                max_spatial_px=spatial_px_per_patch,
+                                min_labelled_px=1 if _is_point_ground_truth(gdf) else 10,
                                 needs_spatial_3x3=needs_spatial_3x3,
                                 needs_spatial_5x5=needs_spatial_5x5,
                                 sample_points_lonlat=sample_points,
@@ -2674,13 +2758,17 @@ def run_large_area():
             file_split_test_vectors = tf_vecs[tf_valid].astype(np.float32)
             file_split_test_labels = tf_lbls[tf_valid]
 
-        # Training percentages (% of labelled area)
+        # Training percentages (% of the training pool). With a random split
+        # the pool also supplies the test set, so 80% is the most that can be
+        # trained on; with a separate test set (rectangles, test year, test
+        # file, area-stratified, or a group-by-field holdout) the whole pool
+        # can be, so a 100% step is added. run_learning_curve drops it again
+        # if the split turns out to be random (e.g. group_by_field requested
+        # but no field groups available). Steps used to be cut at Max pixel
+        # samples too -- a no-op, since the sample can't exceed that budget.
         training_pcts = [1, 3, 5, 10, 20, 30, 50, 80]
-        if max_train:
-            max_pct = min(80, int(100 * max_train / total_labelled))
-            training_pcts = [p for p in training_pcts if p <= max_pct]
-            if not training_pcts:
-                training_pcts = [max_pct]
+        if eval_mode != "kfold" and (has_fixed_test_set or (group_by_field and is_classification)):
+            training_pcts.append(100)
 
         # Class info (classification only -- regression labels are
         # continuous floats, not a small fixed vocabulary to enumerate, and
@@ -2957,6 +3045,7 @@ def run_large_area():
             unet_patches=unet_patches,
             task=task,
             groups=effective_groups,
+            spatial_augment_cap=spatial_train_cap,
         )
         if has_spatial_split:
             lc_kwargs["test_vectors"] = spatial_test_vectors
@@ -3042,6 +3131,7 @@ def run_large_area():
                 model_params=model_params,
                 max_training_samples=max_train,
                 seed=seed,
+                spatial_augment_cap=spatial_train_cap,
                 spatial_vectors=spatial_3x3,
                 spatial_vectors_5x5=spatial_5x5,
                 spatial_labels=(
@@ -3235,6 +3325,7 @@ def run_large_area():
         # Store active_models for deferred training
         _tile_cache["_active_models"] = active_models
         _tile_cache["_model_params"] = model_params
+        _tile_cache["_spatial_augment_cap"] = spatial_train_cap
         _tile_cache["_unet_patches"] = unet_patches
         # Same deferred-training stash, for Spatial MLP -- previously never
         # written, so train_models() always saw spatial_3x3/spatial_5x5 as
@@ -3304,6 +3395,9 @@ def train_models():
     # match the scored ones.
     is_classification = _resolve_task(cache, None)
     seed = int(cache.get("_seed", 42))
+    # The run's Spatial MLP training-point limit (None = no limit); runs
+    # from before this setting existed fall back to the old default.
+    spatial_augment_cap = cache.get("_spatial_augment_cap", DEFAULT_AUGMENT_CAP)
 
     if not active_models:
         return jsonify({"error": "No classifiers configured."}), 400
@@ -3439,7 +3533,12 @@ def train_models():
                     # cached set straight through and OOM the same way
                     # U-Net's eager augmentation did.
                     X_aug, y_aug = augment_spatial(
-                        spatial_3x3, spatial_labels_3x3, window=3, dim=vectors.shape[1], seed=seed
+                        spatial_3x3,
+                        spatial_labels_3x3,
+                        window=3,
+                        dim=vectors.shape[1],
+                        cap=spatial_augment_cap,
+                        seed=seed,
                     )
                     clf = make_classifier(name, model_params.get(name, {}), seed=seed)
                     yield from _fit_with_wire_heartbeat(lambda: clf.fit(X_aug, y_aug))
@@ -3456,7 +3555,12 @@ def train_models():
                     from tessera_eval.classify import augment_spatial
 
                     X_aug, y_aug = augment_spatial(
-                        spatial_5x5, spatial_labels_5x5, window=5, dim=vectors.shape[1], seed=seed
+                        spatial_5x5,
+                        spatial_labels_5x5,
+                        window=5,
+                        dim=vectors.shape[1],
+                        cap=spatial_augment_cap,
+                        seed=seed,
                     )
                     clf = make_classifier(name, model_params.get(name, {}), seed=seed)
                     yield from _fit_with_wire_heartbeat(lambda: clf.fit(X_aug, y_aug))
