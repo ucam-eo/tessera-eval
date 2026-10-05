@@ -33,6 +33,31 @@ _HEARTBEAT_INTERVAL_S = 5  # matches server.py's tile-fetch heartbeat cadence
 _MAX_SCATTER_POINTS = 1000
 
 
+UNET_LC_LIMIT_PARAMS = ("lc_max_train_patches", "lc_max_test_patches")
+
+
+def _unet_lc_split_sizes(n_patches, pct, params=None):
+    """(n_train, n_test) U-Net patches for one learning-curve step.
+
+    Trains on `pct`% of the extracted patches (at least 1, leaving at least 1
+    for test) and tests on all the rest. Both are uncapped unless the U-Net
+    params set `lc_max_train_patches` / `lc_max_test_patches` (shown in the
+    Validation panel; blank = no limit). These used to be silently hard-coded
+    at 20 train / 10 test patches -- ten 256x256 test patches can't contain
+    most classes of a 38-class habitat map, so most confusion-matrix rows
+    were empty by construction (Moustafa Eweda, 2026-10-05).
+    """
+    params = params or {}
+    n_train = max(1, int(n_patches * pct / 100.0))
+    n_train = min(n_train, n_patches - 1)
+    if params.get("lc_max_train_patches"):
+        n_train = min(n_train, int(params["lc_max_train_patches"]))
+    n_test = n_patches - n_train
+    if params.get("lc_max_test_patches"):
+        n_test = min(n_test, int(params["lc_max_test_patches"]))
+    return n_train, n_test
+
+
 def _subsample_for_scatter(y_true, y_pred, rng, max_points=None):
     """Return (y_true, y_pred) trimmed to at most max_points, randomly
     subsampled -- not just the first N, which could bias toward whatever
@@ -624,7 +649,6 @@ def run_learning_curve(
             # Only run 1 repeat for U-Net (training is expensive, variance is dominated by SGD noise)
             unet_active = [n for n in active if _strip_variant_suffix(n) == "unet"]
             if has_unet and unet_active and repeat == 0:
-                yield {"type": "classifier_status", "message": f"Pct {pct}%: training U-Net..."}
                 for unet_name in unet_active:
                     try:
                         from tessera_eval.unet import _HAS_TORCH
@@ -638,19 +662,28 @@ def run_learning_curve(
                             )
 
                         if _HAS_TORCH:
+                            unet_params = dict((classifier_params or {}).get(unet_name, {}))
                             n_patches = len(unet_patches)
-                            n_train = max(1, int(n_patches * pct / 100.0))
-                            n_train = min(n_train, n_patches - 1)  # keep at least 1 for test
-                            n_train = min(n_train, 20)  # cap training patches for speed
+                            n_train, n_test = _unet_lc_split_sizes(n_patches, pct, unet_params)
+                            for k in UNET_LC_LIMIT_PARAMS:
+                                unet_params.pop(k, None)
                             patch_idx = rng.permutation(n_patches)
                             train_patches = [unet_patches[i] for i in patch_idx[:n_train]]
                             test_patches = [
-                                unet_patches[i] for i in patch_idx[n_train : n_train + 10]
-                            ]  # cap test too
+                                unet_patches[i] for i in patch_idx[n_train : n_train + n_test]
+                            ]
+                            yield {
+                                "type": "classifier_status",
+                                "message": (
+                                    f"Pct {pct}%: training {unet_name} on {len(train_patches)} "
+                                    f"patches, testing on {len(test_patches)}..."
+                                ),
+                            }
 
                             if train_patches and test_patches:
-                                # Use fewer epochs for learning curve (full epochs only for final model)
-                                unet_params = dict((classifier_params or {}).get(unet_name, {}))
+                                # Epochs come from the Validation panel's U-Net
+                                # params; 15 is only a fallback for callers that
+                                # send none (the panel always sends its value).
                                 unet_params.setdefault("epochs", 15)
                                 if is_classification:
                                     model = yield from _fit_with_heartbeat(
@@ -807,10 +840,13 @@ def run_learning_curve(
         # Compute actual training pixel counts for unified x-axis
         pixel_train_count = len(train_idx)  # from last repeat (representative)
         unet_train_count = 0
-        if has_unet and any(_strip_variant_suffix(n) == "unet" for n in active):
-            n_train_patches = max(1, int(len(unet_patches) * pct / 100.0))
-            n_train_patches = min(n_train_patches, len(unet_patches) - 1)
-            n_train_patches = min(n_train_patches, 20)
+        unet_names = [n for n in active if _strip_variant_suffix(n) == "unet"]
+        if has_unet and unet_names:
+            # Same split rule as the training step above (first U-Net variant's
+            # limits, if a run has several).
+            n_train_patches, _ = _unet_lc_split_sizes(
+                len(unet_patches), pct, (classifier_params or {}).get(unet_names[0], {})
+            )
             unet_train_count = sum(unet_patch_pixel_counts[:n_train_patches])
 
         pct_elapsed = _time.time() - pct_t0
