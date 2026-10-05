@@ -18,6 +18,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
 from tessera_eval.classify import (
+    DEFAULT_AUGMENT_CAP,
     SPATIAL_MODELS,
     _strip_variant_suffix,
     augment_spatial,
@@ -175,6 +176,7 @@ def run_learning_curve(
     seed=42,
     groups=None,
     group_test_fraction=0.2,
+    spatial_augment_cap=DEFAULT_AUGMENT_CAP,
     **kwargs,
 ):
     """Generator that yields progress events after each training percentage.
@@ -283,6 +285,13 @@ def run_learning_curve(
     # there's no distinction between "held out by field" and "held out by
     # drawn geography".)
     spatial_split = test_vectors is not None and test_labels is not None
+
+    # With a random split the pool also supplies the test set, so 80% is the
+    # most that can be trained on (the remaining 20% is the test set). With a
+    # separate test set every step up to 100% of the pool is valid -- the
+    # server plans a 100% step whenever one may apply (see run_large_area).
+    if not spatial_split:
+        training_pcts = [p for p in training_pcts if p <= 80] or [80]
 
     if spatial_split:
         # No neighbourhood features exist for the fixed test set, so these
@@ -432,13 +441,10 @@ def run_learning_curve(
         # Number of pixels for this percentage
         size = max(1, int(n_samples * pct / 100.0))
 
-        # Adaptive repeats: fewer at high percentages where variance is low
-        if pct >= 50:
-            n_repeats = max(1, repeats - 3)
-        elif pct >= 20:
-            n_repeats = max(2, repeats - 2)
-        else:
-            n_repeats = repeats
+        # Every step gets the full number of repeats. (It used to drop to
+        # 3 at 20-49% and 2 at >=50% to save time, so the error bars at the
+        # largest steps rested on fewer runs than the rest.)
+        n_repeats = repeats
 
         for repeat in range(n_repeats):
             rng = np.random.RandomState(seed + repeat)
@@ -514,12 +520,20 @@ def run_learning_curve(
                             spatial_labels[sp_test_idx],
                         )
                         X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train_sp, window=3, dim=vectors.shape[1]
+                            X_tr,
+                            y_train_sp,
+                            window=3,
+                            dim=vectors.shape[1],
+                            cap=spatial_augment_cap,
                         )
                     else:
                         X_tr, X_te = spatial_vectors[train_idx], spatial_vectors[test_idx]
                         X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train, window=3, dim=vectors.shape[1]
+                            X_tr,
+                            y_train,
+                            window=3,
+                            dim=vectors.shape[1],
+                            cap=spatial_augment_cap,
                         )
                         y_test = labels[test_idx]
                 elif base_clf_name == "spatial_mlp_5x5" and spatial_vectors_5x5 is not None:
@@ -537,12 +551,20 @@ def run_learning_curve(
                         X_tr, X_te = sp_vecs[sp_train_idx], sp_vecs[sp_test_idx]
                         y_train_sp, y_test = sp_lbls[sp_train_idx], sp_lbls[sp_test_idx]
                         X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train_sp, window=5, dim=vectors.shape[1]
+                            X_tr,
+                            y_train_sp,
+                            window=5,
+                            dim=vectors.shape[1],
+                            cap=spatial_augment_cap,
                         )
                     else:
                         X_tr, X_te = sp_vecs[train_idx], sp_vecs[test_idx]
                         X_tr, y_tr_aug = augment_spatial(
-                            X_tr, y_train, window=5, dim=vectors.shape[1]
+                            X_tr,
+                            y_train,
+                            window=5,
+                            dim=vectors.shape[1],
+                            cap=spatial_augment_cap,
                         )
                         y_test = labels[test_idx]
                 else:
@@ -645,10 +667,10 @@ def run_learning_curve(
                                 "message": f"{name} failed to train: {exc}",
                             }
 
-            # U-Net: patch-based train/test split
-            # Only run 1 repeat for U-Net (training is expensive, variance is dominated by SGD noise)
+            # U-Net: patch-based train/test split, repeated like every other
+            # model (it used to run only the first repeat, to save time).
             unet_active = [n for n in active if _strip_variant_suffix(n) == "unet"]
-            if has_unet and unet_active and repeat == 0:
+            if has_unet and unet_active:
                 for unet_name in unet_active:
                     try:
                         from tessera_eval.unet import _HAS_TORCH
@@ -1021,6 +1043,7 @@ def run_kfold_cv(
     spatial_labels=None,
     dim=None,
     groups=None,
+    spatial_augment_cap=DEFAULT_AUGMENT_CAP,
 ):
     """Generator that yields per-fold and aggregate results for k-fold CV.
 
@@ -1193,12 +1216,20 @@ def run_kfold_cv(
             try:
                 if b == "spatial_mlp":
                     X_tr, y_tr = augment_spatial(
-                        spatial_vectors[sp_tr], spatial_labels[sp_tr], window=3, dim=dim
+                        spatial_vectors[sp_tr],
+                        spatial_labels[sp_tr],
+                        window=3,
+                        dim=dim,
+                        cap=spatial_augment_cap,
                     )
                     X_te, y_te = spatial_vectors[sp_te], spatial_labels[sp_te]
                 elif b == "spatial_mlp_5x5":
                     X_tr, y_tr = augment_spatial(
-                        spatial_vectors_5x5[sp_tr], spatial_labels[sp_tr], window=5, dim=dim
+                        spatial_vectors_5x5[sp_tr],
+                        spatial_labels[sp_tr],
+                        window=5,
+                        dim=dim,
+                        cap=spatial_augment_cap,
                     )
                     X_te, y_te = spatial_vectors_5x5[sp_te], spatial_labels[sp_te]
                 else:

@@ -6,6 +6,35 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.17.0]
+
+### Added
+- **Point ground truth.** Each point is one labelled pixel: the sampler uses
+  the points themselves (a random subset if there are more than Max pixel
+  samples), each point counts as 100 m² for sqrt/proportional sampling,
+  area-stratified splits and the upload's pixel estimate, and a patch needs
+  only 1 labelled pixel (not 10) when the ground truth has points. Point
+  shapefiles used to fail in every sampling mode ("No sample points
+  generated", "float division by zero", "cannot convert float NaN to
+  integer"). Mixed point/polygon files work too.
+- **`max_spatial_train_samples`** request setting (default 50,000; blank/0 =
+  no limit): Spatial MLP training points are subsampled to this many before
+  the 4x flip augmentation. It was a hidden constant, so learning-curve steps
+  above it all trained on the same 50,000 points (a flat curve). Also used by
+  k-fold and Download Models.
+- **`max_spatial_px_per_patch`** request setting (default 5,000; blank/0 = no
+  limit): labelled pixels per patch used as Spatial MLP points. Was a hidden
+  constant.
+
+### Changed
+- **Every learning-curve step runs the full number of repeats.** It used to
+  drop to 3 at 20-49% and 2 at 50%+, and U-Net ran only one.
+- **The learning curve reaches 100% of the training pool when the test set
+  is separate** (rectangles, test year, test file, area-stratified or
+  group-by-field holdout). With a random split it still stops at 80%, since
+  the remaining 20% is the test set. Steps are no longer cut at Max pixel
+  samples (that filter had no effect).
+
 ## [1.16.0]
 
 ### Changed

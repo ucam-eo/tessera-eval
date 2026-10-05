@@ -218,7 +218,10 @@ def test_spatial_mlp_5x5_regression_trains_and_produces_a_real_r2():
     progress = [e for e in events if e["type"] == "progress"]
     assert len(progress) == 2
     for e in progress:
-        assert e["classifiers"]["spatial_mlp_5x5"]["mean_r2"] > 0.3
+        # Learnable synthetic data -- a real fit should beat "no skill" (0).
+        # Both repeats now run at every step (the 50%/80% steps used to run
+        # only one), and their mean sits a little lower (~0.29).
+        assert e["classifiers"]["spatial_mlp_5x5"]["mean_r2"] > 0.2
 
 
 def test_aggregate_includes_scatter_points_matching_the_test_set():
