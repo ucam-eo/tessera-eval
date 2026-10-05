@@ -12,7 +12,7 @@ started. For a 128-dim, 256x256 patch that's 32 MiB per variant, so
 len(patches) * 16 * 32 MiB up front -- confirmed live as a real OOM
 ("Unable to allocate 74.5 GiB for an array with shape (2384, 128, 256,
 256)", Moustafa Eweda, hit via train_models()'s uncapped patch set, which
-unlike the learning curve's per-pct 20-patch cap has no size limit at all).
+unlike the learning curve, which can be limited from the panel, has no size limit at all).
 
 _AugmentedPatches (a torch Dataset) generates the same 16 variants lazily
 in __getitem__ instead, so peak memory is O(batch_size) rather than

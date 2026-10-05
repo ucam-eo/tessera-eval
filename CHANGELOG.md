@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.16.0]
+
+### Changed
+- **U-Net's learning curve is no longer silently capped at 20 training / 10
+  test patches.** It now trains on the requested percentage of the extracted
+  patches and tests on all the rest. Ten 256x256 test patches can't contain
+  most classes of a many-class map, so most confusion-matrix rows were empty
+  by construction (reported by Moustafa Eweda: 18 of 38 classes with no test
+  samples, macro-F1 ~0.17). Limits are now optional U-Net params,
+  `lc_max_train_patches` / `lc_max_test_patches` (blank = no limit), and the
+  per-step status line reports the actual counts ("training unet on N
+  patches, testing on M"). Expect U-Net learning curves to take
+  considerably longer on large patch sets.
+
 ## [1.15.6]
 
 ### Fixed

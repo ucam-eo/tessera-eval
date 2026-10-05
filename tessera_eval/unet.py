@@ -205,9 +205,9 @@ if _HAS_TORCH:
         bytes up front: a 500-patch, 128-dim, 256x256 run OOMs at ~75 GiB
         (confirmed live -- "Unable to allocate 74.5 GiB for an array with
         shape (2384, 128, 256, 256)", Moustafa Eweda, final-model training
-        via train_models(), which -- unlike the learning curve's per-pct
-        20-patch cap -- hands the whole cached patch set to this function
-        uncapped). With this Dataset, PyTorch's DataLoader only ever
+        via train_models(), which hands the whole cached patch set to this
+        function uncapped -- and since v1.16.0 the learning curve does too,
+        unless the panel's U-Net patch limits are set). With this Dataset, PyTorch's DataLoader only ever
         materializes one batch at a time, so peak memory is
         O(batch_size), not O(len(patches) * 16).
 
