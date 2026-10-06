@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.18.0]
+
+### Changed
+- **Embeddings now come from the v1.1-dclimate dataset**, the wall-to-wall
+  2017-2025 run, through one reader for everything:
+  `tessera_eval.dataset.make_client()`, a thin client over geotessera's
+  `GeoTesseraZarr` (requires geotessera >= 0.11). Pixel sampling, tile/patch
+  extraction, test-year and test-file sampling, Create Map and the CLI all
+  use it. Results are not comparable with earlier runs on v1.0.
+- NPY tiles (deprecated in geotessera 0.11) are no longer used, and the
+  separate, disabled zarr fast path (`_ZARR_DISABLED`, `_get_zarr`,
+  `_probe_zarr_coverage`) is gone -- there is now a single path.
+- Each tile and point batch is retried on transient errors (e.g. HTTP 502);
+  a tile that still fails is skipped instead of ending the run.
+
 ## [1.17.1]
 
 ### Fixed

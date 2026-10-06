@@ -24,8 +24,8 @@ It handles the unglamorous-but-fiddly parts end to end:
 
 > The library core (`data`, `rasterize`, `classify`, `evaluate`) is pure NumPy /
 > scikit-learn / rasterio and has no web-framework or hosting dependency. The
-> compute server reads zarr embeddings through geotessera's own `GeoTesseraZarr`
-> interface, falling back to NPY tiles when the store lacks coverage.
+> embeddings come from the **v1.1-dclimate** dataset (the wall-to-wall 2017-2025
+> run), read through geotessera's `GeoTesseraZarr` via `tessera_eval.dataset`.
 
 ## Install
 
@@ -49,7 +49,7 @@ parcels near Vienna labelled by crop type):
 
 ```python
 import geopandas as gpd
-from geotessera import GeoTessera
+from tessera_eval.dataset import make_client
 from tessera_eval import load_embeddings_for_shapefile, run_kfold_cv
 
 # 1. Labelled polygons (any CRS — reprojected internally) with a class column.
@@ -60,7 +60,7 @@ gdf = gpd.read_file(
 
 # 2. Pull a 128-d embedding for every pixel under the polygons (memory-bounded:
 #    one GeoTessera tile at a time, keeping only labelled pixels).
-gt = GeoTessera()
+gt = make_client()  # v1.1-dclimate, via geotessera's Zarr reader
 vectors, labels, class_names, stats = load_embeddings_for_shapefile(
     gdf, field="crop", year=2024, gt_instance=gt
 )
@@ -214,10 +214,11 @@ Run any command with `--help` for a list of all possible arguments.
 | `tessera_eval.server` | `tee-compute`: local Flask compute server, proxies data/UI to a hosted TEE. |
 | `tessera_eval.cli` | `tessera-eval` command-line interface: `load`, `kfold`, `learning-curve`. |
 
-The compute server reads zarr embeddings directly through geotessera's
-`GeoTesseraZarr` interface as a fast path, probing coverage first and falling
-back to NPY tiles whenever the store is unavailable or lacks the requested
-region or year.
+Every embedding read -- pixel sampling, tile/patch extraction, maps, the CLI
+-- goes through one reader, `tessera_eval.dataset.make_client()`: geotessera's
+`GeoTesseraZarr` on the **v1.1-dclimate** dataset (geotessera >= 0.11). The
+dataset is named explicitly, so a geotessera upgrade can't change it. NPY tiles
+(deprecated in geotessera 0.11) are no longer used.
 
 Available models: `nn`, `rf`, `mlp`, `spatial_mlp`, `spatial_mlp_5x5`, `xgboost`
 (if installed), `unet` (if torch installed); regressors `nn_reg`, `rf_reg`,

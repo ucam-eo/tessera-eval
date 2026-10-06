@@ -94,6 +94,9 @@ def fake_geotessera(monkeypatch):
 
     fake_module.GeoTessera = FakeGeoTessera
     monkeypatch.setitem(sys.modules, "geotessera", fake_module)
+    # The CLI reads embeddings through tessera_eval.dataset's Zarr client,
+    # which would import geotessera.store -- stub the client itself too.
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", FakeGeoTessera)
     return fake_module
 
 
