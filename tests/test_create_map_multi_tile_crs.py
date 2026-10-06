@@ -4,10 +4,10 @@ that span more than one UTM zone.
 Embeddings are produced on each tile's native UTM grid, and the geotessera
 guidance is to classify on that grid and reproject only the result.  The
 NPY fallback used to reproject the embeddings themselves to EPSG:4326
-before predicting (resampling every 128-dimensional vector), and the zarr
-path handed rasterio.merge blocks in whichever UTM zone each chunk fell in,
-which raised "CRS mismatch with source" for map areas crossing a zone
-boundary.  Both paths must now predict on the grid the embeddings arrive
+before predicting (resampling every 128-dimensional vector), and a
+since-removed chunked path handed rasterio.merge blocks in whichever UTM
+zone each chunk fell in, which raised "CRS mismatch with source" for map
+areas crossing a zone boundary.  Maps must now predict on the grid the embeddings arrive
 on, with only the per-block *prediction* rasters reprojected onto a common
 CRS before merging.
 
@@ -75,24 +75,10 @@ class _FakeGeoTessera:
         )
 
 
-class _FakeZarr:
-    """read_region returns each chunk on the native grid of whichever UTM
-    zone its centre falls in, like the real zarr store."""
-
-    def read_region(self, bbox, year):
-        lon0, lat0, lon1, lat1 = bbox
-        mid_lon = (lon0 + lon1) / 2
-        crs = "EPSG:32633" if mid_lon < 18.0 else "EPSG:32634"
-        return _native_tile(lon0, lat1, crs)
-
-
-def _client(monkeypatch, get_zarr, probe=None):
+def _client(monkeypatch):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "_get_zarr", get_zarr)
-    if probe is not None:
-        monkeypatch.setattr(srv, "_probe_zarr_coverage", probe)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
 
     rng = np.random.RandomState(0)
     n = 100
@@ -115,13 +101,7 @@ def _client(monkeypatch, get_zarr, probe=None):
 
 @pytest.fixture
 def npy_client(monkeypatch):
-    return _client(monkeypatch, get_zarr=lambda: None)
-
-
-@pytest.fixture
-def zarr_client(monkeypatch):
-    zarr = _FakeZarr()
-    return _client(monkeypatch, get_zarr=lambda: zarr, probe=lambda *a, **k: True)
+    return _client(monkeypatch)
 
 
 def _run(client):
@@ -142,12 +122,6 @@ def test_npy_path_predicts_on_native_grids_and_merges_across_zones(npy_client):
         "map_ready must report the output CRS now that maps are written on "
         "native UTM grids rather than always EPSG:4326"
     )
-
-
-def test_zarr_path_merges_chunks_from_different_utm_zones(zarr_client):
-    events = _run(zarr_client)
-    ready = next(e for e in events if e["event"] == "map_ready")
-    assert ready["width"] > 0 and ready["height"] > 0
 
 
 def test_merge_prediction_rasters_handles_mixed_crs():
@@ -171,31 +145,6 @@ def test_merge_prediction_rasters_handles_mixed_crs():
     assert str(crs) in ("EPSG:32633", "EPSG:32634")
 
 
-class _ZoneStrictZarr(_FakeZarr):
-    """Refuses zone-straddling requests.  The real store serves such a bbox
-    from the centre zone alone, silently clipping at the boundary -- so any
-    straddling chunk means a strip of the map would quietly go missing."""
-
-    def read_region(self, bbox, year):
-        lon0, _lat0, lon1, _lat1 = bbox
-        assert int((lon0 + 180.0) // 6.0) == int((lon1 - 1e-9 + 180.0) // 6.0), (
-            f"chunk {bbox} straddles a UTM zone boundary"
-        )
-        return super().read_region(bbox, year)
-
-
-def test_zarr_chunks_never_straddle_a_zone_boundary(monkeypatch):
-    zarr = _ZoneStrictZarr()
-    client = _client(monkeypatch, get_zarr=lambda: zarr, probe=lambda *a, **k: True)
-    body = {"classifier": "rf", "map_bboxes": [[48.2, 17.93, 48.3, 18.25]]}
-    resp = client.post("/api/evaluation/create-map", json=body)
-    events = [json.loads(line) for line in resp.text.strip().splitlines()]
-
-    failed = [e for e in events if "failed" in e.get("message", "")]
-    assert not failed, f"zone-straddling chunk requests: {failed}"
-    assert any(e["event"] == "map_ready" for e in events)
-
-
 def test_registry_failure_yields_an_error_event_not_a_dead_stream(monkeypatch):
     class _BrokenRegistry:
         def load_blocks_for_region(self, bbox, year):
@@ -205,8 +154,8 @@ def test_registry_failure_yields_an_error_event_not_a_dead_stream(monkeypatch):
         def __init__(self, embeddings_dir=None, **kwargs):
             self.registry = _BrokenRegistry()
 
-    client = _client(monkeypatch, get_zarr=lambda: None)
-    monkeypatch.setattr("geotessera.GeoTessera", _BrokenGeoTessera)
+    client = _client(monkeypatch)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _BrokenGeoTessera)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
 
     resp = client.post(

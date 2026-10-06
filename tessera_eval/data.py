@@ -168,6 +168,8 @@ def load_embeddings_for_shapefile(gdf, field, year, gt_instance, callback=None):
     ):
         if callback:
             callback(tile_idx + 1, total_tiles)
+        if tile_emb is None:  # read failed after retries (logged by the reader)
+            continue
 
         h, w, dim = tile_emb.shape
 
@@ -448,6 +450,8 @@ def load_embeddings_for_raster(
     ):
         if callback:
             callback(tile_idx + 1, total_tiles)
+        if tile_emb is None:  # read failed after retries (logged by the reader)
+            continue
 
         h, w, dim = tile_emb.shape
         aligned = align_raster_to_grid(

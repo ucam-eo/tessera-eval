@@ -65,9 +65,8 @@ class _FakeGeoTessera:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     monkeypatch.setattr(srv, "_geotessera_instance", None)
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
 
     rng = np.random.RandomState(0)
     n = 200
@@ -101,7 +100,9 @@ def _run(client, **body):
 
 def test_map_year_defaults_to_training_year_when_omitted(client, monkeypatch):
     fake = _FakeGeoTessera()
-    monkeypatch.setattr("geotessera.GeoTessera", lambda embeddings_dir=None, **kwargs: fake)
+    monkeypatch.setattr(
+        "tessera_eval.dataset.ZarrClient", lambda embeddings_dir=None, **kwargs: fake
+    )
 
     events = _run(client)
 
@@ -113,7 +114,9 @@ def test_map_year_defaults_to_training_year_when_omitted(client, monkeypatch):
 
 def test_map_year_override_fetches_the_requested_year_not_training_year(client, monkeypatch):
     fake = _FakeGeoTessera()
-    monkeypatch.setattr("geotessera.GeoTessera", lambda embeddings_dir=None, **kwargs: fake)
+    monkeypatch.setattr(
+        "tessera_eval.dataset.ZarrClient", lambda embeddings_dir=None, **kwargs: fake
+    )
 
     events = _run(client, map_year=2018)
 
@@ -130,7 +133,9 @@ def test_map_ready_carries_an_in_browser_preview(client, monkeypatch):
     """map_ready includes a lat/lon PNG + legend for the viewer to overlay
     (feature 5). The GeoTIFF download is unaffected."""
     fake = _FakeGeoTessera()
-    monkeypatch.setattr("geotessera.GeoTessera", lambda embeddings_dir=None, **kwargs: fake)
+    monkeypatch.setattr(
+        "tessera_eval.dataset.ZarrClient", lambda embeddings_dir=None, **kwargs: fake
+    )
 
     events = _run(client)
     ready = next(e for e in events if e["event"] == "map_ready")

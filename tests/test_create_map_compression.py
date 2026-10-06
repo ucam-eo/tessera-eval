@@ -42,9 +42,8 @@ class _FakeGeoTessera:
 @pytest.fixture
 def client(monkeypatch):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
 
     rng = np.random.RandomState(0)
     n = 50

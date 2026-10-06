@@ -67,7 +67,6 @@ class _FakeGeoTessera:
 def fake_tiles(monkeypatch):
     rng = np.random.RandomState(0)
     tile_emb = rng.rand(TILE_SIZE, TILE_SIZE, EMBED_DIM).astype(np.float32)
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     return tile_emb
 
 

@@ -64,7 +64,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "_tile_disk_cache_dir", tmp_path)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr(srv, "_tile_cache", {"key": None, "vectors": None})
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
     return srv.app.test_client()
 
 

@@ -115,7 +115,7 @@ def eval_client(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "_tile_disk_cache_dir", tmp_path)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr(srv, "_tile_cache", {"key": None, "vectors": None})
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
     return srv.app.test_client()
 
 
@@ -197,9 +197,8 @@ def _map_cache(extra):
 @pytest.fixture
 def map_client(monkeypatch):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeMapGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeMapGeoTessera)
     monkeypatch.setattr(srv, "_generated_maps", {})
     return srv.app.test_client()
 
