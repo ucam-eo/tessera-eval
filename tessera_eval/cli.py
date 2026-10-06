@@ -15,6 +15,7 @@ from tessera_eval import (
     run_kfold_cv,
     run_learning_curve,
 )
+from tessera_eval.dataset import EMBEDDINGS_DATASET_VERSION
 
 # Default cache file for vectors/labels, in the current working directory —
 # same convention GeoTessera itself uses for its own tile mirror.
@@ -95,7 +96,7 @@ def _get_vectors_and_labels(
             'Loading from --data requires the geotessera extra: pip install -e ".[geotessera]"'
         ) from exc
 
-    gt = GeoTessera()
+    gt = GeoTessera(dataset_version=EMBEDDINGS_DATASET_VERSION)
 
     if source_kind == "shapefile":
         if not field:
@@ -236,7 +237,7 @@ def load(
                 'Loading rasters requires the geotessera extra: pip install -e ".[geotessera]"'
             ) from exc
 
-        gt = GeoTessera()
+        gt = GeoTessera(dataset_version=EMBEDDINGS_DATASET_VERSION)
         print(f"Loading embeddings for {data} (bbox={bbox}, year={year})...")
         vectors, labels, class_names, stats, task_out = load_embeddings_for_raster(
             data,
@@ -531,7 +532,7 @@ def learning_curve(
             gdf = gpd.read_file(src_path)
             if len(gdf) == 0:
                 raise typer.BadParameter(f"{label} file {src_path} contains no polygons.")
-            gt_local = GeoTessera()
+            gt_local = GeoTessera(dataset_version=EMBEDDINGS_DATASET_VERSION)
             print(f"Loading {label} data from {src_path} ({src_year})...")
             vecs, labs, cnames, _ = load_embeddings_for_shapefile(
                 gdf, field=src_field, year=src_year, gt_instance=gt_local
@@ -547,7 +548,7 @@ def learning_curve(
                     f"bbox for {label} must be four comma-separated numbers: minx,miny,maxx,maxy"
                 ) from exc
             nodata_values = [float(x) for x in nodata.split(",")] if nodata else None
-            gt_local = GeoTessera()
+            gt_local = GeoTessera(dataset_version=EMBEDDINGS_DATASET_VERSION)
             print(f"Loading {label} data from {src_path} ({src_year})...")
             vecs, labs, cnames, _, t = load_embeddings_for_raster(
                 src_path,
@@ -611,7 +612,7 @@ def learning_curve(
             print(f"Raster spatial split: train {train_region}, test {test_region}")
 
             nodata_values = [float(v) for v in nodata.split(",")] if nodata else None
-            gt = GeoTessera()
+            gt = GeoTessera(dataset_version=EMBEDDINGS_DATASET_VERSION)
             print(f"Loading training data ({year})...")
             vectors, labels, class_names, _, task = load_embeddings_for_raster(
                 data,
@@ -697,7 +698,7 @@ def learning_curve(
                         "polygons may all share the same location, or check --data's CRS."
                     )
 
-            gt = GeoTessera()
+            gt = GeoTessera(dataset_version=EMBEDDINGS_DATASET_VERSION)
             print(f"Loading training data ({year})...")
             vectors, labels, class_names, _ = load_embeddings_for_shapefile(
                 train_gdf, field=field, year=year, gt_instance=gt

@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.17.1]
+
+### Fixed
+- **geotessera 0.11 silently switched the embeddings dataset.** geotessera
+  0.11.0 (2026-10-04) changed a bare `GeoTessera()` to read v1.1-cambridge
+  NPY tiles (a sparse test run: 0 tiles for Austria 2022, where v1.0 has 70)
+  and a bare `GeoTesseraZarr()` to read v1.1-dclimate. tessera-eval only
+  required `geotessera>=0.10.1` and never named a dataset, so any fresh
+  install evaluated against different embeddings. Every call now asks for
+  v1.0 explicitly (`tessera_eval/dataset.py`), which works with geotessera
+  0.10.x and 0.11. Moving to v1.1-dclimate is left as a deliberate change.
+
 ## [1.17.0]
 
 ### Added

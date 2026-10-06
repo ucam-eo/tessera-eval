@@ -86,7 +86,7 @@ class _FakeRegistry:
 
 
 class _FakeGeoTessera:
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
         self._rng = np.random.RandomState(0)
 
@@ -163,7 +163,7 @@ class _FakeMapRegistry:
 
 
 class _FakeMapGeoTessera:
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeMapRegistry()
 
     def fetch_embeddings(self, tiles):

@@ -31,7 +31,7 @@ class _FakeRegistry:
 class _FakeGeoTessera:
     calls = 0
 
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
 
     def sample_embeddings_at_points(self, points, year=None, progress_callback=None):
