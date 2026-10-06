@@ -40,7 +40,7 @@ class _FakeGeoTessera:
     features would make r2 degenerate and wouldn't exercise the actual
     fit/predict path meaningfully."""
 
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
         self._rng = np.random.RandomState(0)
 

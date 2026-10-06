@@ -53,7 +53,7 @@ class _FakeGeoTessera:
     real to predict from, and so predictions vary too -- a constant map
     wouldn't distinguish "real values" from "degenerate single value"."""
 
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
 
     def fetch_embeddings(self, tiles):

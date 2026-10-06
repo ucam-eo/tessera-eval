@@ -25,6 +25,7 @@ import requests
 from flask import Flask, Response, jsonify, request, send_file
 
 from tessera_eval.classify import DEFAULT_AUGMENT_CAP, SPATIAL_MODELS
+from tessera_eval.dataset import EMBEDDINGS_DATASET_VERSION, zarr_store_url
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,7 @@ def _get_zarr():
             from geotessera.store import GeoTesseraZarr
 
             inst = GeoTesseraZarr(
+                store_url=zarr_store_url(),
                 cache_dir=str(_get_cache_dir() / "zarr"),
                 cache_max_size=ZARR_CACHE_MAX_BYTES,
             )
@@ -1685,7 +1687,10 @@ def run_large_area():
                 tile_cache_dir = _get_cache_dir() / "tiles"
                 tile_cache_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                    _geotessera_instance = GeoTessera(
+                        dataset_version=EMBEDDINGS_DATASET_VERSION,
+                        embeddings_dir=str(tile_cache_dir),
+                    )
                 except Exception as e:
                     # Unguarded before this fix: a network failure here (e.g. no route to
                     # the Tessera embeddings store) raised out of the generator and killed
@@ -2495,7 +2500,10 @@ def run_large_area():
                 tile_cache_dir = _get_cache_dir() / "tiles"
                 tile_cache_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                    _geotessera_instance = GeoTessera(
+                        dataset_version=EMBEDDINGS_DATASET_VERSION,
+                        embeddings_dir=str(tile_cache_dir),
+                    )
                 except Exception as e:
                     yield (
                         json.dumps(
@@ -2673,7 +2681,10 @@ def run_large_area():
                 tile_cache_dir = _get_cache_dir() / "tiles"
                 tile_cache_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                    _geotessera_instance = GeoTessera(
+                        dataset_version=EMBEDDINGS_DATASET_VERSION,
+                        embeddings_dir=str(tile_cache_dir),
+                    )
                 except Exception as e:
                     yield (
                         json.dumps(
@@ -4023,7 +4034,10 @@ def create_map():
             tile_cache_dir = _get_cache_dir() / "tiles"
             tile_cache_dir.mkdir(parents=True, exist_ok=True)
             try:
-                _geotessera_instance = GeoTessera(embeddings_dir=str(tile_cache_dir))
+                _geotessera_instance = GeoTessera(
+                    dataset_version=EMBEDDINGS_DATASET_VERSION,
+                    embeddings_dir=str(tile_cache_dir),
+                )
             except Exception as e:
                 logger.warning("GeoTessera initialization failed: %s", e)
                 yield (

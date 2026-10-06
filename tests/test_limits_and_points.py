@@ -82,7 +82,7 @@ class _Reg:
 
 
 class _PointGT:
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _Reg()
 
     def sample_embeddings_at_points(self, points, year=None, progress_callback=None):

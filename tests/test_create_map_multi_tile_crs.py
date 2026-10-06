@@ -56,7 +56,7 @@ class _FakeGeoTessera:
     store.  fetch_mosaic_for_region reprojects embeddings before analysis,
     so create_map must never call it."""
 
-    def __init__(self, embeddings_dir=None):
+    def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
 
     def fetch_embeddings(self, tiles):
@@ -202,7 +202,7 @@ def test_registry_failure_yields_an_error_event_not_a_dead_stream(monkeypatch):
             raise RuntimeError("registry unavailable")
 
     class _BrokenGeoTessera(_FakeGeoTessera):
-        def __init__(self, embeddings_dir=None):
+        def __init__(self, embeddings_dir=None, **kwargs):
             self.registry = _BrokenRegistry()
 
     client = _client(monkeypatch, get_zarr=lambda: None)
