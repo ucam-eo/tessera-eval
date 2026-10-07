@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.18.0]
+
+### Changed
+- **Embeddings now come from the v1.1-dclimate dataset**, the wall-to-wall
+  2017-2025 run, through one reader for everything:
+  `tessera_eval.dataset.make_client()`, a thin client over geotessera's
+  `GeoTesseraZarr` (requires geotessera >= 0.11). Pixel sampling, tile/patch
+  extraction, test-year and test-file sampling, Create Map and the CLI all
+  use it. Results are not comparable with earlier runs on v1.0.
+- NPY tiles (deprecated in geotessera 0.11) are no longer used, and the
+  separate, disabled zarr fast path (`_ZARR_DISABLED`, `_get_zarr`,
+  `_probe_zarr_coverage`) is gone -- there is now a single path.
+- Each tile read is retried on transient errors (e.g. HTTP 502); a tile that
+  still fails is skipped instead of ending the run.
+- **Region reads only, cached on disk.** Points are grouped by tile and each
+  tile is read once (picking points from the int8 data, dequantizing only
+  those). Tiles are cached on disk (int8 + scales, uncompressed, LRU-capped
+  at 40 GB) -- geotessera's own Zarr cache keeps only metadata, so without
+  this every run re-downloaded every tile. Measured on Austria 2022
+  (177,810 points, 36 tiles): ~12 min cold, ~15 s on a repeat run.
+- **Only tiles with data and labels are read.** The tile listing keeps only
+  tiles overlapping blocks the dataset embedded that year (its tile
+  registry), and patch extraction / the CLI loader skip tiles with no
+  labelled features before reading them. `year_coverage()` answers "which
+  years have data here" from the registry with no embedding reads.
+- Create Map reads only the map area of a tile, or the whole tile through
+  the cache when the map covers at least a quarter of it.
+
 ## [1.17.1]
 
 ### Fixed

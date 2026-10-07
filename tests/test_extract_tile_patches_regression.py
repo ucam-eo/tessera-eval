@@ -35,7 +35,7 @@ class _FakeGeoTessera:
         self._transform = transform
         self._crs = crs
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for _yr, _lon, _lat in tiles:
                 yield (None, None, None, self._tile_emb, self._crs, self._transform)
@@ -51,7 +51,6 @@ def fake_tile(monkeypatch):
     # rasterize/gather_spatial_features only care about the pixel<->coord
     # mapping, not what CRS it nominally represents.
     transform = Affine(0.001, 0, 16.6, 0, -0.001, 48.35)
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     return tile_emb, transform
 
 

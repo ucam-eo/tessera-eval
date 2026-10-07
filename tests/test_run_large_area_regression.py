@@ -73,7 +73,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "_tile_disk_cache_dir", tmp_path)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr(srv, "_tile_cache", {"key": None, "vectors": None})
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
     return srv.app.test_client()
 
 
@@ -175,7 +175,7 @@ def test_sample_point_count_respects_the_budget_with_many_rows(monkeypatch):
     monkeypatch.setattr(srv, "_get_merged_gdf", lambda: big_gdf)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr(srv, "_tile_cache", {"key": None, "vectors": None})
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
     client = srv.app.test_client()
 
     captured = {}

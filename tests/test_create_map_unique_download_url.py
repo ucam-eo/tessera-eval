@@ -32,7 +32,7 @@ class _FakeGeoTessera:
     def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for yr, _lon, _lat in tiles:
                 emb = np.full((16, 16, EMBED_DIM), float(yr), dtype=np.float32)
@@ -51,9 +51,8 @@ class _FakeGeoTessera:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     srv.app.config["TESTING"] = True
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     monkeypatch.setattr(srv, "_geotessera_instance", None)
-    monkeypatch.setattr("geotessera.GeoTessera", _FakeGeoTessera)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _FakeGeoTessera)
 
     rng = np.random.RandomState(0)
     n = 50

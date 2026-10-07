@@ -103,7 +103,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "_tile_disk_cache_dir", tmp_path)
     monkeypatch.setattr(srv, "_geotessera_instance", None)
     monkeypatch.setattr(srv, "_tile_cache", {"key": None, "vectors": None})
-    monkeypatch.setattr("geotessera.GeoTessera", _PointGT)
+    monkeypatch.setattr("tessera_eval.dataset.ZarrClient", _PointGT)
     return srv.app.test_client()
 
 
@@ -226,7 +226,7 @@ class _TileGT:
         self.registry = _TileReg()
         self._emb = np.random.RandomState(0).rand(TILE, TILE, 8).astype(np.float32)
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for _yr, lon, _lat in tiles:
                 yield (
@@ -239,11 +239,6 @@ class _TileGT:
                 )
 
         return gen()
-
-
-@pytest.fixture
-def no_zarr(monkeypatch):
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)
 
 
 def _extract(gdf, **kw):
@@ -267,14 +262,14 @@ def _polygon_gdf():
     return gpd.GeoDataFrame({"height": [3.7, 4.2]}, geometry=geoms, crs="EPSG:4326")
 
 
-def test_spatial_features_per_patch_is_settable(no_zarr):
+def test_spatial_features_per_patch_is_settable():
     patches, sp_limited = _extract(_polygon_gdf(), needs_spatial_3x3=True, max_spatial_px=5)
     _, sp_all = _extract(_polygon_gdf(), needs_spatial_3x3=True, max_spatial_px=None)
     assert len(sp_limited) <= 5 * len(patches)
     assert len(sp_all) > len(sp_limited)
 
 
-def test_sparse_points_still_yield_patches(no_zarr):
+def test_sparse_points_still_yield_patches():
     pts = [Point(16.6 + i * 0.2 + 0.03, 48.32) for i in range(2)]
     gdf = gpd.GeoDataFrame({"height": [1.0, 2.0]}, geometry=pts, crs="EPSG:4326")
     assert len(_extract(gdf)[0]) == 0  # polygon default: >=10 labelled px per patch

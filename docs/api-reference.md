@@ -134,13 +134,22 @@ the training/predict functions raise `RuntimeError`.
 
 ---
 
-## GeoTessera zarr access
+## Embeddings access (`tessera_eval.dataset`)
 
-The compute server uses geotessera's own `GeoTesseraZarr` interface
-(geotessera >= 0.10.1) directly as a fast path. It opens the store once per
-process, probes coverage with a single pixel before each region read, and
-falls back to NPY tiles whenever the store is unavailable or lacks the
-requested region or year. There is no separate zarr module or package.
+All embedding reads go through `make_client()`, which returns a `ZarrClient`
+over geotessera's `GeoTesseraZarr` (geotessera >= 0.11) on the **v1.1-dclimate**
+dataset (`EMBEDDINGS_DATASET_VERSION` / `EMBEDDINGS_DATASET_VARIANT`). It offers
+the part of the old `GeoTessera` client interface tessera-eval uses:
+
+- `registry.load_blocks_for_region(bbox, year)` -- the 0.1-degree tiles
+  intersecting `bbox` (`tiles_for_bbox`); empty for a year the store lacks.
+- `sample_embeddings_at_points(points, year, progress_callback=None)` -- (N, 128)
+  float32, NaN rows where there is no data; sampled in batches with retries.
+- `fetch_embeddings(tiles)` -- yields `(year, lon, lat, emb, crs, transform)`
+  per tile on its zone's native UTM grid, in order; `emb` is None for a tile
+  that still fails after retries.
+
+NPY tiles are not used.
 
 ---
 

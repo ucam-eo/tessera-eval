@@ -25,7 +25,7 @@ import requests
 from flask import Flask, Response, jsonify, request, send_file
 
 from tessera_eval.classify import DEFAULT_AUGMENT_CAP, SPATIAL_MODELS
-from tessera_eval.dataset import EMBEDDINGS_DATASET_VERSION, zarr_store_url
+from tessera_eval.dataset import make_client
 
 logger = logging.getLogger(__name__)
 
@@ -111,18 +111,7 @@ _tile_cache = {
 }
 _hosted_url = None
 _tile_disk_cache_dir = None  # set in main()
-_geotessera_instance = None  # cached to avoid 10-30s registry init per run
-_zarr_instance = None  # cached GeoTesseraZarr handle; False = tried and failed
-# Temporarily force every embedding fetch onto the NPY tile path, bypassing
-# GeoTesseraZarr entirely. The zarr fast path is currently using a smaller
-# chunk size than intended (Keshav, 2026-09-23) -- reported symptom matches
-# Moustafa Eweda's earlier report (forwarded to Anil): the on-disk chunk
-# cache only persists ~1.2MB of metadata, not the actual tile data, so
-# every read still hits the network regardless of caching. Set back to
-# False once geotessera's chunk-size/caching behaviour is confirmed fixed
-# upstream -- _get_zarr()'s own real connection logic is untouched below,
-# this just short-circuits it.
-_ZARR_DISABLED = True
+_geotessera_instance = None  # cached embeddings reader (tessera_eval.dataset.make_client)
 _cancel_flag = None  # threading.Event, set when user cancels
 # Shared across every proxy() call so the TCP+TLS connection to _hosted_url is
 # kept alive and reused (requests' connection-pooling adapter), instead of a
@@ -132,8 +121,6 @@ _cancel_flag = None  # threading.Event, set when user cancels
 _proxy_session = requests.Session()
 
 FLUSH_PAD = 18 * 1024  # pad NDJSON lines to force Waitress flush
-
-ZARR_CACHE_MAX_BYTES = 20 * 1024**3  # bound the on-disk zarr chunk cache
 
 # In-browser map preview (create_map): a small lat/lon PNG + legend the
 # viewer drops on the map as an L.imageOverlay, so a map can be eyeballed
@@ -173,37 +160,6 @@ def _get_cache_dir():
         _tile_disk_cache_dir = Path.home() / ".cache" / "tessera-eval"
     _tile_disk_cache_dir.mkdir(parents=True, exist_ok=True)
     return _tile_disk_cache_dir
-
-
-def _get_zarr():
-    """Return a cached GeoTesseraZarr handle, or None when zarr is unavailable.
-
-    The store is opened once per process and the outcome is cached, failure
-    included; callers fall back to the NPY tile path on None. Chunk reads
-    are cached on disk alongside the NPY tile cache.
-    """
-    if _ZARR_DISABLED:
-        return None
-    global _zarr_instance
-    if _zarr_instance is None:
-        try:
-            from geotessera.store import GeoTesseraZarr
-
-            inst = GeoTesseraZarr(
-                store_url=zarr_store_url(),
-                cache_dir=str(_get_cache_dir() / "zarr"),
-                cache_max_size=ZARR_CACHE_MAX_BYTES,
-            )
-            if getattr(inst, "years", None):
-                logger.info("GeoTesseraZarr available: %s", inst.url)
-                _zarr_instance = inst
-            else:
-                logger.info("Zarr store has no tiles; using NPY tiles")
-                _zarr_instance = False
-        except Exception as e:
-            logger.info("Zarr store unavailable (%s); using NPY tiles", e)
-            _zarr_instance = False
-    return _zarr_instance or None
 
 
 def _fit_with_wire_heartbeat(fit_fn):
@@ -249,25 +205,6 @@ def _fit_with_wire_heartbeat(fit_fn):
             return si.value
         else:
             yield json.dumps({"event": "heartbeat"}) + "\n"
-
-
-def _probe_zarr_coverage(gtz, bounds, year):
-    """True when the zarr store has a valid embedding for *year* at the
-    centre of *bounds* (west, south, east, north).
-
-    geotessera's single-pixel probe distinguishes genuine coverage from
-    water and from areas not yet produced; anything but a valid embedding
-    sends the caller to the NPY tile path.
-    """
-    try:
-        if year not in getattr(gtz, "years", []):
-            return False
-        cx = (bounds[0] + bounds[2]) / 2
-        cy = (bounds[1] + bounds[3]) / 2
-        _vec, status = gtz.probe(cx, cy, year)
-        return status == "valid"
-    except Exception:
-        return False
 
 
 def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_000, seed=42):
@@ -713,17 +650,22 @@ def _extract_tile_patches(
     # Find tiles overlapping the shapefile
     bounds = gdf.total_bounds
 
-    # Try zarr — but verify coverage with a single-pixel probe first,
-    # since the zarr store only has 2025 for some regions.
-    gtz = _get_zarr()
-    use_zarr = gtz is not None and _probe_zarr_coverage(gtz, bounds, year)
-    if logger:
-        logger.info(
-            "Using %s for tile reads", "zarr (fast)" if use_zarr else "NPY tiles with local cache"
-        )
     bbox = (bounds[0], bounds[1], bounds[2], bounds[3])
     tiles_to_fetch = gt.registry.load_blocks_for_region(bbox, year)
-    tiles_to_fetch = list(tiles_to_fetch)
+    # Only tiles that contain labelled features: a shapefile's bounding box
+    # usually covers many tiles with nothing in them (e.g. 31 of 73 for the
+    # Lake District), and every tile read is a network fetch. Sample points
+    # lie inside the features, so this keeps every tile that has any.
+    sindex = gdf.sindex
+    tiles_to_fetch = [
+        t
+        for t in tiles_to_fetch
+        if len(
+            sindex.query(
+                _box(t[1] - 0.05, t[2] - 0.05, t[1] + 0.05, t[2] + 0.05), predicate="intersects"
+            )
+        )
+    ]
     rng.shuffle(tiles_to_fetch)
 
     # Pre-group sample points by tile for efficient extraction
@@ -780,11 +722,8 @@ def _extract_tile_patches(
     # which remains real, complementary advice either way.
     patches_per_tile = max(5, max_patches // max(1, total_tiles))
 
-    # For NPY fallback, create the tile generator (lazy, one tile at a time)
-    # Note: fetch_embeddings downloads a landmask per tile for CRS/transform,
-    # even when embedding files are cached. This is a GeoTessera issue —
-    # landmask CRS should be cached per UTM zone.
-    tiles_gen = gt.fetch_embeddings(tiles_to_fetch) if not use_zarr else None
+    # Lazy, one tile at a time; yields one result per tile, in order.
+    tiles_gen = gt.fetch_embeddings(tiles_to_fetch)
 
     for t_idx, (yr_t, tlon, tlat) in enumerate(tiles_to_fetch):
         if cancel_flag and cancel_flag.is_set():
@@ -795,16 +734,14 @@ def _extract_tile_patches(
             progress_cb(t_idx, total_tiles)
 
         try:
-            if use_zarr:
-                tile_bbox = (tlon - 0.05, tlat - 0.05, tlon + 0.05, tlat + 0.05)
-                tile_emb, transform, crs = gtz.read_region(tile_bbox, year)
-            else:
-                _, _, _, tile_emb, crs, transform = next(tiles_gen)
-                tile_emb = tile_emb.astype(np.float32)
+            _, _, _, tile_emb, crs, transform = next(tiles_gen)
         except Exception as e:
             if logger:
                 logger.warning("Failed to load tile (%.2f, %.2f): %s", tlon, tlat, e)
             continue
+        if tile_emb is None:  # read failed after retries (logged by the reader)
+            continue
+        tile_emb = np.asarray(tile_emb, dtype=np.float32)
 
         h, w = tile_emb.shape[:2]
 
@@ -1526,7 +1463,6 @@ def run_large_area():
         global _cancel_flag
         _cancel_flag = threading.Event()
 
-        from geotessera import GeoTessera
         from sklearn.preprocessing import LabelEncoder
 
         from tessera_eval.evaluate import run_learning_curve
@@ -1684,13 +1620,8 @@ def run_large_area():
             logger.info("Initializing GeoTessera...")
             yield json.dumps({"event": "status", "message": "Initializing GeoTessera..."}) + "\n"
             if _geotessera_instance is None:
-                tile_cache_dir = _get_cache_dir() / "tiles"
-                tile_cache_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    _geotessera_instance = GeoTessera(
-                        dataset_version=EMBEDDINGS_DATASET_VERSION,
-                        embeddings_dir=str(tile_cache_dir),
-                    )
+                    _geotessera_instance = make_client(cache_dir=_get_cache_dir() / "zarr")
                 except Exception as e:
                     # Unguarded before this fix: a network failure here (e.g. no route to
                     # the Tessera embeddings store) raised out of the generator and killed
@@ -2497,13 +2428,8 @@ def run_large_area():
             # already declared global earlier in this same function -- doing
             # it twice with a use in between is itself a SyntaxError.)
             if _geotessera_instance is None:
-                tile_cache_dir = _get_cache_dir() / "tiles"
-                tile_cache_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    _geotessera_instance = GeoTessera(
-                        dataset_version=EMBEDDINGS_DATASET_VERSION,
-                        embeddings_dir=str(tile_cache_dir),
-                    )
+                    _geotessera_instance = make_client(cache_dir=_get_cache_dir() / "zarr")
                 except Exception as e:
                     yield (
                         json.dumps(
@@ -2678,13 +2604,8 @@ def run_large_area():
                 return
 
             if _geotessera_instance is None:
-                tile_cache_dir = _get_cache_dir() / "tiles"
-                tile_cache_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    _geotessera_instance = GeoTessera(
-                        dataset_version=EMBEDDINGS_DATASET_VERSION,
-                        embeddings_dir=str(tile_cache_dir),
-                    )
+                    _geotessera_instance = make_client(cache_dir=_get_cache_dir() / "zarr")
                 except Exception as e:
                     yield (
                         json.dumps(
@@ -4025,19 +3946,12 @@ def create_map():
             yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
             return
 
-        # Prepare GeoTessera and zarr
-        from geotessera import GeoTessera
-
+        # The embeddings reader (shared with run_large_area)
         global _geotessera_instance
 
         if _geotessera_instance is None:
-            tile_cache_dir = _get_cache_dir() / "tiles"
-            tile_cache_dir.mkdir(parents=True, exist_ok=True)
             try:
-                _geotessera_instance = GeoTessera(
-                    dataset_version=EMBEDDINGS_DATASET_VERSION,
-                    embeddings_dir=str(tile_cache_dir),
-                )
+                _geotessera_instance = make_client(cache_dir=_get_cache_dir() / "zarr")
             except Exception as e:
                 logger.warning("GeoTessera initialization failed: %s", e)
                 yield (
@@ -4118,172 +4032,86 @@ def create_map():
 
             bbox_lonlat = (west, south, east, north)
 
-            # Probe zarr coverage
-            gtz = _get_zarr()
-            use_zarr = gtz is not None and _probe_zarr_coverage(gtz, bbox_lonlat, map_year)
-
-            yield (
-                json.dumps(
-                    {
-                        "event": "status",
-                        "message": f"Using {'zarr (fast)' if use_zarr else 'NPY tiles'} for predictions",
-                    }
-                )
-                + "\n"
-            )
-
             # Embeddings are predicted on whatever native grid they arrive
             # on; only the resulting prediction rasters are reprojected, at
             # merge time, if the area spans more than one UTM zone.
             chunk_results = []  # list of (predicted_2d, transform, crs)
 
-            if use_zarr:
-                # Split bbox into 0.1 deg chunks to manage memory. Chunks
-                # additionally break at UTM zone edges (6-degree multiples):
-                # the store serves a zone-straddling bbox from the centre
-                # zone alone, silently clipping at the edge, which would
-                # leave a nodata strip along the boundary.
-                CHUNK_SIZE = 0.1
-                chunk_lons = []
-                lon = west
-                while lon < east:
-                    zone_edge = (np.floor(lon / 6.0) + 1) * 6.0
-                    chunk_lons.append((lon, min(lon + CHUNK_SIZE, zone_edge, east)))
-                    lon = chunk_lons[-1][1]
-                chunk_lats = []
-                lat = south
-                while lat < north:
-                    chunk_lats.append((lat, min(lat + CHUNK_SIZE, north)))
-                    lat += CHUNK_SIZE
-
-                total_chunks = len(chunk_lons) * len(chunk_lats)
+            # One tile at a time, on each tile's own native UTM grid, cropped
+            # to the map area.
+            try:
+                tiles = list(gt.registry.load_blocks_for_region(bbox_lonlat, map_year))
+            except Exception as e:
+                logger.warning("Tile listing failed for map area %d: %s", bbox_idx + 1, e)
                 yield (
                     json.dumps(
                         {
-                            "event": "status",
-                            "message": f"Map area {bbox_idx + 1}: {total_chunks} chunks ({len(chunk_lons)} x {len(chunk_lats)})",
+                            "event": "error",
+                            "message": f"Could not list tiles for map area {bbox_idx + 1}: {e}",
                         }
                     )
                     + "\n"
                 )
-                chunk_counter = 0
+                continue
+            total_tiles = len(tiles)
+            yield (
+                json.dumps(
+                    {
+                        "event": "status",
+                        "message": f"Map area {bbox_idx + 1}: {total_tiles} tiles",
+                    }
+                )
+                + "\n"
+            )
+            # Read only the part of each tile inside the map area.
+            tiles_gen = gt.fetch_embeddings(tiles, clip_bbox=bbox_lonlat)
 
-                for lon_start, lon_end in chunk_lons:
-                    for lat_start, lat_end in chunk_lats:
-                        if _cancelled():
-                            yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
-                            return
+            for t_idx in range(total_tiles):
+                if _cancelled():
+                    yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
+                    return
 
-                        chunk_counter += 1
-                        yield (
-                            json.dumps(
-                                {
-                                    "event": "map_progress",
-                                    "bbox_idx": bbox_idx,
-                                    "chunk": chunk_counter,
-                                    "total_chunks": total_chunks,
-                                    "message": f"Predicting chunk {chunk_counter}/{total_chunks}",
-                                }
-                            )
-                            + "\n"
-                        )
+                yield (
+                    json.dumps(
+                        {
+                            "event": "map_progress",
+                            "bbox_idx": bbox_idx,
+                            "chunk": t_idx + 1,
+                            "total_chunks": total_tiles,
+                            "message": f"Predicting tile {t_idx + 1}/{total_tiles}",
+                        }
+                    )
+                    + "\n"
+                )
 
-                        chunk_bbox = (lon_start, lat_start, lon_end, lat_end)
-                        try:
-                            emb, transform, crs = gtz.read_region(chunk_bbox, map_year)
-                            if emb is None or emb.size == 0:
-                                continue
-                            predicted_2d = _predict_raster(
-                                clf, emb, is_classification, clip_range=reg_clip
-                            )
-                            chunk_results.append((predicted_2d, transform, crs))
-                        except Exception as e:
-                            logger.warning("Chunk %d failed: %s", chunk_counter, e)
-                            yield (
-                                json.dumps(
-                                    {
-                                        "event": "status",
-                                        "message": f"Chunk {chunk_counter} failed: {e}",
-                                    }
-                                )
-                                + "\n"
-                            )
-                            continue
-            else:
-                # NPY fallback: one tile at a time, on each tile's own
-                # native UTM grid, cropped to the map area.
                 try:
-                    tiles = list(gt.registry.load_blocks_for_region(bbox_lonlat, map_year))
+                    _, _, _, emb, crs, transform = next(tiles_gen)
+                    if emb is None:  # read failed after retries
+                        continue
+                    cropped, crop_transform = _crop_tile_to_bbox(emb, transform, crs, bbox_lonlat)
+                    if cropped is None:
+                        continue
+                    predicted_2d = _predict_raster(
+                        clf,
+                        np.asarray(cropped, dtype=np.float32),
+                        is_classification,
+                        clip_range=reg_clip,
+                    )
+                    chunk_results.append((predicted_2d, crop_transform, crs))
+                except StopIteration:
+                    break
                 except Exception as e:
-                    logger.warning("Tile listing failed for map area %d: %s", bbox_idx + 1, e)
+                    logger.warning("Tile %d failed: %s", t_idx + 1, e)
                     yield (
                         json.dumps(
                             {
-                                "event": "error",
-                                "message": f"Could not list tiles for map area {bbox_idx + 1}: {e}",
+                                "event": "status",
+                                "message": f"Tile {t_idx + 1} failed: {e}",
                             }
                         )
                         + "\n"
                     )
                     continue
-                total_tiles = len(tiles)
-                yield (
-                    json.dumps(
-                        {
-                            "event": "status",
-                            "message": f"Map area {bbox_idx + 1}: {total_tiles} tiles",
-                        }
-                    )
-                    + "\n"
-                )
-                tiles_gen = gt.fetch_embeddings(tiles)
-
-                for t_idx in range(total_tiles):
-                    if _cancelled():
-                        yield json.dumps({"event": "error", "message": "Cancelled"}) + "\n"
-                        return
-
-                    yield (
-                        json.dumps(
-                            {
-                                "event": "map_progress",
-                                "bbox_idx": bbox_idx,
-                                "chunk": t_idx + 1,
-                                "total_chunks": total_tiles,
-                                "message": f"Predicting tile {t_idx + 1}/{total_tiles}",
-                            }
-                        )
-                        + "\n"
-                    )
-
-                    try:
-                        _, _, _, emb, crs, transform = next(tiles_gen)
-                        cropped, crop_transform = _crop_tile_to_bbox(
-                            emb, transform, crs, bbox_lonlat
-                        )
-                        if cropped is None:
-                            continue
-                        predicted_2d = _predict_raster(
-                            clf,
-                            np.asarray(cropped, dtype=np.float32),
-                            is_classification,
-                            clip_range=reg_clip,
-                        )
-                        chunk_results.append((predicted_2d, crop_transform, crs))
-                    except StopIteration:
-                        break
-                    except Exception as e:
-                        logger.warning("Tile %d failed: %s", t_idx + 1, e)
-                        yield (
-                            json.dumps(
-                                {
-                                    "event": "status",
-                                    "message": f"Tile {t_idx + 1} failed: {e}",
-                                }
-                            )
-                            + "\n"
-                        )
-                        continue
 
             if not chunk_results:
                 yield (

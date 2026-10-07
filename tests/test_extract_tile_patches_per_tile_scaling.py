@@ -54,7 +54,7 @@ class _FakeGeoTessera:
         self._tile_emb = tile_emb
         self._crs = crs
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for _yr, lon, _lat in tiles:
                 transform = Affine(0.001, 0, lon, 0, -0.001, 48.35)
@@ -67,7 +67,6 @@ class _FakeGeoTessera:
 def fake_tiles(monkeypatch):
     rng = np.random.RandomState(0)
     tile_emb = rng.rand(TILE_SIZE, TILE_SIZE, EMBED_DIM).astype(np.float32)
-    monkeypatch.setattr(srv, "_get_zarr", lambda: None)  # force the NPY fallback path
     return tile_emb
 
 

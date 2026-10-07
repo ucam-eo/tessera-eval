@@ -28,10 +28,10 @@ classification (`habitat` is categorical).
 ## 2. Pull embeddings under the polygons
 
 ```python
-from geotessera import GeoTessera
+from tessera_eval.dataset import make_client
 from tessera_eval import load_embeddings_for_shapefile
 
-gt = GeoTessera()
+gt = make_client()  # v1.1-dclimate, via geotessera's Zarr reader
 vectors, labels, class_names, stats = load_embeddings_for_shapefile(
     gdf,
     field="habitat",
