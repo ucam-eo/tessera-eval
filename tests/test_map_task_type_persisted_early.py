@@ -166,7 +166,7 @@ class _FakeMapGeoTessera:
     def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeMapRegistry()
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for yr, _lon, _lat in tiles:
                 rng = np.random.RandomState(1)

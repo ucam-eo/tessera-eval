@@ -29,7 +29,7 @@ class _FakeGeoTessera:
     def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for yr, _lon, _lat in tiles:
                 emb = np.full((16, 16, EMBED_DIM), float(yr), dtype=np.float32)

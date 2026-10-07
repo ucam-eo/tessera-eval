@@ -150,6 +150,18 @@ def load_embeddings_for_shapefile(gdf, field, year, gt_instance, callback=None):
     bbox = (bounds[0], bounds[1], bounds[2], bounds[3])
 
     tiles = gt_instance.registry.load_blocks_for_region(bbox, year)
+    # Only tiles that contain features: every tile read is a network fetch,
+    # and a shapefile's bounding box often covers many empty tiles.
+    sindex = gdf.sindex
+    tiles = [
+        t
+        for t in tiles
+        if len(
+            sindex.query(
+                _box(t[1] - 0.05, t[2] - 0.05, t[1] + 0.05, t[2] + 0.05), predicate="intersects"
+            )
+        )
+    ]
     total_tiles = len(tiles)
     if total_tiles == 0:
         raise ValueError(f"No GeoTessera tiles found for bbox {bbox}, year {year}")

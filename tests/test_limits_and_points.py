@@ -226,7 +226,7 @@ class _TileGT:
         self.registry = _TileReg()
         self._emb = np.random.RandomState(0).rand(TILE, TILE, 8).astype(np.float32)
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for _yr, lon, _lat in tiles:
                 yield (

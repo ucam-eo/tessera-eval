@@ -652,7 +652,20 @@ def _extract_tile_patches(
 
     bbox = (bounds[0], bounds[1], bounds[2], bounds[3])
     tiles_to_fetch = gt.registry.load_blocks_for_region(bbox, year)
-    tiles_to_fetch = list(tiles_to_fetch)
+    # Only tiles that contain labelled features: a shapefile's bounding box
+    # usually covers many tiles with nothing in them (e.g. 31 of 73 for the
+    # Lake District), and every tile read is a network fetch. Sample points
+    # lie inside the features, so this keeps every tile that has any.
+    sindex = gdf.sindex
+    tiles_to_fetch = [
+        t
+        for t in tiles_to_fetch
+        if len(
+            sindex.query(
+                _box(t[1] - 0.05, t[2] - 0.05, t[1] + 0.05, t[2] + 0.05), predicate="intersects"
+            )
+        )
+    ]
     rng.shuffle(tiles_to_fetch)
 
     # Pre-group sample points by tile for efficient extraction
@@ -4050,7 +4063,8 @@ def create_map():
                 )
                 + "\n"
             )
-            tiles_gen = gt.fetch_embeddings(tiles)
+            # Read only the part of each tile inside the map area.
+            tiles_gen = gt.fetch_embeddings(tiles, clip_bbox=bbox_lonlat)
 
             for t_idx in range(total_tiles):
                 if _cancelled():

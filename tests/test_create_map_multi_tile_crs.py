@@ -59,7 +59,7 @@ class _FakeGeoTessera:
     def __init__(self, embeddings_dir=None, **kwargs):
         self.registry = _FakeRegistry()
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for _yr, tlon, tlat in tiles:
                 crs = WEST_TILE[2] if tlon < 18.0 else EAST_TILE[2]

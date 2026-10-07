@@ -52,7 +52,7 @@ class _FakeGeoTessera:
         self._transform = transform
         self._dim = dim
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         rng = np.random.RandomState(0)
         tile_emb = rng.randn(10, 10, self._dim).astype(np.float32)
         yield (2020, 0, 0, tile_emb, "EPSG:4326", self._transform)

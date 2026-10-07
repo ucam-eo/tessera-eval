@@ -35,7 +35,7 @@ class _FakeGeoTessera:
         self._transform = transform
         self._crs = crs
 
-    def fetch_embeddings(self, tiles):
+    def fetch_embeddings(self, tiles, clip_bbox=None):
         def gen():
             for _yr, _lon, _lat in tiles:
                 yield (None, None, None, self._tile_emb, self._crs, self._transform)
