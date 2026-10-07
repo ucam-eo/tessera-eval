@@ -98,6 +98,16 @@ def _with_retries(fn, what):
             time.sleep(_RETRY_BACKOFF_S * attempt)
 
 
+def _dequantize(q, scales):
+    """float32 embeddings from int8 values and per-pixel scales; works for
+    a whole tile (H, W, 128) / (H, W) or picked pixels (N, 128) / (N,)."""
+    q = np.asarray(q, dtype=np.float32)
+    scales = np.asarray(scales, dtype=np.float32)
+    if scales.ndim == q.ndim - 1:
+        scales = scales[..., None]
+    return q * scales
+
+
 def tiles_for_bbox(bbox, year=None):
     """(year, lon, lat) for every 0.1-degree tile intersecting *bbox*.
 
@@ -248,19 +258,21 @@ class ZarrClient:
             lon = round((i + 0.5) * TILE_DEG, 2)
             lat = round((j + 0.5) * TILE_DEG, 2)
             try:
-                emb, crs, transform = self.read_tile(year, lon, lat)
+                q, scales, crs, transform = self.read_tile_quantized(year, lon, lat)
             except Exception as e:
                 logger.warning("Tile (%.2f, %.2f) %s unavailable: %s", lon, lat, year, e)
-                emb = None
-            if emb is not None:
+                q = None
+            if q is not None:
                 idx = np.asarray(idx_list)
                 xs, ys = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(
                     pts[idx, 0], pts[idx, 1]
                 )
                 rows, cols = (np.asarray(a) for a in rowcol(transform, xs, ys))
-                h, w = emb.shape[:2]
+                h, w = q.shape[:2]
                 ok = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
-                out[idx[ok]] = emb[rows[ok], cols[ok]]
+                r, c = rows[ok], cols[ok]
+                # Dequantize only the picked pixels, not the whole tile.
+                out[idx[ok]] = _dequantize(q[r, c], scales[r, c])
             if progress_callback:
                 progress_callback(done, total, "tiles")
         return out
@@ -270,14 +282,13 @@ class ZarrClient:
 
     def _load_cached_tile(self, path):
         from affine import Affine
-        from geotessera import dequantize_embedding
 
         with np.load(path, allow_pickle=False) as f:
-            emb = dequantize_embedding(f["q"], f["scales"]).astype(np.float32, copy=False)
+            q, scales = f["q"], f["scales"]
             transform = Affine(*f["transform"].tolist())
             crs = str(f["crs"])
         os.utime(path)  # mark as recently used for eviction
-        return emb, crs, transform
+        return q, scales, crs, transform
 
     def _cached_files(self):
         return [p for p in self._tile_dir.rglob("*.npz") if ".tmp-" not in p.name]
@@ -319,9 +330,9 @@ class ZarrClient:
             p.unlink(missing_ok=True)
         self._tile_cache_bytes = total
 
-    def read_tile(self, year, lon, lat):
-        """(embedding (H, W, 128) float32, crs, transform) for one tile, on
-        its zone's native UTM grid. Cached on disk."""
+    def read_tile_quantized(self, year, lon, lat):
+        """(int8 embedding (H, W, 128), scales (H, W), crs, transform) for one
+        tile, on its zone's native UTM grid. Cached on disk."""
         path = self._tile_path(year, lon, lat)
         if path.exists():
             try:
@@ -329,8 +340,6 @@ class ZarrClient:
             except Exception as e:
                 logger.warning("Discarding unreadable cached tile %s: %s", path, e)
                 path.unlink(missing_ok=True)
-        from geotessera import dequantize_embedding
-
         q, scales, transform, crs = _with_retries(
             lambda: self.store.read_region_quantized(_tile_box(lon, lat), year),
             f"Reading tile ({lon:.2f}, {lat:.2f})",
@@ -339,8 +348,13 @@ class ZarrClient:
             self._save_tile(path, q, scales, transform, crs)
         except Exception as e:
             logger.warning("Could not cache tile %s: %s", path, e)
-        emb = dequantize_embedding(q, scales).astype(np.float32, copy=False)
-        return emb, str(crs), transform
+        return q, scales, str(crs), transform
+
+    def read_tile(self, year, lon, lat):
+        """(embedding (H, W, 128) float32, crs, transform) for one tile, on
+        its zone's native UTM grid. Cached on disk."""
+        q, scales, crs, transform = self.read_tile_quantized(year, lon, lat)
+        return _dequantize(q, scales), crs, transform
 
     def read_clipped(self, year, lon, lat, clip_bbox):
         """Like read_tile, but for the part of the tile inside *clip_bbox*
