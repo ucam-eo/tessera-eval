@@ -12,11 +12,39 @@ from __future__ import annotations
 
 import json
 
+import geopandas as gpd
 import numpy as np
 import pytest
+from shapely.geometry import box
 
 import tessera_eval.server as srv
-from tests.test_cache_key_sample_budget import EMBED_DIM, _FakeGeoTessera, _make_gdf
+
+EMBED_DIM = 128
+
+
+class _FakeRegistry:
+    def load_blocks_for_region(self, bbox, year):
+        return [object()]
+
+
+class _FakeGeoTessera:
+    calls = 0
+
+    def __init__(self, embeddings_dir=None, **kwargs):
+        self.registry = _FakeRegistry()
+
+    def sample_embeddings_at_points(self, points, year=None, progress_callback=None):
+        type(self).calls += 1
+        if progress_callback:
+            progress_callback(len(points), len(points), "done")
+        rng = np.random.RandomState(0)
+        return rng.normal(size=(len(points), EMBED_DIM)).astype(np.float32)
+
+
+def _make_gdf():
+    names = ["a", "b"] * 6
+    geoms = [box(i * 0.1, 0, i * 0.1 + 0.05, 0.05) for i in range(len(names))]
+    return gpd.GeoDataFrame({"habitat": names}, geometry=geoms, crs="EPSG:4326")
 
 
 @pytest.fixture
