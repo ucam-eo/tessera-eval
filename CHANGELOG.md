@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.18.1]
+
+### Fixed
+- **Group by field was silently dropped on a cached sample.** The on-disk
+  sample cache (`result_*.npz`) did not store each pixel's source polygon,
+  so any run that reused it (e.g. a second model run on the same labels
+  after the compute server restarted) could not group by field and fell
+  back to an ungrouped random split, with only a brief status message.
+  Learning curves run one model at a time therefore had only the first run
+  grouped, and the rest scored optimistically. The cache now stores the
+  polygon IDs; a cache written by an earlier version is re-extracted (not
+  reused) when Group by field is requested.
+
 ## [1.18.0]
 
 ### Changed

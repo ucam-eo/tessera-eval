@@ -38,7 +38,7 @@ def test_result_cache_roundtrip():
         result = srv._load_cached_result("habitat", 2024, gdf)
         assert result is not None, "Cache miss on saved result"
 
-        loaded_vectors, loaded_labels, loaded_names, loaded_stats = result
+        loaded_vectors, loaded_labels, loaded_names, loaded_stats, _groups = result
         np.testing.assert_array_equal(loaded_vectors, vectors)
         np.testing.assert_array_equal(loaded_labels, labels)
         assert loaded_names == class_names

@@ -241,7 +241,12 @@ def _gdf_hash(gdf):
 
 
 def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000, seed=42):
-    """Load cached evaluation result. Returns (vectors, labels, class_names, stats) or None."""
+    """Load cached evaluation result.
+
+    Returns (vectors, labels, class_names, stats, groups) or None. ``groups``
+    (each pixel's source polygon, needed by group_by_field) is None for
+    caches written before 1.18.1, which didn't store it.
+    """
     path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed)
     if path.exists():
         try:
@@ -251,6 +256,7 @@ def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000,
                 data["labels"],
                 data["class_names"].tolist(),
                 dict(data["stats"].item()),
+                data["groups"] if "groups" in data.files else None,
             )
         except Exception:
             path.unlink(missing_ok=True)
@@ -975,16 +981,20 @@ def _save_cached_result(
     sampling="equal",
     max_samples=200_000,
     seed=42,
+    groups=None,
 ):
-    """Save evaluation result to disk cache."""
+    """Save evaluation result to disk cache, with each pixel's source
+    polygon (``groups``) when known, so group_by_field works on a cache hit."""
     try:
         path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed)
+        extra = {"groups": np.asarray(groups)} if groups is not None else {}
         np.savez_compressed(
             path,
             vectors=vectors,
             labels=labels,
             class_names=np.array(class_names),
             stats=np.array(stats),
+            **extra,
         )
     except Exception as e:
         logger.debug("Failed to save result cache: %s", e)
@@ -1488,6 +1498,9 @@ def run_large_area():
         cache_key = (field_name, train_year, test_year, sampling, sample_budget, seed)
         vectors = labels = class_names = stats = None
         groups = None
+        # group_by_field needs each pixel's source polygon; a cache without
+        # them must be re-extracted, not reused (that silently ran ungrouped).
+        needs_groups = group_by_field and is_classification
         spatial_3x3 = spatial_5x5 = unet_patches = None
         spatial_labels_3x3 = spatial_labels_5x5 = None
         all_sample_points = None  # (lon, lat) coordinates of all sample points
@@ -1543,6 +1556,13 @@ def run_large_area():
                     logger.info("Spatial split needs point coordinates — reloading tiles")
                 vectors = None  # force reload
                 _tile_cache["key"] = None
+            elif needs_groups and groups is None:
+                # A cache filled without polygon IDs (see the disk path
+                # below) can't honour group_by_field: re-extract rather
+                # than silently fall back to an ungrouped, optimistic split.
+                logger.info("Group by field needs polygon IDs not in the cache — reloading")
+                vectors = None
+                _tile_cache["key"] = None
 
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
@@ -1555,8 +1575,9 @@ def run_large_area():
                 and not needs_spatial_5x5
                 and not needs_unet
                 and not has_spatial_bboxes
+                and not (needs_groups and cached_result[4] is None)
             ):
-                vectors, labels, class_names, stats = cached_result
+                vectors, labels, class_names, stats, groups = cached_result
                 logger.info(
                     "Disk result cache hit for %s/%s (%d pixels)",
                     field_name,
@@ -1586,9 +1607,10 @@ def run_large_area():
                     # group IDs and doesn't store them -- a hit here has no
                     # groups to offer, so explicitly clear the slot rather
                     # than leaving a previous run's (mismatched) groups
-                    # array in place. group_by_field is simply unavailable
-                    # until the next fresh fetch repopulates it.
-                    "groups": None,
+                    # array in place. (Caches written since 1.18.1 carry
+                    # them; an older cache is skipped above when
+                    # group_by_field needs them.)
+                    "groups": groups,
                     "class_names": class_names,
                     "stats": stats,
                     "spatial_3x3": None,
@@ -2091,6 +2113,7 @@ def run_large_area():
                     sampling,
                     sample_budget,
                     seed,
+                    groups=groups,
                 )
 
                 all_sample_points = sample_points
@@ -2941,8 +2964,8 @@ def run_large_area():
                     json.dumps(
                         {
                             "event": "status",
-                            "message": "Group by field ignored — not available for this "
-                            "cached result; re-run to regenerate it.",
+                            "message": "Group by field ignored — no polygon IDs were "
+                            "recorded for these labels, so this run used a random split.",
                         }
                     )
                     + "\n"
