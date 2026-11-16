@@ -154,9 +154,9 @@ def test_disk_cache_round_trips_groups(tmp_path, monkeypatch):
     labels = np.array([0, 0, 1, 1], dtype=np.int32)
     groups = np.array([3, 3, 7, 8])
     srv._save_cached_result("habitat", 2024, gdf, vectors, labels, ["a", "b"], {}, groups=groups)
-    *_, loaded = srv._load_cached_result("habitat", 2024, gdf)
+    loaded = srv._load_cached_result("habitat", 2024, gdf)[4]
     np.testing.assert_array_equal(loaded, groups)
 
     srv._save_cached_result("habitat", 2024, gdf, vectors, labels, ["a", "b"], {})
-    *_, loaded = srv._load_cached_result("habitat", 2024, gdf)
+    loaded = srv._load_cached_result("habitat", 2024, gdf)[4]
     assert loaded is None

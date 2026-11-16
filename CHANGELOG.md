@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.18.2]
+
+### Fixed
+- **Spatial k-fold said "point coordinates don't match the training data".**
+  A disk-cache hit replaced the sample but kept the previous sample's
+  coordinates (e.g. after a run with another seed), and the disk cache did
+  not store coordinates at all. It now stores them, and a cache without them
+  is re-extracted when spatial k-fold needs them.
+- **Loading a different shapefile without restarting reused the old sample.**
+  The in-memory cache key did not include the shapefile, so a new shapefile
+  with the same label field silently ran on the previous one's pixels.
+- **Edited labels reused old labels from the disk cache.** The shapefile
+  hash covered only row count, column names and bounds; it now covers the
+  geometries and attribute values.
+- **Caches did not record the embeddings dataset version or the task.** A
+  cache written before the move to v1.1 could serve v1.0 embeddings. Existing
+  caches are re-extracted once after upgrading.
+
 ## [1.18.1]
 
 ### Fixed
