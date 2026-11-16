@@ -207,7 +207,9 @@ def _fit_with_wire_heartbeat(fit_fn):
             yield json.dumps({"event": "heartbeat"}) + "\n"
 
 
-def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_000, seed=42):
+def _result_cache_path(
+    field, year, gdf_hash, sampling="equal", max_samples=200_000, seed=42, task="classification"
+):
     """Return the disk path for cached evaluation results (vectors + labels).
 
     max_samples (the request's Max pixel samples budget) is part of the key:
@@ -222,32 +224,60 @@ def _result_cache_path(field, year, gdf_hash, sampling="equal", max_samples=200_
     seed is part of the key for the same reason: it seeds the point sampler,
     so a different seed must draw a different sample. Without it, "try a
     different seed" silently reused the cached points for pixel classifiers.
+
+    The embeddings dataset version and the task are part of the key too:
+    caches written before TEE moved to v1.1 (October 2026) would otherwise
+    serve v1.0 embeddings, and labels are encoded differently for
+    classification and regression.
     """
+    task_tag = "" if task == "classification" else f"_{task}"
     return (
-        _get_cache_dir() / f"result_{field}_{year}_{sampling}_n{max_samples}_s{seed}_{gdf_hash}.npz"
+        _get_cache_dir()
+        / f"result_{field}_{year}_{sampling}_n{max_samples}_s{seed}{task_tag}_{_dataset_tag()}_{gdf_hash}.npz"
     )
 
 
 def _gdf_hash(gdf):
-    """Quick hash of a GeoDataFrame for cache keying."""
+    """Hash of a GeoDataFrame's content (geometries and attribute values) for
+    cache keying.
+
+    It used to hash only the row count, column names and bounds, so a
+    shapefile whose labels were edited (same polygons, new class values)
+    reused the old sample and its old labels from the disk cache.
+    """
     import hashlib
 
+    import pandas as pd
+
     h = hashlib.md5()
-    h.update(str(len(gdf)).encode())
+    h.update(str(gdf.crs).encode())
     h.update(str(sorted(gdf.columns.tolist())).encode())
-    bounds = gdf.total_bounds
-    h.update(f"{bounds[0]:.4f},{bounds[1]:.4f},{bounds[2]:.4f},{bounds[3]:.4f}".encode())
+    h.update(b"".join(g.wkb if g is not None else b"" for g in gdf.geometry))
+    attrs = gdf.drop(columns=gdf.geometry.name)
+    if len(attrs.columns):
+        h.update(pd.util.hash_pandas_object(attrs.astype(str), index=False).values.tobytes())
     return h.hexdigest()[:12]
 
 
-def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000, seed=42):
+def _dataset_tag():
+    """The embeddings dataset in use, e.g. "v1.1-dclimate", for cache keys:
+    samples drawn from one dataset version must not be reused for another."""
+    from tessera_eval import dataset as _ds
+
+    return f"{_ds.EMBEDDINGS_DATASET_VERSION}-{_ds.EMBEDDINGS_DATASET_VARIANT}"
+
+
+def _load_cached_result(
+    field, year, gdf, sampling="equal", max_samples=200_000, seed=42, task="classification"
+):
     """Load cached evaluation result.
 
-    Returns (vectors, labels, class_names, stats, groups) or None. ``groups``
-    (each pixel's source polygon, needed by group_by_field) is None for
-    caches written before 1.18.1, which didn't store it.
+    Returns (vectors, labels, class_names, stats, groups, points) or None.
+    ``groups`` (each pixel's source polygon, needed by group_by_field) is None
+    for caches written before 1.18.1; ``points`` (each pixel's lon/lat, needed
+    by spatial k-fold) is None for caches written before 1.18.2.
     """
-    path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed)
+    path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed, task)
     if path.exists():
         try:
             data = np.load(path, allow_pickle=True)
@@ -257,6 +287,7 @@ def _load_cached_result(field, year, gdf, sampling="equal", max_samples=200_000,
                 data["class_names"].tolist(),
                 dict(data["stats"].item()),
                 data["groups"] if "groups" in data.files else None,
+                data["points"] if "points" in data.files else None,
             )
         except Exception:
             path.unlink(missing_ok=True)
@@ -982,12 +1013,19 @@ def _save_cached_result(
     max_samples=200_000,
     seed=42,
     groups=None,
+    points=None,
+    task="classification",
 ):
     """Save evaluation result to disk cache, with each pixel's source
-    polygon (``groups``) when known, so group_by_field works on a cache hit."""
+    polygon (``groups``) and lon/lat (``points``) when known, so
+    group_by_field and spatial k-fold work on a cache hit."""
     try:
-        path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed)
-        extra = {"groups": np.asarray(groups)} if groups is not None else {}
+        path = _result_cache_path(field, year, _gdf_hash(gdf), sampling, max_samples, seed, task)
+        extra = {}
+        if groups is not None:
+            extra["groups"] = np.asarray(groups)
+        if points is not None:
+            extra["points"] = np.asarray(points, dtype=np.float64)
         np.savez_compressed(
             path,
             vectors=vectors,
@@ -1494,13 +1532,29 @@ def run_large_area():
 
         # Check in-memory cache first, then disk cache
         # The sample budget and seed are part of the key -- see _result_cache_path.
+        # So are the shapefile's content, the dataset and the task: without
+        # them, loading a different shapefile (same field name) without
+        # restarting reused the previous shapefile's sample.
         sample_budget = max_train if max_train else 200_000
-        cache_key = (field_name, train_year, test_year, sampling, sample_budget, seed)
+        cache_task = "classification" if is_classification else "regression"
+        cache_key = (
+            field_name,
+            train_year,
+            test_year,
+            sampling,
+            sample_budget,
+            seed,
+            cache_task,
+            _dataset_tag(),
+            _gdf_hash(gdf),
+        )
         vectors = labels = class_names = stats = None
         groups = None
         # group_by_field needs each pixel's source polygon; a cache without
         # them must be re-extracted, not reused (that silently ran ungrouped).
         needs_groups = group_by_field and is_classification
+        # Spatial k-fold needs each pixel's coordinates, from this same sample.
+        needs_points = spatial_kfold and eval_mode == "kfold"
         spatial_3x3 = spatial_5x5 = unet_patches = None
         spatial_labels_3x3 = spatial_labels_5x5 = None
         all_sample_points = None  # (lon, lat) coordinates of all sample points
@@ -1556,6 +1610,10 @@ def run_large_area():
                     logger.info("Spatial split needs point coordinates — reloading tiles")
                 vectors = None  # force reload
                 _tile_cache["key"] = None
+            elif needs_points and all_sample_points is None:
+                logger.info("Spatial k-fold needs point coordinates not in the cache — reloading")
+                vectors = None
+                _tile_cache["key"] = None
             elif needs_groups and groups is None:
                 # A cache filled without polygon IDs (see the disk path
                 # below) can't honour group_by_field: re-extract rather
@@ -1567,7 +1625,7 @@ def run_large_area():
         if vectors is None:
             # Check disk result cache (much smaller than raw tiles)
             cached_result = _load_cached_result(
-                field_name, train_year, gdf, sampling, sample_budget, seed
+                field_name, train_year, gdf, sampling, sample_budget, seed, cache_task
             )
             if (
                 cached_result
@@ -1576,8 +1634,13 @@ def run_large_area():
                 and not needs_unet
                 and not has_spatial_bboxes
                 and not (needs_groups and cached_result[4] is None)
+                and not (needs_points and cached_result[5] is None)
             ):
-                vectors, labels, class_names, stats, groups = cached_result
+                vectors, labels, class_names, stats, groups, cached_points = cached_result
+                # Coordinates of exactly these pixels (already filtered to
+                # valid embeddings when saved), so no mask applies.
+                all_sample_points = cached_points
+                all_valid_mask = None
                 logger.info(
                     "Disk result cache hit for %s/%s (%d pixels)",
                     field_name,
@@ -1616,6 +1679,11 @@ def run_large_area():
                     "spatial_3x3": None,
                     "spatial_5x5": None,
                     "unet_patches": [],
+                    # Replace, never keep, the previous sample's coordinates:
+                    # leaving them made spatial k-fold report "point
+                    # coordinates don't match" (Moustafa, 2026-11-16).
+                    "sample_points": all_sample_points,
+                    "valid_mask": all_valid_mask,
                     # Commit the task type alongside the vectors it applies
                     # to -- see the identical key in the fetch path below.
                     "_is_classification": is_classification,
@@ -2114,6 +2182,12 @@ def run_large_area():
                     sample_budget,
                     seed,
                     groups=groups,
+                    task=cache_task,
+                    points=(
+                        np.asarray(sample_points)[valid_mask]
+                        if valid_mask.sum() < len(sample_points)
+                        else np.asarray(sample_points)
+                    ),
                 )
 
                 all_sample_points = sample_points
@@ -3993,7 +4067,7 @@ def create_map():
                 return
         gt = _geotessera_instance
 
-        # cache["key"] is (field_name, train_year, test_year, sampling, sample_budget, seed) --
+        # cache["key"] starts (field_name, train_year, test_year, ...) --
         # index 1 regardless of test_year. map_year defaults to this (today's
         # existing behavior: map the same year the model was trained on) but
         # can be overridden to run the trained model as pure inference
